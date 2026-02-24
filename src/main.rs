@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use color_eyre::eyre::{Context, Result};
@@ -20,12 +21,43 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Resolve the agent Dockerfile and build context for the given workspace.
+///
+/// If `<workspace>/.ramekin/Dockerfile` exists, the agent is built from the
+/// user-supplied Dockerfile with the workspace as the build context.
+/// Otherwise we fall back to the default Dockerfile shipped with ramekin.
+fn resolve_agent_dockerfile(workspace: &Path) -> (PathBuf, PathBuf) {
+    let custom = workspace.join(".ramekin/Dockerfile");
+    if custom.is_file() {
+        info!(?custom, "using custom agent Dockerfile");
+        (custom, workspace.to_path_buf())
+    } else {
+        let default = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Dockerfile");
+        info!("no .ramekin/Dockerfile found, using default");
+        (default, PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    }
+}
+
 fn run() -> Result<()> {
     let compose_dir = env!("CARGO_MANIFEST_DIR");
 
-    info!("starting containers");
+    let workspace = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
+
+    let workspace = workspace
+        .canonicalize()
+        .wrap_err_with(|| format!("workspace path does not exist: {}", workspace.display()))?;
+
+    let (agent_dockerfile, agent_context) = resolve_agent_dockerfile(&workspace);
+
+    info!(?workspace, "starting containers");
     let status = Command::new("docker")
         .args(["compose", "up", "--build", "-d"])
+        .env("AGENT_DOCKERFILE", &agent_dockerfile)
+        .env("AGENT_CONTEXT", &agent_context)
+        .env("WORKSPACE_DIR", &workspace)
         .current_dir(compose_dir)
         .status()
         .wrap_err("failed to run docker compose")?;

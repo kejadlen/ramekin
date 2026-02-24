@@ -1,8 +1,8 @@
 services:
   agent:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ${AGENT_CONTEXT:-.}
+      dockerfile: ${AGENT_DOCKERFILE:-Dockerfile}
     depends_on:
       firewall:
         condition: service_started
@@ -12,6 +12,8 @@ services:
     network_mode: "service:firewall"
     stdin_open: true
     tty: true
+    volumes:
+      - ${WORKSPACE_DIR:-.}:/workspace
 
   firewall:
     build:
