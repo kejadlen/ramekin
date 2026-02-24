@@ -26,9 +26,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
 
-async fn proxy(
-    Json(req): Json<ProxyRequest>,
-) -> Result<Json<ProxyResponse>, (StatusCode, String)> {
+async fn proxy(Json(req): Json<ProxyRequest>) -> Result<Json<ProxyResponse>, (StatusCode, String)> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -74,10 +72,7 @@ async fn proxy(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string()))
         .collect();
 
-    let resp_body: serde_json::Value = response
-        .json()
-        .await
-        .unwrap_or(serde_json::Value::Null);
+    let resp_body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
 
     info!(status, "proxied response");
 
