@@ -10,3 +10,7 @@ serde_json = "*"
 tokio = { version = "*", features = ["full"] }
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "*"
+tower = { version = "*", features = ["util"] }

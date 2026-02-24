@@ -483,8 +483,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "color-eyre",
+ "http-body-util",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

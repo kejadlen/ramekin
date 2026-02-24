@@ -8,3 +8,7 @@ fmt:
 
 clippy:
     cargo clippy --workspace
+
+cov:
+    cargo llvm-cov --workspace --html
+    @echo "Coverage report: target/llvm-cov/html/index.html"
