@@ -3,8 +3,9 @@ FROM rust:1.93-trixie AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY firewall/ firewall/
+COPY src/ src/
 
-RUN cargo build --release --bin ramekin-firewall
+RUN cargo build --release -p ramekin-firewall
 
 FROM debian:trixie-slim
 

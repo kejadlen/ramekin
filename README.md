@@ -9,7 +9,7 @@ A containerized setup for running the [pi coding agent](https://github.com/badlo
 │            firewall network namespace            │
 │                                                  │
 │  ┌─────────────┐        ┌─────────────────────┐  │
-│  │    agent    │─:8080─▶│      firewall      │  │
+│  │    agent    │─:8080─▶│      firewall       │  │
 │  │    (pi)     │        │  ┌───────────────┐  │──┼──▶ api.anthropic.com:443
 │  │             ├────────┼──┤ bridge server │  │  │
 │  └─────────────┘        │  └───────────────┘  │  │
