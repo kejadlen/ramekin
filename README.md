@@ -1,6 +1,6 @@
 # ramekin
 
-A containerized Rust setup for running a coding agent with network-restricted access to the Anthropic API.
+A containerized setup for running the [pi coding agent](https://github.com/badlogic/pi-mono) with network-restricted access to the Anthropic API.
 
 ## Architecture
 
@@ -10,7 +10,7 @@ A containerized Rust setup for running a coding agent with network-restricted ac
 │                                                  │
 │  ┌─────────────┐        ┌─────────────────────┐ │
 │  │    agent     │──:8080─│      sidecar        │ │
-│  │  (ramekin)   │        │  ┌───────────────┐  │─│──▶ api.anthropic.com:443
+│  │    (pi)      │        │  ┌───────────────┐  │─│──▶ api.anthropic.com:443
 │  │             ─┼────────┼──│ bridge server │  │ │
 │  └─────────────┘        │  └───────────────┘  │ │
 │                          │  iptables firewall  │ │
@@ -20,7 +20,7 @@ A containerized Rust setup for running a coding agent with network-restricted ac
 
 Two containers share a network namespace:
 
-- **agent** — the Rust coding agent (`ramekin`). Talks directly to the Anthropic API and uses the bridge server for any other external communication.
+- **agent** — runs the [pi coding agent](https://github.com/badlogic/pi-mono) (`@mariozechner/pi-coding-agent`). Talks directly to the Anthropic API for LLM calls.
 - **sidecar** — runs iptables rules that restrict all outbound traffic to `api.anthropic.com:443`, plus a bridge HTTP server that acts as a controlled proxy for other requests.
 
 Because the agent uses `network_mode: "service:sidecar"`, all of its traffic is subject to the sidecar's iptables rules.
@@ -37,22 +37,18 @@ export ANTHROPIC_API_KEY=sk-ant-...
 docker compose up --build
 ```
 
-Set `RUST_LOG` to control log verbosity:
+The agent container runs `pi` interactively with `stdin_open` and `tty` enabled. To attach to the agent and interact with pi:
 
 ```sh
-RUST_LOG=debug docker compose up --build
+docker compose attach agent
 ```
 
 ## Project structure
 
 ```
-├── Cargo.toml              # Workspace root + agent crate
-├── Dockerfile              # Agent container image
+├── Cargo.toml              # Workspace root (sidecar only)
+├── Dockerfile              # Agent container image (Node.js + pi)
 ├── docker-compose.yml      # Orchestration for both containers
-├── src/
-│   ├── main.rs             # Agent entry point
-│   ├── agent.rs            # Anthropic API client
-│   └── bridge.rs           # Bridge server client helpers
 └── sidecar/
     ├── Cargo.toml          # Sidecar crate (ramekin-sidecar)
     ├── Dockerfile          # Sidecar container image

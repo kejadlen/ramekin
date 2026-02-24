@@ -2,9 +2,7 @@ FROM rust:1.85-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY sidecar/Cargo.toml sidecar/Cargo.toml
-COPY sidecar/src/ sidecar/src/
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+COPY sidecar/ sidecar/
 
 RUN cargo build --release --bin ramekin-sidecar
 
