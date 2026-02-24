@@ -1,0 +1,12 @@
+{
+  "outputs": {
+    "ramekin": {
+      "platforms": {
+        "macos-aarch64": {
+          "regex": "^ramekin-aarch64-apple-darwin\\.tar\\.gz$",
+          "path": "ramekin"
+        }
+      }
+    }
+  }
+}
