@@ -5,8 +5,6 @@ services:
       dockerfile: Dockerfile
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - BRIDGE_URL=http://sidecar:8080
-      - RUST_LOG=${RUST_LOG:-info}
     depends_on:
       sidecar:
         condition: service_started
@@ -14,6 +12,8 @@ services:
     # the sidecar's network namespace so all traffic is subject
     # to the sidecar's iptables rules.
     network_mode: "service:sidecar"
+    stdin_open: true
+    tty: true
 
   sidecar:
     build:
