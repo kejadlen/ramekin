@@ -469,6 +469,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ramekin"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ramekin-sidecar"
 version = "0.1.0"
 dependencies = [

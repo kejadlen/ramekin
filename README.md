@@ -28,25 +28,28 @@ Because the agent uses `network_mode: "service:sidecar"`, all of its traffic is 
 ## Prerequisites
 
 - Docker and Docker Compose
+- Rust toolchain (for building the `ramekin` CLI)
 
 ## Usage
 
 ```sh
-docker compose up --build
+cargo run
 ```
 
-The agent container runs `pi` interactively with `stdin_open` and `tty` enabled. To attach to the agent and interact with pi:
+This builds the containers, starts the system in the background, and drops you into the pi agent. To tear down:
 
 ```sh
-docker compose attach agent
+docker compose down
 ```
 
 ## Project structure
 
 ```
-├── Cargo.toml              # Workspace root (sidecar only)
+├── Cargo.toml              # Workspace root + ramekin CLI
 ├── Dockerfile              # Agent container image (Node.js + pi)
 ├── docker-compose.yml      # Orchestration for both containers
+├── src/
+│   └── main.rs             # CLI: starts containers, attaches to pi
 └── sidecar/
     ├── Cargo.toml          # Sidecar crate (ramekin-sidecar)
     ├── Dockerfile          # Sidecar container image
