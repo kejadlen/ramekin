@@ -1,39 +1,37 @@
 # ramekin
 
-A containerized setup for running the [pi coding agent](https://github.com/badlogic/pi-mono) with network-restricted access to the Anthropic API.
+A containerized setup for running the [pi coding agent](https://github.com/badlogic/pi-mono) with network-restricted access.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  sidecar network namespace       │
+┌──────────────────────────────────────────────────┐
+│            sidecar network namespace             │
 │                                                  │
-│  ┌─────────────┐        ┌─────────────────────┐ │
-│  │    agent     │──:8080─│      sidecar        │ │
-│  │    (pi)      │        │  ┌───────────────┐  │─│──▶ api.anthropic.com:443
-│  │             ─┼────────┼──│ bridge server │  │ │
-│  └─────────────┘        │  └───────────────┘  │ │
-│                          │  iptables firewall  │ │
-│                          └─────────────────────┘ │
-└─────────────────────────────────────────────────┘
+│  ┌─────────────┐        ┌─────────────────────┐  │
+│  │    agent    │─:8080─▶│       sidecar       │  │
+│  │    (pi)     │        │  ┌───────────────┐  │──┼──▶ api.anthropic.com:443
+│  │             ├────────┼──┤ bridge server │  │  │
+│  └─────────────┘        │  └───────────────┘  │  │
+│                         │  iptables firewall  │  │
+│                         └─────────────────────┘  │
+└──────────────────────────────────────────────────┘
 ```
 
 Two containers share a network namespace:
 
-- **agent** — runs the [pi coding agent](https://github.com/badlogic/pi-mono) (`@mariozechner/pi-coding-agent`). Talks directly to the Anthropic API for LLM calls.
-- **sidecar** — runs iptables rules that restrict all outbound traffic to `api.anthropic.com:443`, plus a bridge HTTP server that acts as a controlled proxy for other requests.
+- **agent** — runs the [pi coding agent](https://github.com/badlogic/pi-mono) (`@mariozechner/pi-coding-agent`). Pi handles all Anthropic API communication internally.
+- **sidecar** — runs iptables rules that restrict all outbound traffic to `api.anthropic.com:443`, plus a bridge HTTP server for controlled proxying.
 
 Because the agent uses `network_mode: "service:sidecar"`, all of its traffic is subject to the sidecar's iptables rules.
 
 ## Prerequisites
 
 - Docker and Docker Compose
-- An Anthropic API key
 
 ## Usage
 
 ```sh
-export ANTHROPIC_API_KEY=sk-ant-...
 docker compose up --build
 ```
 
@@ -69,25 +67,4 @@ The sidecar's `entrypoint.sh` configures iptables at startup:
 
 ## Bridge server
 
-The bridge server (`/proxy` endpoint) accepts JSON requests describing an HTTP call to make on behalf of the agent:
-
-```json
-{
-  "method": "GET",
-  "url": "https://example.com/api/data",
-  "headers": { "Authorization": "Bearer ..." },
-  "body": { "key": "value" }
-}
-```
-
-It returns the upstream response as JSON:
-
-```json
-{
-  "status": 200,
-  "headers": { "content-type": "application/json" },
-  "body": { ... }
-}
-```
-
-A health check is available at `GET /health`.
+The bridge server (`/echo` endpoint) accepts a JSON body and returns it unchanged. This provides a simple mechanism for the agent to verify connectivity to the sidecar.

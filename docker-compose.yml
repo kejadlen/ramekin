@@ -3,8 +3,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     depends_on:
       sidecar:
         condition: service_started
