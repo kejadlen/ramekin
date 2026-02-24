@@ -11,10 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - run: just check
+      - run: cargo check --workspace
       - run: cargo fmt --all --check
-      - run: just clippy
+      - run: cargo clippy --workspace
