@@ -1,3 +1,5 @@
+default: check fmt clippy
+
 check:
     cargo check --workspace
 

@@ -1,4 +1,4 @@
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.93-trixie AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -6,7 +6,7 @@ COPY firewall/ firewall/
 
 RUN cargo build --release --bin ramekin-firewall
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
