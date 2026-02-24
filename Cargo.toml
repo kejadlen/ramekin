@@ -1,5 +1,5 @@
 [workspace]
-members = ["sidecar"]
+members = ["firewall"]
 resolver = "2"
 
 [package]

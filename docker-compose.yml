@@ -4,19 +4,19 @@ services:
       context: .
       dockerfile: Dockerfile
     depends_on:
-      sidecar:
+      firewall:
         condition: service_started
     # The agent container has no network of its own; it shares
-    # the sidecar's network namespace so all traffic is subject
-    # to the sidecar's iptables rules.
-    network_mode: "service:sidecar"
+    # the firewall's network namespace so all traffic is subject
+    # to its iptables rules.
+    network_mode: "service:firewall"
     stdin_open: true
     tty: true
 
-  sidecar:
+  firewall:
     build:
       context: .
-      dockerfile: sidecar/Dockerfile
+      dockerfile: firewall/Dockerfile
     # NET_ADMIN is required for iptables rules.
     cap_add:
       - NET_ADMIN

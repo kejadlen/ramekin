@@ -1,5 +1,5 @@
 [package]
-name = "ramekin-sidecar"
+name = "ramekin-firewall"
 version = "0.1.0"
 edition = "2024"
 

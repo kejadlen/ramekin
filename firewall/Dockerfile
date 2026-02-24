@@ -2,9 +2,9 @@ FROM rust:1.85-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY sidecar/ sidecar/
+COPY firewall/ firewall/
 
-RUN cargo build --release --bin ramekin-sidecar
+RUN cargo build --release --bin ramekin-firewall
 
 FROM debian:bookworm-slim
 
@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/ramekin-sidecar /usr/local/bin/bridge
-COPY sidecar/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --from=builder /app/target/release/ramekin-firewall /usr/local/bin/bridge
+COPY firewall/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 EXPOSE 8080
 
