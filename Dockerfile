@@ -3,8 +3,10 @@ FROM rust:1.85-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY sidecar/Cargo.toml sidecar/Cargo.toml
+RUN mkdir -p sidecar/src && echo "fn main() {}" > sidecar/src/main.rs
 
-RUN cargo build --release
+RUN cargo build --release --bin ramekin
 
 FROM debian:bookworm-slim
 

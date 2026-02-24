@@ -1,10 +1,12 @@
-FROM golang:1.23-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /app
-COPY go.mod ./
-COPY bridge.go ./
+COPY Cargo.toml Cargo.lock ./
+COPY sidecar/Cargo.toml sidecar/Cargo.toml
+COPY sidecar/src/ sidecar/src/
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 
-RUN CGO_ENABLED=0 go build -o bridge .
+RUN cargo build --release --bin ramekin-sidecar
 
 FROM debian:bookworm-slim
 
@@ -13,8 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/bridge /usr/local/bin/bridge
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --from=builder /app/target/release/ramekin-sidecar /usr/local/bin/bridge
+COPY sidecar/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 EXPOSE 8080
 

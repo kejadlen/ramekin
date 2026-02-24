@@ -17,8 +17,8 @@ services:
 
   sidecar:
     build:
-      context: ./sidecar
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: sidecar/Dockerfile
     # NET_ADMIN is required for iptables rules.
     cap_add:
       - NET_ADMIN
