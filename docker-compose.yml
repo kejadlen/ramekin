@@ -7,6 +7,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - BRIDGE_URL=http://sidecar:8080
       - RUST_LOG=${RUST_LOG:-info}
+      - AGENT_PROMPT=${AGENT_PROMPT:-}
     depends_on:
       sidecar:
         condition: service_started
