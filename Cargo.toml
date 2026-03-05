@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "ramekin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "*", features = ["derive"] }
+color-eyre = "*"
+tracing = "*"
+tracing-subscriber = { version = "*", features = ["env-filter"] }
+xdg = "3.0.0"
