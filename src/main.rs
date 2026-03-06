@@ -7,8 +7,8 @@ use color_eyre::eyre::{Context, Result, bail};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-const COMPOSE_YML: &str = include_str!("../compose.yml");
-const DOCKERFILE: &str = include_str!("../Dockerfile");
+const COMPOSE_YML: &str = include_str!("../assets/compose.yml");
+const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
 
 #[derive(Parser)]
 #[command(about = "Run a pi coding agent in a containerized environment")]
