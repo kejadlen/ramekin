@@ -1,0 +1,10 @@
+disallowed-methods = [
+    { path = "std::fs::read_to_string", reason = "use fs_err::read_to_string" },
+    { path = "std::fs::write", reason = "use fs_err::write" },
+    { path = "std::fs::read_dir", reason = "use fs_err::read_dir" },
+    { path = "std::fs::remove_file", reason = "use fs_err::remove_file" },
+    { path = "std::fs::remove_dir_all", reason = "use fs_err::remove_dir_all" },
+    { path = "std::fs::create_dir_all", reason = "use fs_err::create_dir_all" },
+    { path = "std::fs::read_link", reason = "use fs_err::read_link" },
+    { path = "std::fs::symlink_metadata", reason = "use fs_err::symlink_metadata" },
+]

@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
@@ -53,10 +52,8 @@ fn run() -> Result<()> {
     let cache_dir = xdg
         .create_cache_directory("")
         .wrap_err("failed to create cache directory")?;
-    fs::write(cache_dir.join("compose.yml"), COMPOSE_YML)
-        .wrap_err("failed to write compose.yml")?;
-    fs::write(cache_dir.join("Dockerfile"), DOCKERFILE)
-        .wrap_err("failed to write Dockerfile")?;
+    fs_err::write(cache_dir.join("compose.yml"), COMPOSE_YML)?;
+    fs_err::write(cache_dir.join("Dockerfile"), DOCKERFILE)?;
 
     let compose_file = cache_dir.join("compose.yml");
 
