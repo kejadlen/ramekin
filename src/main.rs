@@ -14,8 +14,6 @@ struct Cli {
     workspace: PathBuf,
 }
 
-const IMAGE_NAME: &str = "ramekin-agent";
-
 fn main() -> ExitCode {
     color_eyre::install().ok();
     tracing_subscriber::registry()
@@ -43,38 +41,48 @@ fn run() -> Result<()> {
     let pi_data_dir = xdg
         .create_data_directory("")
         .wrap_err("failed to create pi data directory")?;
+
     info!(data = %pi_data_dir.display(), "pi data directory");
+    info!(workspace = %workspace.display(), "starting agent");
 
-    let dockerfile = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Dockerfile");
+    let compose_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("compose.yml");
 
-    info!("building agent image");
-    let status = Command::new("docker")
-        .args(["build", "-t", IMAGE_NAME, "-f"])
-        .arg(&dockerfile)
-        .arg(dockerfile.parent().unwrap())
+    let docker_compose = |args: &[&str]| -> Result<Command> {
+        let mut cmd = Command::new("docker");
+        cmd.args(["compose", "-f"])
+            .arg(&compose_file)
+            .args(args)
+            .env("RAMEKIN_WORKSPACE", &workspace)
+            .env("RAMEKIN_DATA_DIR", &pi_data_dir);
+        Ok(cmd)
+    };
+
+    let status = docker_compose(&["up", "-d", "--build"])?
         .status()
-        .wrap_err("failed to run docker build")?;
+        .wrap_err("failed to run docker compose up")?;
 
     if !status.success() {
-        bail!("docker build failed ({})", status);
+        bail!("docker compose up failed ({})", status);
     }
 
-    info!(?workspace, "starting agent");
-    let status = Command::new("docker")
-        .args(["run", "--rm", "-it"])
-        .arg("-v")
-        .arg(format!("{}:/workspace", workspace.display()))
-        .arg("-v")
-        .arg(format!("{}:/root/.pi", pi_data_dir.display()))
-        .arg(IMAGE_NAME)
+    let status = docker_compose(&["attach", "agent"])?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .wrap_err("failed to run docker")?;
+        .wrap_err("failed to attach to agent")?;
+
+    // Always tear down, regardless of attach exit status
+    let down_status = docker_compose(&["down"])?
+        .status()
+        .wrap_err("failed to run docker compose down")?;
+
+    if !down_status.success() {
+        error!("docker compose down failed ({})", down_status);
+    }
 
     if !status.success() {
-        bail!("docker run failed ({})", status);
+        bail!("agent exited with error ({})", status);
     }
 
     Ok(())

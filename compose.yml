@@ -1,0 +1,11 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ramekin-agent
+    stdin_open: true
+    tty: true
+    volumes:
+      - "${RAMEKIN_WORKSPACE:-.}:/workspace"
+      - "${RAMEKIN_DATA_DIR}:/root/.pi"
