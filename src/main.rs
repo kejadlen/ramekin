@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
@@ -5,6 +6,9 @@ use clap::Parser;
 use color_eyre::eyre::{Context, Result, bail};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+const COMPOSE_YML: &str = include_str!("../compose.yml");
+const DOCKERFILE: &str = include_str!("../Dockerfile");
 
 #[derive(Parser)]
 #[command(about = "Run a pi coding agent in a containerized environment")]
@@ -45,7 +49,16 @@ fn run() -> Result<()> {
     info!(data = %pi_data_dir.display(), "pi data directory");
     info!(workspace = %workspace.display(), "starting agent");
 
-    let compose_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("compose.yml");
+    // Write embedded files to XDG cache so docker compose can find them
+    let cache_dir = xdg
+        .create_cache_directory("")
+        .wrap_err("failed to create cache directory")?;
+    fs::write(cache_dir.join("compose.yml"), COMPOSE_YML)
+        .wrap_err("failed to write compose.yml")?;
+    fs::write(cache_dir.join("Dockerfile"), DOCKERFILE)
+        .wrap_err("failed to write Dockerfile")?;
+
+    let compose_file = cache_dir.join("compose.yml");
 
     let docker_compose = |args: &[&str]| -> Result<Command> {
         let mut cmd = Command::new("docker");
