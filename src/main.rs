@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const COMPOSE_YML: &str = include_str!("../assets/compose.yml");
 const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
+const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
 
 #[derive(Parser)]
 #[command(about = "Run a pi coding agent in a containerized environment")]
@@ -70,6 +71,7 @@ fn run() -> Result<()> {
         .wrap_err("failed to create cache directory")?;
     fs_err::write(cache_dir.join("compose.yml"), COMPOSE_YML)?;
     fs_err::write(cache_dir.join("Dockerfile"), DOCKERFILE)?;
+    fs_err::write(cache_dir.join("ramekin.ts"), RAMEKIN_EXTENSION)?;
 
     let compose_file = cache_dir.join("compose.yml");
 
@@ -92,7 +94,8 @@ fn run() -> Result<()> {
             .env("RAMEKIN_DATA_DIR", &pi_data_dir)
             .env("RAMEKIN_DOCKERFILE", &dockerfile)
             .env("RAMEKIN_BUILD_CONTEXT", &build_context)
-            .env("RAMEKIN_CONFIG_DIR", &pi_config_dir);
+            .env("RAMEKIN_CONFIG_DIR", &pi_config_dir)
+            .env("RAMEKIN_EXTENSION", cache_dir.join("ramekin.ts"));
         Ok(cmd)
     };
 

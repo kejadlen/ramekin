@@ -6,9 +6,15 @@ services:
     image: ramekin-agent
     stdin_open: true
     tty: true
+    environment:
+      - RAMEKIN_FIREWALL=${RAMEKIN_FIREWALL:-true}
     volumes:
       - "${RAMEKIN_WORKSPACE:-.}:/workspace"
       - "${RAMEKIN_DATA_DIR}:/root/.pi"
       - "${RAMEKIN_CONFIG_DIR}/settings.json:/root/.pi/agent/settings.json"
       - "${RAMEKIN_CONFIG_DIR}/keybindings.json:/root/.pi/agent/keybindings.json"
       - "${RAMEKIN_CONFIG_DIR}/AGENTS.md:/root/.pi/agent/AGENTS.md"
+      - type: bind
+        source: "${RAMEKIN_EXTENSION}"
+        target: /root/.pi/agent/extensions/ramekin.ts
+        read_only: true
