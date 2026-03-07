@@ -9,3 +9,6 @@ services:
     volumes:
       - "${RAMEKIN_WORKSPACE:-.}:/workspace"
       - "${RAMEKIN_DATA_DIR}:/root/.pi"
+      - "${RAMEKIN_CONFIG_DIR}/settings.json:/root/.pi/agent/settings.json"
+      - "${RAMEKIN_CONFIG_DIR}/keybindings.json:/root/.pi/agent/keybindings.json"
+      - "${RAMEKIN_CONFIG_DIR}/AGENTS.md:/root/.pi/agent/AGENTS.md"

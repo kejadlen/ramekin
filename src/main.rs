@@ -45,7 +45,23 @@ fn run() -> Result<()> {
         .create_data_directory("")
         .wrap_err("failed to create pi data directory")?;
 
-    info!(data = %pi_data_dir.display(), "pi data directory");
+    let pi_config_dir = xdg
+        .create_config_directory("")
+        .wrap_err("failed to create pi config directory")?;
+
+    // Seed empty config files if they don't exist
+    for file in ["settings.json", "keybindings.json"] {
+        let path = pi_config_dir.join(file);
+        if !path.exists() {
+            fs_err::write(&path, "{}")?;
+        }
+    }
+    let agents_md = pi_config_dir.join("AGENTS.md");
+    if !agents_md.exists() {
+        fs_err::write(&agents_md, "")?;
+    }
+
+    info!(data = %pi_data_dir.display(), config = %pi_config_dir.display(), "pi directories");
     info!(workspace = %workspace.display(), "starting agent");
 
     // Write embedded files to XDG cache so docker compose can find them
@@ -75,7 +91,8 @@ fn run() -> Result<()> {
             .env("RAMEKIN_WORKSPACE", &workspace)
             .env("RAMEKIN_DATA_DIR", &pi_data_dir)
             .env("RAMEKIN_DOCKERFILE", &dockerfile)
-            .env("RAMEKIN_BUILD_CONTEXT", &build_context);
+            .env("RAMEKIN_BUILD_CONTEXT", &build_context)
+            .env("RAMEKIN_CONFIG_DIR", &pi_config_dir);
         Ok(cmd)
     };
 
