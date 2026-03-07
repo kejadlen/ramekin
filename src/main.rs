@@ -57,13 +57,25 @@ fn run() -> Result<()> {
 
     let compose_file = cache_dir.join("compose.yml");
 
+    // Use .ramekin/Dockerfile from workspace if it exists, otherwise use the embedded one
+    let custom_dockerfile = workspace.join(".ramekin/Dockerfile");
+    let (dockerfile, build_context) = if custom_dockerfile.exists() {
+        info!("using custom Dockerfile from .ramekin/Dockerfile");
+        (custom_dockerfile, workspace.clone())
+    } else {
+        info!("using built-in Dockerfile");
+        (cache_dir.join("Dockerfile"), cache_dir.clone())
+    };
+
     let docker_compose = |args: &[&str]| -> Result<Command> {
         let mut cmd = Command::new("docker");
         cmd.args(["compose", "-f"])
             .arg(&compose_file)
             .args(args)
             .env("RAMEKIN_WORKSPACE", &workspace)
-            .env("RAMEKIN_DATA_DIR", &pi_data_dir);
+            .env("RAMEKIN_DATA_DIR", &pi_data_dir)
+            .env("RAMEKIN_DOCKERFILE", &dockerfile)
+            .env("RAMEKIN_BUILD_CONTEXT", &build_context);
         Ok(cmd)
     };
 

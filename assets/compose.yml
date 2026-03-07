@@ -1,8 +1,8 @@
 services:
   agent:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: "${RAMEKIN_BUILD_CONTEXT:-.}"
+      dockerfile: "${RAMEKIN_DOCKERFILE:-Dockerfile}"
     image: ramekin-agent
     stdin_open: true
     tty: true
