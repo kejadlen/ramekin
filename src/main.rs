@@ -75,14 +75,27 @@ fn run() -> Result<()> {
 
     let compose_file = cache_dir.join("compose.yml");
 
-    // Use .ramekin/Dockerfile from workspace if it exists, otherwise use the embedded one
+    // Always build the base image first
+    info!("building base image");
+    let base_dockerfile = cache_dir.join("Dockerfile");
+    let status = Command::new("docker")
+        .args(["build", "-t", "ramekin-agent", "-f"])
+        .arg(&base_dockerfile)
+        .arg(&cache_dir)
+        .status()
+        .wrap_err("failed to build base image")?;
+
+    if !status.success() {
+        bail!("base image build failed ({})", status);
+    }
+
+    // If a project Dockerfile exists, build it on top of the base image
     let custom_dockerfile = workspace.join(".ramekin/Dockerfile");
     let (dockerfile, build_context) = if custom_dockerfile.exists() {
-        info!("using custom Dockerfile from .ramekin/Dockerfile");
+        info!("building project image from .ramekin/Dockerfile");
         (custom_dockerfile, workspace.clone())
     } else {
-        info!("using built-in Dockerfile");
-        (cache_dir.join("Dockerfile"), cache_dir.clone())
+        (base_dockerfile, cache_dir.clone())
     };
 
     let docker_compose = |args: &[&str]| -> Result<Command> {

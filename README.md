@@ -37,7 +37,12 @@ A built-in pi extension (`ramekin.ts`) is mounted into the agent container. It a
 
 ### Custom Dockerfile
 
-Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to override the default agent image. The workspace is used as the build context, so `COPY` instructions work relative to the project root.
+Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base agent image. Use `FROM ramekin-agent` to layer on top — the base image includes Node.js, pi, git, ripgrep, and fd. The workspace is used as the build context, so `COPY` instructions work relative to the project root.
+
+```dockerfile
+FROM ramekin-agent
+RUN apt-get update && apt-get install -y ruby && rm -rf /var/lib/apt/lists/*
+```
 
 ## Development
 
