@@ -20,6 +20,9 @@ RUN case "${TARGETARCH}" in \
     curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${JJ_ARCH}-unknown-linux-musl.tar.gz" \
       | tar xz -C /usr/local/bin jj
 
+RUN jj config set --user user.name "ramekin" && \
+    jj config set --user user.email "ramekin@example.com"
+
 RUN npm install -g @mariozechner/pi-coding-agent
 
 WORKDIR /workspace
