@@ -18,7 +18,7 @@ RUN case "${TARGETARCH}" in \
       *) echo "unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
     curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${JJ_ARCH}-unknown-linux-musl.tar.gz" \
-      | tar xz -C /usr/local/bin jj
+      | tar xz --strip-components=0 -C /usr/local/bin ./jj
 
 RUN jj config set --user user.name "ramekin" && \
     jj config set --user user.email "ramekin@example.com"
