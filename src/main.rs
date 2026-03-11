@@ -69,7 +69,10 @@ fn run() -> Result<()> {
     let cache_dir = xdg
         .create_cache_directory("")
         .wrap_err("failed to create cache directory")?;
-    fs_err::write(cache_dir.join("compose.yml"), COMPOSE_YML)?;
+
+    // Inject host git/jj config mounts into compose template
+    let compose = inject_vcs_config_mounts(COMPOSE_YML);
+    fs_err::write(cache_dir.join("compose.yml"), &compose)?;
     fs_err::write(cache_dir.join("Dockerfile"), DOCKERFILE)?;
     fs_err::write(cache_dir.join("ramekin.ts"), RAMEKIN_EXTENSION)?;
 
@@ -141,4 +144,33 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Insert read-only volume mounts for host git/jj config into the compose YAML.
+fn inject_vcs_config_mounts(template: &str) -> String {
+    let git_config_dir = xdg::BaseDirectories::with_prefix("git").get_config_home();
+    let jj_config_dir = xdg::BaseDirectories::with_prefix("jj").get_config_home();
+
+    if git_config_dir.is_none() && jj_config_dir.is_none() {
+        return template.to_string();
+    }
+
+    let mut extra = String::new();
+    if let Some(ref path) = git_config_dir {
+        info!(path = %path.display(), "mounting git config dir");
+        extra.push_str(&format!(
+            "      - \"{}:/root/.config/git:ro\"\n",
+            path.display()
+        ));
+    }
+    if let Some(ref path) = jj_config_dir {
+        info!(path = %path.display(), "mounting jj config dir");
+        extra.push_str(&format!(
+            "      - \"{}:/root/.config/jj:ro\"\n",
+            path.display()
+        ));
+    }
+
+    // Insert before the extension bind mount
+    template.replace("      - type: bind", &format!("{extra}      - type: bind"))
 }
