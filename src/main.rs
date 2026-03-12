@@ -1,12 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::Parser;
 use color_eyre::eyre::{Context, Result, bail};
+use serde::Serialize;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-const COMPOSE_YML: &str = include_str!("../assets/compose.yml");
 const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
 const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
 
@@ -70,13 +70,9 @@ fn run() -> Result<()> {
         .create_cache_directory("")
         .wrap_err("failed to create cache directory")?;
 
-    // Inject host git/jj config mounts into compose template
-    let compose = inject_vcs_config_mounts(COMPOSE_YML);
-    fs_err::write(cache_dir.join("compose.yml"), &compose)?;
     fs_err::write(cache_dir.join("Dockerfile"), DOCKERFILE)?;
-    fs_err::write(cache_dir.join("ramekin.ts"), RAMEKIN_EXTENSION)?;
-
-    let compose_file = cache_dir.join("compose.yml");
+    let extension_path = cache_dir.join("ramekin.ts");
+    fs_err::write(&extension_path, RAMEKIN_EXTENSION)?;
 
     // Always build the base image first
     info!("building base image");
@@ -101,17 +97,22 @@ fn run() -> Result<()> {
         (base_dockerfile, cache_dir.clone())
     };
 
+    let compose = generate_compose(
+        &workspace,
+        &dockerfile,
+        &build_context,
+        &pi_data_dir,
+        &pi_config_dir,
+        &extension_path,
+    );
+    let compose_file = cache_dir.join("compose.yml");
+    fs_err::write(&compose_file, &compose)?;
+
     let docker_compose = |args: &[&str]| -> Result<Command> {
         let mut cmd = Command::new("docker");
         cmd.args(["compose", "-f"])
             .arg(&compose_file)
-            .args(args)
-            .env("RAMEKIN_WORKSPACE", &workspace)
-            .env("RAMEKIN_DATA_DIR", &pi_data_dir)
-            .env("RAMEKIN_DOCKERFILE", &dockerfile)
-            .env("RAMEKIN_BUILD_CONTEXT", &build_context)
-            .env("RAMEKIN_CONFIG_DIR", &pi_config_dir)
-            .env("RAMEKIN_EXTENSION", cache_dir.join("ramekin.ts"));
+            .args(args);
         Ok(cmd)
     };
 
@@ -146,31 +147,81 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Insert read-only volume mounts for host git/jj config into the compose YAML.
-fn inject_vcs_config_mounts(template: &str) -> String {
-    let git_config_dir = xdg::BaseDirectories::with_prefix("git").get_config_home();
-    let jj_config_dir = xdg::BaseDirectories::with_prefix("jj").get_config_home();
+#[derive(Serialize)]
+struct ComposeConfig {
+    services: Services,
+}
 
-    if git_config_dir.is_none() && jj_config_dir.is_none() {
-        return template.to_string();
+#[derive(Serialize)]
+struct Services {
+    agent: AgentService,
+}
+
+#[derive(Serialize)]
+struct AgentService {
+    build: BuildConfig,
+    image: String,
+    stdin_open: bool,
+    tty: bool,
+    volumes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BuildConfig {
+    context: String,
+    dockerfile: String,
+}
+
+/// Generate a Docker Compose config with all volume mounts baked in.
+fn generate_compose(
+    workspace: &Path,
+    dockerfile: &Path,
+    build_context: &Path,
+    data_dir: &Path,
+    config_dir: &Path,
+    extension_path: &Path,
+) -> String {
+    let mut volumes = vec![
+        format!("{}:/workspace", workspace.display()),
+        format!("{}:/root/.pi", data_dir.display()),
+        format!(
+            "{}/settings.json:/root/.pi/agent/settings.json",
+            config_dir.display()
+        ),
+        format!(
+            "{}/keybindings.json:/root/.pi/agent/keybindings.json",
+            config_dir.display()
+        ),
+        format!("{}/AGENTS.md:/root/.pi/agent/AGENTS.md", config_dir.display()),
+        format!(
+            "{}:/root/.pi/agent/extensions/ramekin.ts:ro",
+            extension_path.display()
+        ),
+    ];
+
+    if let Some(dir) = xdg::BaseDirectories::with_prefix("git").get_config_home() {
+        info!(path = %dir.display(), "mounting git config dir");
+        volumes.push(format!("{}:/root/.config/git:ro", dir.display()));
+    }
+    if let Some(dir) = xdg::BaseDirectories::with_prefix("jj").get_config_home() {
+        info!(path = %dir.display(), "mounting jj config dir");
+        volumes.push(format!("{}:/root/.config/jj:ro", dir.display()));
     }
 
-    let mut extra = String::new();
-    if let Some(ref path) = git_config_dir {
-        info!(path = %path.display(), "mounting git config dir");
-        extra.push_str(&format!(
-            "      - \"{}:/root/.config/git:ro\"\n",
-            path.display()
-        ));
-    }
-    if let Some(ref path) = jj_config_dir {
-        info!(path = %path.display(), "mounting jj config dir");
-        extra.push_str(&format!(
-            "      - \"{}:/root/.config/jj:ro\"\n",
-            path.display()
-        ));
-    }
+    let config = ComposeConfig {
+        services: Services {
+            agent: AgentService {
+                build: BuildConfig {
+                    context: build_context.display().to_string(),
+                    dockerfile: dockerfile.display().to_string(),
+                },
+                image: "ramekin-agent".into(),
+                stdin_open: true,
+                tty: true,
+                volumes,
+            },
+        },
+    };
 
-    // Insert before the extension bind mount
-    template.replace("      - type: bind", &format!("{extra}      - type: bind"))
+    serde_yaml::to_string(&config).expect("failed to serialize compose config")
 }

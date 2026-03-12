@@ -9,6 +9,8 @@ edition = "2024"
 clap = { version = "*", features = ["derive"] }
 color-eyre = "*"
 fs-err = "*"
+serde = { version = "*", features = ["derive"] }
+serde_yaml = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter"] }
 xdg = "*"
