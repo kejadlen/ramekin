@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     fd-find \
     git \
+    jq \
     just \
     ripgrep \
     && rm -rf /var/lib/apt/lists/* \
