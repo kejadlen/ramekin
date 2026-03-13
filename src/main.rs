@@ -61,12 +61,19 @@ fn run() -> Result<()> {
         fs_err::write(&agents_md, "")?;
     }
 
-    // User-scoped: auth shared across all sessions
+    // User-scoped: auth shared across all sessions.
+    // Seed from pi's own auth if available so the user doesn't re-authenticate.
     let auth_file = xdg
         .place_data_file("auth.json")
         .wrap_err("failed to create auth file path")?;
     if !auth_file.exists() {
-        fs_err::write(&auth_file, "{}")?;
+        let pi_auth = home_dir().map(|h| h.join(".pi/agent/auth.json"));
+        if let Some(src) = pi_auth.filter(|p| p.is_file()) {
+            info!(src = %src.display(), "seeding auth from pi");
+            fs_err::copy(&src, &auth_file)?;
+        } else {
+            fs_err::write(&auth_file, "{}")?;
+        }
     }
 
     // Repo-scoped: per-workspace pi data dir for sessions
@@ -172,6 +179,10 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
 }
 
 /// Generate a short random session ID.
