@@ -61,28 +61,18 @@ fn run() -> Result<()> {
         fs_err::write(&agents_md, "")?;
     }
 
-    // User-scoped: auth shared across all sessions.
-    // Seed from pi's own auth if available so the user doesn't re-authenticate.
-    let auth_file = xdg
-        .place_data_file("auth.json")
-        .wrap_err("failed to create auth file path")?;
-    if !auth_file.exists() {
-        let pi_auth = home_dir().map(|h| h.join(".pi/agent/auth.json"));
-        if let Some(src) = pi_auth.filter(|p| p.is_file()) {
-            info!(src = %src.display(), "seeding auth from pi");
-            fs_err::copy(&src, &auth_file)?;
-        } else {
-            fs_err::write(&auth_file, "{}")?;
-        }
-    }
+    // User-scoped: pi data dir shared across all sessions
+    let pi_data_dir = xdg
+        .create_data_directory("")
+        .wrap_err("failed to create pi data directory")?;
 
-    // Repo-scoped: per-workspace pi data dir for sessions
+    // Repo-scoped: per-workspace sessions directory
     let repo_slug = repo_slug(&workspace);
-    let repo_data_dir = xdg
-        .create_data_directory(format!("repos/{repo_slug}"))
-        .wrap_err("failed to create repo data directory")?;
+    let repo_sessions_dir = xdg
+        .create_data_directory(format!("repos/{repo_slug}/sessions"))
+        .wrap_err("failed to create repo sessions directory")?;
 
-    info!(config = %config_dir.display(), repo = %repo_data_dir.display(), "directories");
+    info!(config = %config_dir.display(), repo = %repo_sessions_dir.display(), "directories");
     info!(workspace = %workspace.display(), "starting agent");
 
     // User-scoped: embedded assets
@@ -127,8 +117,8 @@ fn run() -> Result<()> {
         &workspace,
         &dockerfile,
         &build_context,
-        &repo_data_dir,
-        &auth_file,
+        &pi_data_dir,
+        &repo_sessions_dir,
         &config_dir,
         &extension_path,
     );
@@ -181,10 +171,6 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
-}
-
 /// Generate a short random session ID.
 fn session_id() -> String {
     format!("{:x}", std::process::id())
@@ -232,15 +218,15 @@ fn generate_compose(
     workspace: &Path,
     dockerfile: &Path,
     build_context: &Path,
-    repo_data_dir: &Path,
-    auth_file: &Path,
+    pi_data_dir: &Path,
+    repo_sessions_dir: &Path,
     config_dir: &Path,
     extension_path: &Path,
 ) -> String {
     let mut volumes = vec![
+        format!("{}:/root/.pi", pi_data_dir.display()),
+        format!("{}:/root/.pi/agent/sessions", repo_sessions_dir.display()),
         format!("{}:/workspace", workspace.display()),
-        format!("{}:/root/.pi", repo_data_dir.display()),
-        format!("{}:/root/.pi/auth.json", auth_file.display()),
         format!(
             "{}/settings.json:/root/.pi/agent/settings.json",
             config_dir.display()
