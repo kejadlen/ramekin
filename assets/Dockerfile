@@ -3,6 +3,7 @@ FROM node:24-trixie-slim
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     curl \
     fd-find \
