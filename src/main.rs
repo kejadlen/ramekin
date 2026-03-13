@@ -207,6 +207,10 @@ fn generate_compose(
         info!(path = %dir.display(), "mounting jj config dir");
         volumes.push(format!("{}:/root/.config/jj:ro", dir.display()));
     }
+    if let Some(dir) = xdg::BaseDirectories::with_prefix("ranger").get_data_home() {
+        info!(path = %dir.display(), "mounting ranger data dir");
+        volumes.push(format!("{}:/root/.local/share/ranger", dir.display()));
+    }
 
     let config = ComposeConfig {
         services: Services {

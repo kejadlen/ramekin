@@ -23,6 +23,11 @@ RUN case "${TARGETARCH}" in \
     curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${JJ_ARCH}-unknown-linux-musl.tar.gz" \
       | tar xz --strip-components=0 -C /usr/local/bin ./jj
 
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN cargo install --git https://github.com/kejadlen/ranger.git --locked
+
 RUN jj config set --user user.name "ramekin" && \
     jj config set --user user.email "ramekin@example.com"
 
