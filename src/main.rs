@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Context, Result, bail};
 use serde::Serialize;
 use tracing::{error, info};
@@ -15,9 +15,24 @@ const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
 #[derive(Parser)]
 #[command(about = "Run a pi coding agent in a containerized environment")]
 struct Cli {
-    /// Workspace directory to mount (defaults to current directory)
-    #[arg(default_value = ".")]
-    workspace: PathBuf,
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Start a containerized pi agent session
+    Run {
+        /// Workspace directory to mount (defaults to current directory)
+        #[arg(default_value = ".")]
+        workspace: PathBuf,
+    },
+    /// Show resolved paths and mount configuration
+    Config {
+        /// Workspace directory to resolve (defaults to current directory)
+        #[arg(default_value = ".")]
+        workspace: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -27,7 +42,13 @@ fn main() -> ExitCode {
         .with(EnvFilter::from_default_env())
         .init();
 
-    if let Err(e) = run() {
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Cmd::Run { workspace } => cmd_run(workspace),
+        Cmd::Config { workspace } => cmd_config(workspace),
+    };
+
+    if let Err(e) = result {
         error!("{e:?}");
         return ExitCode::FAILURE;
     }
@@ -35,62 +56,179 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+// ---------------------------------------------------------------------------
+// Resolved paths shared by run and config
+// ---------------------------------------------------------------------------
 
-    let workspace = cli
-        .workspace
+struct Dirs {
+    workspace: PathBuf,
+    agent_dir: PathBuf,
+    pi_data_dir: PathBuf,
+    repo_sessions_dir: PathBuf,
+    cache_dir: PathBuf,
+    custom_dockerfile: PathBuf,
+}
+
+/// Resolve all XDG directories and ensure the agent directory structure exists.
+fn resolve_dirs(workspace_arg: PathBuf) -> Result<Dirs> {
+    let workspace = workspace_arg
         .canonicalize()
-        .wrap_err_with(|| format!("workspace path does not exist: {}", cli.workspace.display()))?;
+        .wrap_err_with(|| format!("workspace path does not exist: {}", workspace_arg.display()))?;
 
     let xdg = xdg::BaseDirectories::with_prefix("ramekin");
 
-    // User-scoped: config files shared across all sessions
-    let config_dir = xdg
-        .create_config_directory("")
-        .wrap_err("failed to create config directory")?;
+    // User-scoped: agent directory mirrors /root/.pi/agent in the container.
+    // Skills, extensions, settings, keybindings, and AGENTS.md all live here.
+    let agent_dir = xdg
+        .create_config_directory("agent")
+        .wrap_err("failed to create agent config directory")?;
 
     for file in ["settings.json", "keybindings.json"] {
-        let path = config_dir.join(file);
+        let path = agent_dir.join(file);
         if !path.is_file() {
             fs_err::write(&path, "{}")?;
         }
     }
-    let agents_md = config_dir.join("AGENTS.md");
+    let agents_md = agent_dir.join("AGENTS.md");
     if !agents_md.exists() {
         fs_err::write(&agents_md, "")?;
     }
 
-    // User-scoped: pi data dir shared across all sessions
+    let extensions_dir = xdg
+        .create_config_directory("agent/extensions")
+        .wrap_err("failed to create extensions directory")?;
+    fs_err::write(extensions_dir.join("ramekin.ts"), RAMEKIN_EXTENSION)?;
+
+    xdg.create_config_directory("agent/skills")
+        .wrap_err("failed to create skills directory")?;
+
     let pi_data_dir = xdg
         .create_data_directory("")
         .wrap_err("failed to create pi data directory")?;
 
-    // Repo-scoped: per-workspace sessions directory
     let repo_slug = repo_slug(&workspace);
     let repo_sessions_dir = xdg
         .create_data_directory(format!("repos/{repo_slug}/sessions"))
         .wrap_err("failed to create repo sessions directory")?;
 
-    info!(config = %config_dir.display(), repo = %repo_sessions_dir.display(), "directories");
-    info!(workspace = %workspace.display(), "starting agent");
-
-    // User-scoped: embedded assets
     let cache_dir = xdg
         .create_cache_directory("")
         .wrap_err("failed to create cache directory")?;
 
-    fs_err::write(cache_dir.join("Dockerfile"), DOCKERFILE)?;
-    let extension_path = cache_dir.join("ramekin.ts");
-    fs_err::write(&extension_path, RAMEKIN_EXTENSION)?;
+    let custom_dockerfile = workspace.join(".ramekin/Dockerfile");
+
+    Ok(Dirs {
+        workspace,
+        agent_dir,
+        pi_data_dir,
+        repo_sessions_dir,
+        cache_dir,
+        custom_dockerfile,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// config subcommand
+// ---------------------------------------------------------------------------
+
+fn cmd_config(workspace: PathBuf) -> Result<()> {
+    let dirs = resolve_dirs(workspace)?;
+
+    let check = |path: &Path| if path.exists() { "✓" } else { "✗" };
+
+    println!("Workspace");
+    println!("  {} {}", check(&dirs.workspace), dirs.workspace.display());
+
+    println!();
+    println!("Ramekin directories");
+    println!(
+        "  {} agent    {}",
+        check(&dirs.agent_dir),
+        dirs.agent_dir.display()
+    );
+    println!(
+        "  {} data     {}",
+        check(&dirs.pi_data_dir),
+        dirs.pi_data_dir.display()
+    );
+    println!(
+        "  {} sessions {}",
+        check(&dirs.repo_sessions_dir),
+        dirs.repo_sessions_dir.display()
+    );
+    println!(
+        "  {} cache    {}",
+        check(&dirs.cache_dir),
+        dirs.cache_dir.display()
+    );
+
+    println!();
+    println!("Volume mounts");
+    let mut mounts: Vec<(&Path, &str)> = vec![
+        (&dirs.pi_data_dir, "/root/.pi"),
+        (&dirs.agent_dir, "/root/.pi/agent"),
+        (&dirs.repo_sessions_dir, "/root/.pi/agent/sessions"),
+        (&dirs.workspace, "/workspace"),
+    ];
+
+    let git_config = xdg::BaseDirectories::with_prefix("git").get_config_home();
+    let jj_config = xdg::BaseDirectories::with_prefix("jj").get_config_home();
+    let ranger_data = xdg::BaseDirectories::with_prefix("ranger").get_data_home();
+
+    if let Some(ref dir) = git_config {
+        if dir.is_dir() {
+            mounts.push((dir, "/root/.config/git (ro)"));
+        }
+    }
+    if let Some(ref dir) = jj_config {
+        if dir.is_dir() {
+            mounts.push((dir, "/root/.config/jj (ro)"));
+        }
+    }
+    if let Some(ref dir) = ranger_data {
+        if dir.is_dir() {
+            mounts.push((dir, "/root/.local/share/ranger"));
+        }
+    }
+
+    for (source, target) in mounts {
+        println!("  {} {} → {}", check(source), source.display(), target);
+    }
+
+    println!();
+    println!("Dockerfile");
+    if dirs.custom_dockerfile.is_file() {
+        println!("  ✓ {}", dirs.custom_dockerfile.display());
+    } else {
+        println!("  embedded (default)");
+        println!(
+            "  ✗ {} (not found)",
+            dirs.custom_dockerfile.display()
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// run subcommand
+// ---------------------------------------------------------------------------
+
+fn cmd_run(workspace: PathBuf) -> Result<()> {
+    let dirs = resolve_dirs(workspace)?;
+
+    info!(agent = %dirs.agent_dir.display(), repo = %dirs.repo_sessions_dir.display(), "directories");
+    info!(workspace = %dirs.workspace.display(), "starting agent");
+
+    fs_err::write(dirs.cache_dir.join("Dockerfile"), DOCKERFILE)?;
 
     // Always build the base image first
     info!("building base image");
-    let base_dockerfile = cache_dir.join("Dockerfile");
+    let base_dockerfile = dirs.cache_dir.join("Dockerfile");
     let status = Command::new("docker")
         .args(["build", "-t", "ramekin-agent", "-f"])
         .arg(&base_dockerfile)
-        .arg(&cache_dir)
+        .arg(&dirs.cache_dir)
         .status()
         .wrap_err("failed to build base image")?;
 
@@ -99,28 +237,27 @@ fn run() -> Result<()> {
     }
 
     // If a project Dockerfile exists, build it on top of the base image
-    let custom_dockerfile = workspace.join(".ramekin/Dockerfile");
-    let (dockerfile, build_context) = if custom_dockerfile.exists() {
+    let (dockerfile, build_context) = if dirs.custom_dockerfile.exists() {
         info!("building project image from .ramekin/Dockerfile");
-        (custom_dockerfile, workspace.clone())
+        (dirs.custom_dockerfile.clone(), dirs.workspace.clone())
     } else {
-        (base_dockerfile, cache_dir.clone())
+        (base_dockerfile, dirs.cache_dir.clone())
     };
 
     // Session-scoped: unique compose file and project name
+    let xdg = xdg::BaseDirectories::with_prefix("ramekin");
     let session_id = session_id();
     let session_dir = xdg
         .create_cache_directory(format!("sessions/{session_id}"))
         .wrap_err("failed to create session directory")?;
 
     let compose = generate_compose(
-        &workspace,
+        &dirs.workspace,
         &dockerfile,
         &build_context,
-        &pi_data_dir,
-        &repo_sessions_dir,
-        &config_dir,
-        &extension_path,
+        &dirs.pi_data_dir,
+        &dirs.agent_dir,
+        &dirs.repo_sessions_dir,
     );
     let compose_file = session_dir.join("compose.yml");
     fs_err::write(&compose_file, &compose)?;
@@ -171,6 +308,10 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /// Generate a short random session ID.
 fn session_id() -> String {
     format!("{:x}", std::process::id())
@@ -213,46 +354,36 @@ struct BuildConfig {
     dockerfile: String,
 }
 
-/// Generate a Docker Compose config with all volume mounts baked in.
+/// Generate a Docker Compose config with all volume mounts.
 fn generate_compose(
     workspace: &Path,
     dockerfile: &Path,
     build_context: &Path,
     pi_data_dir: &Path,
+    agent_dir: &Path,
     repo_sessions_dir: &Path,
-    config_dir: &Path,
-    extension_path: &Path,
 ) -> String {
     let mut volumes = vec![
         format!("{}:/root/.pi", pi_data_dir.display()),
+        format!("{}:/root/.pi/agent", agent_dir.display()),
         format!("{}:/root/.pi/agent/sessions", repo_sessions_dir.display()),
         format!("{}:/workspace", workspace.display()),
-        format!(
-            "{}/settings.json:/root/.pi/agent/settings.json",
-            config_dir.display()
-        ),
-        format!(
-            "{}/keybindings.json:/root/.pi/agent/keybindings.json",
-            config_dir.display()
-        ),
-        format!("{}/AGENTS.md:/root/.pi/agent/AGENTS.md", config_dir.display()),
-        format!(
-            "{}:/root/.pi/agent/extensions/ramekin.ts:ro",
-            extension_path.display()
-        ),
     ];
 
     if let Some(dir) = xdg::BaseDirectories::with_prefix("git").get_config_home() {
-        info!(path = %dir.display(), "mounting git config dir");
-        volumes.push(format!("{}:/root/.config/git:ro", dir.display()));
+        if dir.is_dir() {
+            volumes.push(format!("{}:/root/.config/git:ro", dir.display()));
+        }
     }
     if let Some(dir) = xdg::BaseDirectories::with_prefix("jj").get_config_home() {
-        info!(path = %dir.display(), "mounting jj config dir");
-        volumes.push(format!("{}:/root/.config/jj:ro", dir.display()));
+        if dir.is_dir() {
+            volumes.push(format!("{}:/root/.config/jj:ro", dir.display()));
+        }
     }
     if let Some(dir) = xdg::BaseDirectories::with_prefix("ranger").get_data_home() {
-        info!(path = %dir.display(), "mounting ranger data dir");
-        volumes.push(format!("{}:/root/.local/share/ranger", dir.display()));
+        if dir.is_dir() {
+            volumes.push(format!("{}:/root/.local/share/ranger", dir.display()));
+        }
     }
 
     let config = ComposeConfig {
