@@ -16,7 +16,11 @@ const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
 #[command(about = "Run a pi coding agent in a containerized environment")]
 struct Cli {
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
+
+    /// Workspace directory to mount (defaults to current directory)
+    #[arg(default_value = ".")]
+    workspace: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -44,8 +48,9 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let result = match cli.command {
-        Cmd::Run { workspace } => cmd_run(workspace),
-        Cmd::Config { workspace } => cmd_config(workspace),
+        Some(Cmd::Run { workspace }) => cmd_run(workspace),
+        Some(Cmd::Config { workspace }) => cmd_config(workspace),
+        None => cmd_run(cli.workspace),
     };
 
     if let Err(e) = result {
