@@ -12,8 +12,10 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
 const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
 
+const VERSION: &str = env!("RAMEKIN_VERSION");
+
 #[derive(Parser)]
-#[command(about = "Run a pi coding agent in a containerized environment")]
+#[command(about = "Run a pi coding agent in a containerized environment", version = VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,

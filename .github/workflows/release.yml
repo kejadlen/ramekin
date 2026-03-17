@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [rewrite]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate version
+        id: version
+        run: |
+          CALVER=$(date -u +"%Y-%m-%d")
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=${CALVER}+${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build
+        run: |
+          RAMEKIN_VERSION="${{ steps.version.outputs.version }}" cargo build --release
+          tar -czf ramekin-aarch64-apple-darwin.tar.gz -C target/release ramekin
+
+      - name: Publish
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            ramekin-aarch64-apple-darwin.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  dotslash:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate DotSlash file
+        uses: facebook/dotslash-publish-release@v1
+        with:
+          config: .github/dotslash-config.json
+          tag: v${{ needs.build.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
