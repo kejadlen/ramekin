@@ -30,6 +30,10 @@ enum Cmd {
         /// Workspace directory to mount (defaults to current directory)
         #[arg(default_value = ".")]
         workspace: PathBuf,
+
+        /// Force a full image rebuild (ignores Docker layer cache)
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Show resolved paths and mount configuration
     Config {
@@ -48,9 +52,9 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let result = match cli.command {
-        Some(Cmd::Run { workspace }) => cmd_run(workspace),
+        Some(Cmd::Run { workspace, rebuild }) => cmd_run(workspace, rebuild),
         Some(Cmd::Config { workspace }) => cmd_config(workspace),
-        None => cmd_run(cli.workspace),
+        None => cmd_run(cli.workspace, false),
     };
 
     if let Err(e) = result {
@@ -216,7 +220,7 @@ fn cmd_config(workspace: PathBuf) -> Result<()> {
 // run subcommand
 // ---------------------------------------------------------------------------
 
-fn cmd_run(workspace: PathBuf) -> Result<()> {
+fn cmd_run(workspace: PathBuf, rebuild: bool) -> Result<()> {
     let dirs = resolve_dirs(workspace)?;
 
     info!(agent = %dirs.agent_dir.display(), repo = %dirs.repo_sessions_dir.display(), "directories");
@@ -224,15 +228,22 @@ fn cmd_run(workspace: PathBuf) -> Result<()> {
 
     fs_err::write(dirs.cache_dir.join("Dockerfile"), DOCKERFILE)?;
 
-    // Always build the base image first
-    info!("building base image");
+    // Build the base image (--no-cache --pull when --rebuild is set)
+    if rebuild {
+        info!("rebuilding base image (no cache)");
+    } else {
+        info!("building base image");
+    }
     let base_dockerfile = dirs.cache_dir.join("Dockerfile");
-    let status = Command::new("docker")
+    let mut build_cmd = Command::new("docker");
+    build_cmd
         .args(["build", "-t", "ramekin-agent", "-f"])
-        .arg(&base_dockerfile)
-        .arg(&dirs.cache_dir)
-        .status()
-        .wrap_err("failed to build base image")?;
+        .arg(&base_dockerfile);
+    if rebuild {
+        build_cmd.args(["--no-cache", "--pull"]);
+    }
+    build_cmd.arg(&dirs.cache_dir);
+    let status = build_cmd.status().wrap_err("failed to build base image")?;
 
     if !status.success() {
         bail!("base image build failed ({})", status);
