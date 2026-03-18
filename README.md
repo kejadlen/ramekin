@@ -5,8 +5,9 @@ Containerized harness for running the [pi coding agent](https://github.com/badlo
 ## Quick start
 
 ```sh
-cargo run               # run pi in a container against the current directory
-cargo run -- /some/path  # mount a specific workspace
+ramekin              # run pi against the current directory
+ramekin /some/path   # mount a specific workspace
+ramekin run --rebuild  # force a full image rebuild
 ```
 
 Ramekin builds a Docker image with pi and its dependencies, starts it via Docker Compose, and attaches your terminal. Auth state, settings, and keybindings persist across runs.
@@ -16,20 +17,37 @@ Ramekin builds a Docker image with pi and its dependencies, starts it via Docker
 A Rust CLI orchestrates a Docker Compose stack. On each run it:
 
 1. Creates XDG directories for persistent state
-2. Writes the embedded Dockerfile and compose file to `$XDG_CACHE_HOME/ramekin/`
-3. Starts the agent container with the workspace mounted at `/workspace`
-4. Attaches interactively, then tears down on exit
+2. Writes the embedded Dockerfile to `$XDG_CACHE_HOME/ramekin/`
+3. Generates a compose config and writes it to a session-scoped cache directory
+4. Builds the agent image (and a project-specific layer, if one exists)
+5. Starts the agent container with the workspace mounted at `/workspace`
+6. Attaches interactively, then tears down on exit
+
+### Subcommands
+
+`run` (default) starts a containerized pi session. Pass `--rebuild` to ignore Docker layer cache and pull fresh base images.
+
+`config` prints resolved paths, volume mounts, and Dockerfile status without starting anything — useful for debugging mount issues.
 
 ### Persistence
 
-| What | Where (host) | Where (container) |
-|---|---|---|
-| Auth, sessions | `$XDG_DATA_HOME/ramekin/` | `/root/.pi` |
-| settings.json | `$XDG_CONFIG_HOME/ramekin/settings.json` | `/root/.pi/agent/settings.json` |
-| keybindings.json | `$XDG_CONFIG_HOME/ramekin/keybindings.json` | `/root/.pi/agent/keybindings.json` |
-| AGENTS.md | `$XDG_CONFIG_HOME/ramekin/AGENTS.md` | `/root/.pi/agent/AGENTS.md` |
+The agent directory (`$XDG_CONFIG_HOME/ramekin/agent/`) is mounted into the container at `/root/.pi/agent`. It holds:
 
-Settings and keybindings are seeded as empty JSON (`{}`) on first run. AGENTS.md is seeded empty.
+| File | Seeded as |
+|---|---|
+| settings.json | `{}` |
+| keybindings.json | `{}` |
+| AGENTS.md | empty |
+
+The full pi data directory (`$XDG_DATA_HOME/ramekin/`) is mounted at `/root/.pi` for auth tokens and session history. Each workspace also gets its own sessions directory under `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`.
+
+Additional read-only mounts are added when the host directories exist:
+
+| Host path | Container path |
+|---|---|
+| `$XDG_CONFIG_HOME/git/` | `/root/.config/git` (read-only) |
+| `$XDG_CONFIG_HOME/jj/` | `/root/.config/jj` (read-only) |
+| `$XDG_DATA_HOME/ranger/` | `/root/.local/share/ranger` |
 
 ### Container environment extension
 
@@ -37,7 +55,9 @@ A built-in pi extension (`ramekin.ts`) is mounted into the agent container. It a
 
 ### Custom Dockerfile
 
-Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base agent image. Use `FROM ramekin-agent` to layer on top — the base image includes Node.js, pi, git, ripgrep, and fd. The workspace is used as the build context, so `COPY` instructions work relative to the project root.
+Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base agent image. Use `FROM ramekin-agent` to layer on top — the base image includes Node.js, pi, git, jj, ripgrep, fd, just, and Rust tooling.
+
+The workspace is used as the build context, so `COPY` instructions work relative to the project root.
 
 ```dockerfile
 FROM ramekin-agent
@@ -50,5 +70,7 @@ RUN apt-get update && apt-get install -y ruby && rm -rf /var/lib/apt/lists/*
 cargo check    # type-check
 cargo fmt      # format
 cargo clippy   # lint
-just           # all three
+cargo test     # run tests
+just           # all four
+just install   # cargo install from local source
 ```
