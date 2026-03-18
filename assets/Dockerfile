@@ -27,6 +27,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN cargo install --git https://github.com/kejadlen/ranger.git --locked
+RUN cargo install difftastic --locked
 
 RUN jj config set --user user.name "ramekin" && \
     jj config set --user user.email "ramekin@example.com"
