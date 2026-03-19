@@ -1,3 +1,5 @@
+mod config;
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -175,35 +177,24 @@ fn cmd_config(workspace: PathBuf) -> Result<()> {
 
     println!();
     println!("Volume mounts");
-    let mut mounts: Vec<(&Path, &str)> = vec![
+    let builtin_mounts: Vec<(&Path, &str)> = vec![
         (&dirs.pi_data_dir, "/root/.pi"),
         (&dirs.agent_dir, "/root/.pi/agent"),
         (&dirs.repo_sessions_dir, "/root/.pi/agent/sessions"),
         (&dirs.workspace, "/workspace"),
     ];
-
-    let git_config = xdg::BaseDirectories::with_prefix("git").get_config_home();
-    let jj_config = xdg::BaseDirectories::with_prefix("jj").get_config_home();
-    let ranger_data = xdg::BaseDirectories::with_prefix("ranger").get_data_home();
-
-    if let Some(ref dir) = git_config
-        && dir.is_dir()
-    {
-        mounts.push((dir, "/root/.config/git (ro)"));
-    }
-    if let Some(ref dir) = jj_config
-        && dir.is_dir()
-    {
-        mounts.push((dir, "/root/.config/jj (ro)"));
-    }
-    if let Some(ref dir) = ranger_data
-        && dir.is_dir()
-    {
-        mounts.push((dir, "/root/.local/share/ranger"));
-    }
-
-    for (source, target) in mounts {
+    for (source, target) in builtin_mounts {
         println!("  {} {} → {}", check(source), source.display(), target);
+    }
+
+    let user_mounts = config::Config::default().resolve_mounts();
+    for m in &user_mounts {
+        println!(
+            "  {} {} → {}",
+            check(&m.source),
+            m.source.display(),
+            m.display_target()
+        );
     }
 
     println!();
@@ -385,20 +376,8 @@ fn generate_compose(
         format!("{}:/workspace", workspace.display()),
     ];
 
-    if let Some(dir) = xdg::BaseDirectories::with_prefix("git").get_config_home()
-        && dir.is_dir()
-    {
-        volumes.push(format!("{}:/root/.config/git:ro", dir.display()));
-    }
-    if let Some(dir) = xdg::BaseDirectories::with_prefix("jj").get_config_home()
-        && dir.is_dir()
-    {
-        volumes.push(format!("{}:/root/.config/jj:ro", dir.display()));
-    }
-    if let Some(dir) = xdg::BaseDirectories::with_prefix("ranger").get_data_home()
-        && dir.is_dir()
-    {
-        volumes.push(format!("{}:/root/.local/share/ranger", dir.display()));
+    for m in config::Config::default().resolve_mounts() {
+        volumes.push(m.to_volume_string());
     }
 
     let config = ComposeConfig {

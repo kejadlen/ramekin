@@ -11,6 +11,7 @@ color-eyre = "*"
 fs-err = "*"
 serde = { version = "*", features = ["derive"] }
 serde_yaml = "*"
+shellexpand = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter"] }
 xdg = "*"
