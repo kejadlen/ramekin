@@ -12,7 +12,10 @@ pub struct Config {
 pub struct Mount {
     pub source: String,
     pub target: Option<String>,
-    #[serde(default, deserialize_with = "serde_kdl2::bare_defaults::bool::bare_true")]
+    #[serde(
+        default,
+        deserialize_with = "serde_kdl2::bare_defaults::bool::bare_true"
+    )]
     pub writable: bool,
 }
 
