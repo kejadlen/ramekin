@@ -82,6 +82,31 @@ struct Dirs {
     custom_dockerfile: PathBuf,
 }
 
+impl Dirs {
+    /// All volume mounts: builtin (always present) + config (user-configurable,
+    /// skipped when source doesn't exist).
+    fn all_mounts(&self) -> Vec<config::ResolvedMount> {
+        let builtin = [
+            (&self.pi_data_dir, "/root/.pi"),
+            (&self.agent_dir, "/root/.pi/agent"),
+            (&self.repo_sessions_dir, "/root/.pi/agent/sessions"),
+            (&self.workspace, "/workspace"),
+        ];
+
+        let mut mounts: Vec<config::ResolvedMount> = builtin
+            .into_iter()
+            .map(|(source, target)| config::ResolvedMount {
+                source: source.clone(),
+                target: target.into(),
+                read_only: false,
+            })
+            .collect();
+
+        mounts.extend(config::Config::default().resolve_mounts());
+        mounts
+    }
+}
+
 /// Resolve all XDG directories and ensure the agent directory structure exists.
 fn resolve_dirs(workspace_arg: PathBuf) -> Result<Dirs> {
     let workspace = workspace_arg
@@ -177,18 +202,7 @@ fn cmd_config(workspace: PathBuf) -> Result<()> {
 
     println!();
     println!("Volume mounts");
-    let builtin_mounts: Vec<(&Path, &str)> = vec![
-        (&dirs.pi_data_dir, "/root/.pi"),
-        (&dirs.agent_dir, "/root/.pi/agent"),
-        (&dirs.repo_sessions_dir, "/root/.pi/agent/sessions"),
-        (&dirs.workspace, "/workspace"),
-    ];
-    for (source, target) in builtin_mounts {
-        println!("  {} {} → {}", check(source), source.display(), target);
-    }
-
-    let user_mounts = config::Config::default().resolve_mounts();
-    for m in &user_mounts {
+    for m in dirs.all_mounts() {
         println!(
             "  {} {} → {}",
             check(&m.source),
@@ -257,14 +271,7 @@ fn cmd_run(workspace: PathBuf, rebuild: bool) -> Result<()> {
         .create_cache_directory(format!("sessions/{session_id}"))
         .wrap_err("failed to create session directory")?;
 
-    let compose = generate_compose(
-        &dirs.workspace,
-        &dockerfile,
-        &build_context,
-        &dirs.pi_data_dir,
-        &dirs.agent_dir,
-        &dirs.repo_sessions_dir,
-    );
+    let compose = generate_compose(&dockerfile, &build_context, &dirs.all_mounts());
     let compose_file = session_dir.join("compose.yml");
     fs_err::write(&compose_file, &compose)?;
 
@@ -362,23 +369,11 @@ struct BuildConfig {
 
 /// Generate a Docker Compose config with all volume mounts.
 fn generate_compose(
-    workspace: &Path,
     dockerfile: &Path,
     build_context: &Path,
-    pi_data_dir: &Path,
-    agent_dir: &Path,
-    repo_sessions_dir: &Path,
+    mounts: &[config::ResolvedMount],
 ) -> String {
-    let mut volumes = vec![
-        format!("{}:/root/.pi", pi_data_dir.display()),
-        format!("{}:/root/.pi/agent", agent_dir.display()),
-        format!("{}:/root/.pi/agent/sessions", repo_sessions_dir.display()),
-        format!("{}:/workspace", workspace.display()),
-    ];
-
-    for m in config::Config::default().resolve_mounts() {
-        volumes.push(m.to_volume_string());
-    }
+    let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
 
     let config = ComposeConfig {
         services: Services {
