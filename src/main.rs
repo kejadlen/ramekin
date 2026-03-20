@@ -139,7 +139,8 @@ impl Ramekin {
             .collect();
 
         // Config mounts (user-configurable, skipped when source doesn't exist)
-        mounts.extend(config::Config::default().resolve_mounts());
+        let config = config::Config::load().wrap_err("failed to load ramekin configuration")?;
+        mounts.extend(config.resolve_mounts());
 
         Ok(Self {
             workspace,

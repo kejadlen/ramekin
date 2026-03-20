@@ -10,6 +10,7 @@ clap = { version = "*", features = ["derive"] }
 color-eyre = "*"
 fs-err = "*"
 serde = { version = "*", features = ["derive"] }
+serde-kdl2 = "*"
 serde_yaml = "*"
 shellexpand = "*"
 tracing = "*"

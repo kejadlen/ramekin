@@ -1,14 +1,18 @@
 use std::path::PathBuf;
 
-#[derive(Debug, PartialEq)]
+use color_eyre::eyre::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub mounts: Vec<Mount>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Mount {
     pub source: String,
     pub target: Option<String>,
+    #[serde(default)]
     pub read_only: bool,
 }
 
@@ -22,6 +26,33 @@ pub struct ResolvedMount {
 
 impl Default for Config {
     fn default() -> Self {
+        Self::fallback()
+    }
+}
+
+impl Config {
+    /// Load configuration from `~/.config/ramekin/config.kdl`.
+    ///
+    /// If the file doesn't exist, create it with default contents.
+    /// If it exists but can't be parsed, return an error.
+    pub fn load() -> Result<Self> {
+        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
+        let config_path = xdg
+            .place_config_file("config.kdl")
+            .wrap_err("failed to determine config file path")?;
+
+        if !config_path.exists() {
+            return Ok(Self::fallback());
+        }
+
+        let content =
+            fs_err::read_to_string(&config_path).wrap_err("failed to read config file")?;
+
+        serde_kdl2::from_str(&content).wrap_err("failed to parse config file")
+    }
+
+    /// Fallback configuration with hardcoded mounts.
+    fn fallback() -> Self {
         Self {
             mounts: vec![
                 Mount {
@@ -110,9 +141,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_has_three_mounts() {
-        let config = Config::default();
+    fn fallback_has_three_mounts() {
+        let config = Config::fallback();
         assert_eq!(config.mounts.len(), 3);
+    }
+
+    #[test]
+    fn kdl_deserialization_works() {
+        let kdl_content = r#"
+            mounts{
+            source "~/.config/git"
+            read_only #true
+            }
+            mounts{
+            source "~/.config/jj"  
+            read_only #true
+            }
+            mounts{
+            source "~/.local/share/ranger"
+            read_only #false
+            }
+            mounts{
+            source "~/Downloads"
+            target "/root/downloads"
+            }
+        "#;
+
+        let parsed: Config = serde_kdl2::from_str(kdl_content).unwrap();
+        assert_eq!(parsed.mounts.len(), 4);
+        assert_eq!(parsed.mounts[0].source, "~/.config/git");
+        assert!(parsed.mounts[0].read_only);
+        assert_eq!(parsed.mounts[3].target, Some("/root/downloads".into()));
+    }
+
+    #[test]
+    fn kdl_parse_error_on_invalid_syntax() {
+        let invalid_kdl = "invalid_syntax_here{ missing closing brace";
+        let result: Result<Config, _> = serde_kdl2::from_str(invalid_kdl);
+        assert!(result.is_err());
     }
 
     #[test]
