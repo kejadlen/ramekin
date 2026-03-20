@@ -13,7 +13,7 @@ pub struct Mount {
     pub source: String,
     pub target: Option<String>,
     #[serde(default)]
-    pub read_only: bool,
+    pub writable: bool,
 }
 
 /// A mount with tilde-expanded paths ready for Docker.
@@ -21,7 +21,7 @@ pub struct Mount {
 pub struct ResolvedMount {
     pub source: PathBuf,
     pub target: String,
-    pub read_only: bool,
+    pub writable: bool,
 }
 
 impl Default for Config {
@@ -58,17 +58,17 @@ impl Config {
                 Mount {
                     source: "~/.config/git".into(),
                     target: None,
-                    read_only: true,
+                    writable: false,
                 },
                 Mount {
                     source: "~/.config/jj".into(),
                     target: None,
-                    read_only: true,
+                    writable: false,
                 },
                 Mount {
                     source: "~/.local/share/ranger".into(),
                     target: None,
-                    read_only: false,
+                    writable: true,
                 },
             ],
         }
@@ -100,7 +100,7 @@ impl Mount {
         Some(ResolvedMount {
             source: expanded,
             target,
-            read_only: self.read_only,
+            writable: self.writable,
         })
     }
 }
@@ -108,19 +108,19 @@ impl Mount {
 impl ResolvedMount {
     /// Format as a Docker volume mount string (`source:target` or `source:target:ro`).
     pub fn to_volume_string(&self) -> String {
-        if self.read_only {
-            format!("{}:{}:ro", self.source.display(), self.target)
-        } else {
+        if self.writable {
             format!("{}:{}", self.source.display(), self.target)
+        } else {
+            format!("{}:{}:ro", self.source.display(), self.target)
         }
     }
 
     /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
     pub fn display_target(&self) -> String {
-        if self.read_only {
-            format!("{} (ro)", self.target)
-        } else {
+        if self.writable {
             self.target.clone()
+        } else {
+            format!("{} (ro)", self.target)
         }
     }
 }
@@ -151,15 +151,13 @@ mod tests {
         let kdl_content = r#"
             mounts{
             source "~/.config/git"
-            read_only #true
             }
             mounts{
             source "~/.config/jj"  
-            read_only #true
             }
             mounts{
             source "~/.local/share/ranger"
-            read_only #false
+            writable #true
             }
             mounts{
             source "~/Downloads"
@@ -170,8 +168,11 @@ mod tests {
         let parsed: Config = serde_kdl2::from_str(kdl_content).unwrap();
         assert_eq!(parsed.mounts.len(), 4);
         assert_eq!(parsed.mounts[0].source, "~/.config/git");
-        assert!(parsed.mounts[0].read_only);
+        assert!(!parsed.mounts[0].writable);
+        assert!(parsed.mounts[2].writable);
         assert_eq!(parsed.mounts[3].target, Some("/root/downloads".into()));
+        // writable defaults to false when omitted.
+        assert!(!parsed.mounts[3].writable);
     }
 
     #[test]
@@ -201,7 +202,7 @@ mod tests {
         let mount = Mount {
             source: "/nonexistent/path/that/does/not/exist".into(),
             target: None,
-            read_only: false,
+            writable: false,
         };
         assert!(mount.resolve().is_none());
     }
@@ -211,12 +212,12 @@ mod tests {
         let mount = Mount {
             source: "/tmp".into(),
             target: Some("/container/tmp".into()),
-            read_only: true,
+            writable: false,
         };
         let resolved = mount.resolve().unwrap();
         assert_eq!(resolved.source, PathBuf::from("/tmp"));
         assert_eq!(resolved.target, "/container/tmp");
-        assert!(resolved.read_only);
+        assert!(!resolved.writable);
     }
 
     #[test]
@@ -224,7 +225,7 @@ mod tests {
         let mount = Mount {
             source: "/tmp".into(),
             target: None,
-            read_only: false,
+            writable: true,
         };
         let resolved = mount.resolve().unwrap();
         assert_eq!(resolved.target, "/tmp");
@@ -235,7 +236,7 @@ mod tests {
         let m = ResolvedMount {
             source: PathBuf::from("/home/user/.config/git"),
             target: "/root/.config/git".into(),
-            read_only: true,
+            writable: false,
         };
         assert_eq!(
             m.to_volume_string(),
@@ -248,7 +249,7 @@ mod tests {
         let m = ResolvedMount {
             source: PathBuf::from("/home/user/.local/share/ranger"),
             target: "/root/.local/share/ranger".into(),
-            read_only: false,
+            writable: true,
         };
         assert_eq!(
             m.to_volume_string(),
@@ -261,7 +262,7 @@ mod tests {
         let m = ResolvedMount {
             source: PathBuf::from("/x"),
             target: "/root/.config/git".into(),
-            read_only: true,
+            writable: false,
         };
         assert_eq!(m.display_target(), "/root/.config/git (ro)");
     }
@@ -271,7 +272,7 @@ mod tests {
         let m = ResolvedMount {
             source: PathBuf::from("/x"),
             target: "/root/.local/share/ranger".into(),
-            read_only: false,
+            writable: true,
         };
         assert_eq!(m.display_target(), "/root/.local/share/ranger");
     }
@@ -283,12 +284,12 @@ mod tests {
                 Mount {
                     source: "/tmp".into(),
                     target: Some("/container/tmp".into()),
-                    read_only: false,
+                    writable: true,
                 },
                 Mount {
                     source: "/nonexistent".into(),
                     target: None,
-                    read_only: false,
+                    writable: false,
                 },
             ],
         };

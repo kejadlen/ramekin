@@ -134,7 +134,7 @@ impl Ramekin {
             .map(|(source, target)| config::ResolvedMount {
                 source: source.clone(),
                 target: target.into(),
-                read_only: false,
+                writable: true,
             })
             .collect();
 
