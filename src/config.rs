@@ -12,7 +12,7 @@ pub struct Config {
 pub struct Mount {
     pub source: String,
     pub target: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "serde_kdl2::bare_defaults::bool::bare_true")]
     pub writable: bool,
 }
 
@@ -173,6 +173,24 @@ mod tests {
         assert_eq!(parsed.mounts[3].target, Some("/root/downloads".into()));
         // writable defaults to false when omitted.
         assert!(!parsed.mounts[3].writable);
+    }
+
+    #[test]
+    fn kdl_bare_writable() {
+        let kdl_content = r#"
+            mounts {
+                source "~/.local/share/ranger"
+                writable
+            }
+            mounts {
+                source "~/.config/git"
+            }
+        "#;
+
+        let parsed: Config = serde_kdl2::from_str(kdl_content).unwrap();
+        assert_eq!(parsed.mounts.len(), 2);
+        assert!(parsed.mounts[0].writable);
+        assert!(!parsed.mounts[1].writable);
     }
 
     #[test]
