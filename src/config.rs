@@ -33,8 +33,8 @@ impl Default for Config {
 impl Config {
     /// Load configuration from `~/.config/ramekin/config.kdl`.
     ///
-    /// If the file doesn't exist, create it with default contents.
-    /// If it exists but can't be parsed, return an error.
+    /// Falls back to hardcoded defaults when the file doesn't exist.
+    /// Returns an error if the file exists but can't be parsed.
     pub fn load() -> Result<Self> {
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
         let config_path = xdg
