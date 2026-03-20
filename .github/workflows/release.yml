@@ -5,7 +5,7 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
-    branches: [rewrite]
+    branches: [main]
 
 permissions:
   contents: write
