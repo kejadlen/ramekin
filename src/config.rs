@@ -60,12 +60,24 @@ pub struct ScopedConfig {
 }
 
 impl ScopedConfig {
-    /// Return merged mounts from all layers, lowest precedence first.
+    /// Return merged mounts from all layers, de-duplicated by container target.
     ///
-    /// Mounts accumulate across layers — each scope adds to the set rather
-    /// than replacing it.
+    /// Mounts accumulate across layers. When multiple layers define mounts with
+    /// the same container target path, the higher-precedence layer wins.
     pub fn merged_mounts(&self) -> Vec<&ResolvedMount> {
-        self.layers.iter().flat_map(|l| &l.mounts).collect()
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        // Iterate in reverse (highest precedence first) so higher layers win,
+        // then reverse the result to preserve low-to-high ordering.
+        for layer in self.layers.iter().rev() {
+            for mount in layer.mounts.iter().rev() {
+                if seen.insert(&mount.target) {
+                    result.push(mount);
+                }
+            }
+        }
+        result.reverse();
+        result
     }
 }
 
@@ -497,6 +509,49 @@ mod tests {
         assert_eq!(merged[0].target, "/a");
         assert_eq!(merged[1].target, "/b");
         assert_eq!(merged[2].target, "/c");
+    }
+
+    #[test]
+    fn merged_mounts_deduplicates_by_target() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::Default,
+                    path: None,
+                    mounts: vec![
+                        ResolvedMount {
+                            source: PathBuf::from("/default/git"),
+                            target: "/root/.config/git".into(),
+                            writable: false,
+                        },
+                        ResolvedMount {
+                            source: PathBuf::from("/default/jj"),
+                            target: "/root/.config/jj".into(),
+                            writable: false,
+                        },
+                    ],
+                },
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: Some(PathBuf::from("/user/config.kdl")),
+                    mounts: vec![ResolvedMount {
+                        // Override the default git mount with a different source
+                        source: PathBuf::from("/user/git"),
+                        target: "/root/.config/git".into(),
+                        writable: true,
+                    }],
+                },
+            ],
+        };
+        let merged = config.merged_mounts();
+        // /root/.config/git appears in both layers; user layer wins
+        assert_eq!(merged.len(), 2);
+        // jj from default (not overridden)
+        assert_eq!(merged[0].target, "/root/.config/jj");
+        // git from user (overrides default)
+        assert_eq!(merged[1].target, "/root/.config/git");
+        assert_eq!(merged[1].source, PathBuf::from("/user/git"));
+        assert!(merged[1].writable);
     }
 
     #[test]
