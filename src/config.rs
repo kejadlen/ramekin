@@ -23,8 +23,6 @@ pub struct Mount {
 /// Configuration scope, ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// Hardcoded defaults.
-    Default,
     /// User-level `~/.config/ramekin/config.kdl`.
     User,
     /// Project-level `<workspace>/.ramekin/config.kdl`.
@@ -36,7 +34,6 @@ pub enum Scope {
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Default => write!(f, "default"),
             Self::User => write!(f, "user"),
             Self::Project => write!(f, "project"),
             Self::Builtin => write!(f, "builtin"),
@@ -93,32 +90,17 @@ pub struct ResolvedMount {
     pub writable: bool,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self::fallback()
-    }
-}
-
 impl Config {
     /// Load all configuration layers for the given workspace.
     ///
     /// Layers are returned in precedence order (lowest first):
-    /// 1. Default (hardcoded)
-    /// 2. User (`~/.config/ramekin/config.kdl`) — only if the file exists
-    /// 3. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
-    /// 4. Builtin (internal mounts passed by the caller)
+    /// 1. User (`~/.config/ramekin/config.kdl`) — only if the file exists
+    /// 2. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
+    /// 3. Builtin (internal mounts passed by the caller)
     ///
     /// Returns an error if a config file exists but can't be parsed.
     pub fn load(workspace: &Path, builtin_mounts: Vec<ResolvedMount>) -> Result<ScopedConfig> {
         let mut layers = Vec::new();
-
-        // Default layer (always present)
-        let default_config = Self::fallback();
-        layers.push(ConfigLayer {
-            scope: Scope::Default,
-            path: None,
-            mounts: default_config.resolve_mounts(),
-        });
 
         // User layer
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
@@ -163,29 +145,6 @@ impl Config {
     fn load_file(path: &Path) -> Result<Self> {
         let content = fs_err::read_to_string(path).wrap_err("failed to read config file")?;
         serde_kdl2::from_str(&content).wrap_err("failed to parse config file")
-    }
-
-    /// Fallback configuration with hardcoded mounts.
-    fn fallback() -> Self {
-        Self {
-            mounts: vec![
-                Mount {
-                    source: "~/.config/git".into(),
-                    target: None,
-                    writable: false,
-                },
-                Mount {
-                    source: "~/.config/jj".into(),
-                    target: None,
-                    writable: false,
-                },
-                Mount {
-                    source: "~/.local/share/ranger".into(),
-                    target: None,
-                    writable: true,
-                },
-            ],
-        }
     }
 
     /// Resolve all mounts, skipping any whose source directory does not exist.
@@ -251,12 +210,6 @@ fn tilde_to_root(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fallback_has_three_mounts() {
-        let config = Config::fallback();
-        assert_eq!(config.mounts.len(), 3);
-    }
 
     #[test]
     fn kdl_deserialization_works() {
@@ -430,7 +383,6 @@ mod tests {
 
     #[test]
     fn scope_display() {
-        assert_eq!(Scope::Default.to_string(), "default");
         assert_eq!(Scope::User.to_string(), "user");
         assert_eq!(Scope::Project.to_string(), "project");
         assert_eq!(Scope::Builtin.to_string(), "builtin");
@@ -441,8 +393,8 @@ mod tests {
         let config = ScopedConfig {
             layers: vec![
                 ConfigLayer {
-                    scope: Scope::Default,
-                    path: None,
+                    scope: Scope::User,
+                    path: Some(PathBuf::from("/user/config.kdl")),
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/a"),
                         target: "/a".into(),
@@ -450,8 +402,8 @@ mod tests {
                     }],
                 },
                 ConfigLayer {
-                    scope: Scope::User,
-                    path: Some(PathBuf::from("/user/config.kdl")),
+                    scope: Scope::Project,
+                    path: Some(PathBuf::from("/project/config.kdl")),
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/b"),
                         target: "/b".into(),
@@ -467,11 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn merged_mounts_default_only() {
+    fn merged_mounts_single_layer() {
         let config = ScopedConfig {
             layers: vec![ConfigLayer {
-                scope: Scope::Default,
-                path: None,
+                scope: Scope::User,
+                path: Some(PathBuf::from("/user/config.kdl")),
                 mounts: vec![ResolvedMount {
                     source: PathBuf::from("/a"),
                     target: "/a".into(),
@@ -489,8 +441,8 @@ mod tests {
         let config = ScopedConfig {
             layers: vec![
                 ConfigLayer {
-                    scope: Scope::Default,
-                    path: None,
+                    scope: Scope::User,
+                    path: Some(PathBuf::from("/user/config.kdl")),
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/a"),
                         target: "/a".into(),
@@ -498,8 +450,8 @@ mod tests {
                     }],
                 },
                 ConfigLayer {
-                    scope: Scope::User,
-                    path: Some(PathBuf::from("/user/config.kdl")),
+                    scope: Scope::Project,
+                    path: Some(PathBuf::from("/project/config.kdl")),
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/b"),
                         target: "/b".into(),
@@ -507,8 +459,8 @@ mod tests {
                     }],
                 },
                 ConfigLayer {
-                    scope: Scope::Project,
-                    path: Some(PathBuf::from("/project/config.kdl")),
+                    scope: Scope::Builtin,
+                    path: None,
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/c"),
                         target: "/c".into(),
@@ -529,27 +481,27 @@ mod tests {
         let config = ScopedConfig {
             layers: vec![
                 ConfigLayer {
-                    scope: Scope::Default,
-                    path: None,
+                    scope: Scope::User,
+                    path: Some(PathBuf::from("/user/config.kdl")),
                     mounts: vec![
                         ResolvedMount {
-                            source: PathBuf::from("/default/git"),
+                            source: PathBuf::from("/user/git"),
                             target: "/root/.config/git".into(),
                             writable: false,
                         },
                         ResolvedMount {
-                            source: PathBuf::from("/default/jj"),
+                            source: PathBuf::from("/user/jj"),
                             target: "/root/.config/jj".into(),
                             writable: false,
                         },
                     ],
                 },
                 ConfigLayer {
-                    scope: Scope::User,
-                    path: Some(PathBuf::from("/user/config.kdl")),
+                    scope: Scope::Project,
+                    path: Some(PathBuf::from("/project/config.kdl")),
                     mounts: vec![ResolvedMount {
-                        // Override the default git mount with a different source
-                        source: PathBuf::from("/user/git"),
+                        // Override the user git mount with a different source
+                        source: PathBuf::from("/project/git"),
                         target: "/root/.config/git".into(),
                         writable: true,
                     }],
@@ -557,15 +509,15 @@ mod tests {
             ],
         };
         let merged = config.merged_mounts();
-        // /root/.config/git appears in both layers; user layer wins
+        // /root/.config/git appears in both layers; project layer wins
         assert_eq!(merged.len(), 2);
-        // jj from default (not overridden)
-        assert_eq!(merged[0].0, Scope::Default);
+        // jj from user (not overridden)
+        assert_eq!(merged[0].0, Scope::User);
         assert_eq!(merged[0].1.target, "/root/.config/jj");
-        // git from user (overrides default)
-        assert_eq!(merged[1].0, Scope::User);
+        // git from project (overrides user)
+        assert_eq!(merged[1].0, Scope::Project);
         assert_eq!(merged[1].1.target, "/root/.config/git");
-        assert_eq!(merged[1].1.source, PathBuf::from("/user/git"));
+        assert_eq!(merged[1].1.source, PathBuf::from("/project/git"));
         assert!(merged[1].1.writable);
     }
 
@@ -573,9 +525,9 @@ mod tests {
     fn load_with_no_config_files() {
         // Use a workspace with no .ramekin/config.kdl
         let config = Config::load(Path::new("/tmp"), vec![]).unwrap();
-        // Should have at least the default layer
-        assert!(!config.layers.is_empty());
-        assert_eq!(config.layers[0].scope, Scope::Default);
+        // Should have only the builtin layer
+        assert_eq!(config.layers.len(), 1);
+        assert_eq!(config.layers[0].scope, Scope::Builtin);
     }
 
     #[test]
@@ -596,8 +548,8 @@ mod tests {
         // Clean up
         let _ = fs_err::remove_dir_all(&dir);
 
-        // Should have default + project + builtin layers
-        assert!(config.layers.len() >= 3);
+        // Should have project + builtin layers
+        assert!(config.layers.len() >= 2);
         let project_layer = config
             .layers
             .iter()

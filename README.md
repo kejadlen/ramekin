@@ -41,17 +41,51 @@ The agent directory (`$XDG_CONFIG_HOME/ramekin/agent/`) is mounted into the cont
 
 The full pi data directory (`$XDG_DATA_HOME/ramekin/`) is mounted at `/root/.pi` for auth tokens and session history. Each workspace also gets its own sessions directory under `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`.
 
-Additional read-only mounts are added when the host directories exist:
+### Volume mounts
 
-| Host path | Container path |
-|---|---|
-| `$XDG_CONFIG_HOME/git/` | `/root/.config/git` (read-only) |
-| `$XDG_CONFIG_HOME/jj/` | `/root/.config/jj` (read-only) |
-| `$XDG_DATA_HOME/ranger/` | `/root/.local/share/ranger` |
+Additional host directories can be mounted into the container via KDL config files. Mounts whose source doesn't exist on the host are silently skipped.
+
+**User config** — `$XDG_CONFIG_HOME/ramekin/config.kdl`
+
+```kdl
+// Mount git and jj config (read-only by default)
+mounts {
+    source "~/.config/git"
+}
+mounts {
+    source "~/.config/jj"
+}
+
+// Mount ranger database (writable)
+mounts {
+    source "~/.local/share/ranger"
+    writable
+}
+```
+
+**Project config** — `<workspace>/.ramekin/config.kdl`
+
+```kdl
+// Mount extra data into the container
+mounts {
+    source "~/datasets"
+    target "/root/datasets"
+}
+```
+
+Each `mounts` block supports:
+
+| Field | Required | Description |
+|---|---|---|
+| `source` | yes | Host path (`~` expands to home directory) |
+| `target` | no | Container path (derived from source if omitted) |
+| `writable` | no | Allow writes (read-only by default) |
+
+Mounts are merged across scopes. When both user and project configs define a mount with the same container target, the project mount wins. Builtin mounts (workspace, pi data, agent dir) cannot be overridden.
 
 ### Container environment extension
 
-A built-in pi extension (`ramekin.ts`) is mounted into the agent container. It appends container environment context to the system prompt via `before_agent_start`, telling the agent about the workspace mount, ephemeral filesystem, and networking constraints (when the firewall is enabled). AGENTS.md remains fully available for user customization.
+A built-in pi extension (`ramekin.ts`) is mounted into the agent container. It appends container environment context to the system prompt via `before_agent_start`, telling the agent about the workspace mount, ephemeral filesystem, and networking. AGENTS.md remains fully available for user customization.
 
 ### Custom Dockerfile
 
