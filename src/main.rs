@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{Context, Result, bail};
+use color_eyre::eyre::{bail, Context, Result};
 use serde::Serialize;
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
 const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
@@ -135,6 +135,7 @@ impl Ramekin {
                 source: source.clone(),
                 target: target.into(),
                 writable: true,
+                builtin: true,
             })
             .collect();
 
@@ -183,14 +184,30 @@ impl Ramekin {
         );
 
         println!();
-        println!("Volume mounts");
-        for m in &self.mounts {
+        println!("Built-in volume mounts");
+        for m in self.mounts.iter().filter(|m| m.builtin) {
             println!(
                 "  {} {} → {}",
                 check(&m.source),
                 m.source.display(),
                 m.display_target()
             );
+        }
+
+        println!();
+        println!("Config volume mounts");
+        let config_mounts: Vec<_> = self.mounts.iter().filter(|m| !m.builtin).collect();
+        if config_mounts.is_empty() {
+            println!("  (none)");
+        } else {
+            for m in config_mounts {
+                println!(
+                    "  {} {} → {}",
+                    check(&m.source),
+                    m.source.display(),
+                    m.display_target()
+                );
+            }
         }
 
         println!();
