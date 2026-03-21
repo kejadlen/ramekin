@@ -11,7 +11,7 @@ color-eyre = "*"
 fs-err = "*"
 serde = { version = "*", features = ["derive"] }
 # Pinned to prerelease — alpha.4 fixes serde defaults with bare KDL values.
-serde-kdl2 = "0.1.1-alpha.4"
+serde-kdl2 = "0.1.1-alpha.5"
 serde_yaml = "*"
 shellexpand = "*"
 tracing = "*"
