@@ -64,7 +64,8 @@ impl ScopedConfig {
     ///
     /// Mounts accumulate across layers. When multiple layers define mounts with
     /// the same container target path, the higher-precedence layer wins.
-    pub fn merged_mounts(&self) -> Vec<&ResolvedMount> {
+    /// Each mount is tagged with the scope it came from.
+    pub fn merged_mounts(&self) -> Vec<(Scope, &ResolvedMount)> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         // Iterate in reverse (highest precedence first) so higher layers win,
@@ -72,7 +73,7 @@ impl ScopedConfig {
         for layer in self.layers.iter().rev() {
             for mount in layer.mounts.iter().rev() {
                 if seen.insert(&mount.target) {
-                    result.push(mount);
+                    result.push((layer.scope, mount));
                 }
             }
         }
@@ -449,8 +450,8 @@ mod tests {
         };
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].target, "/a");
-        assert_eq!(merged[1].target, "/b");
+        assert_eq!(merged[0].1.target, "/a");
+        assert_eq!(merged[1].1.target, "/b");
     }
 
     #[test]
@@ -468,7 +469,7 @@ mod tests {
         };
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].target, "/a");
+        assert_eq!(merged[0].1.target, "/a");
     }
 
     #[test]
@@ -506,9 +507,9 @@ mod tests {
         };
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged[0].target, "/a");
-        assert_eq!(merged[1].target, "/b");
-        assert_eq!(merged[2].target, "/c");
+        assert_eq!(merged[0].1.target, "/a");
+        assert_eq!(merged[1].1.target, "/b");
+        assert_eq!(merged[2].1.target, "/c");
     }
 
     #[test]
@@ -547,11 +548,13 @@ mod tests {
         // /root/.config/git appears in both layers; user layer wins
         assert_eq!(merged.len(), 2);
         // jj from default (not overridden)
-        assert_eq!(merged[0].target, "/root/.config/jj");
+        assert_eq!(merged[0].0, Scope::Default);
+        assert_eq!(merged[0].1.target, "/root/.config/jj");
         // git from user (overrides default)
-        assert_eq!(merged[1].target, "/root/.config/git");
-        assert_eq!(merged[1].source, PathBuf::from("/user/git"));
-        assert!(merged[1].writable);
+        assert_eq!(merged[1].0, Scope::User);
+        assert_eq!(merged[1].1.target, "/root/.config/git");
+        assert_eq!(merged[1].1.source, PathBuf::from("/user/git"));
+        assert!(merged[1].1.writable);
     }
 
     #[test]

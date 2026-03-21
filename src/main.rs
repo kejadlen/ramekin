@@ -195,25 +195,30 @@ impl Ramekin {
             );
         }
 
-        for layer in &self.config.layers {
-            println!();
-            let label = match layer.path {
-                Some(ref path) => format!("Volume mounts — {} ({})", layer.scope, path.display()),
-                None => format!("Volume mounts — {}", layer.scope),
-            };
-            println!("{label}");
-            if layer.mounts.is_empty() {
-                println!("  (none)");
-            } else {
-                for m in &layer.mounts {
-                    println!(
-                        "  {} {} → {}",
-                        check(&m.source),
-                        m.source.display(),
-                        m.display_target()
-                    );
-                }
+        println!();
+        println!("Config volume mounts");
+        let merged = self.config.merged_mounts();
+        if merged.is_empty() {
+            println!("  (none)");
+        } else {
+            for (scope, m) in &merged {
+                println!(
+                    "  {} {} → {}  ({})",
+                    check(&m.source),
+                    m.source.display(),
+                    m.display_target(),
+                    scope,
+                );
             }
+        }
+
+        println!();
+        println!("Config sources");
+        for layer in &self.config.layers {
+            match layer.path {
+                Some(ref path) => println!("  {} {} {}", check(path), layer.scope, path.display()),
+                None => println!("  ✓ {}", layer.scope),
+            };
         }
 
         println!();
@@ -275,11 +280,14 @@ impl Ramekin {
             .create_cache_directory(format!("sessions/{session_id}"))
             .wrap_err("failed to create session directory")?;
 
-        let all_mounts: Vec<&config::ResolvedMount> = self
-            .builtin_mounts
-            .iter()
-            .chain(self.config.merged_mounts())
+        let config_mounts: Vec<_> = self
+            .config
+            .merged_mounts()
+            .into_iter()
+            .map(|(_, m)| m)
             .collect();
+        let all_mounts: Vec<&config::ResolvedMount> =
+            self.builtin_mounts.iter().chain(config_mounts).collect();
         let compose = generate_compose(&dockerfile, &build_context, &all_mounts);
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose)?;
