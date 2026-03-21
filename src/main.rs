@@ -153,33 +153,15 @@ impl Ramekin {
     }
 
     fn config(&self) -> Result<()> {
-        let check = |path: &Path| if path.exists() { "✓" } else { "✗" };
-
         println!("Workspace");
-        println!("  {} {}", check(&self.workspace), self.workspace.display());
+        println!("  {}", self.workspace.display());
 
         println!();
         println!("Ramekin directories");
-        println!(
-            "  {} agent    {}",
-            check(&self.agent_dir),
-            self.agent_dir.display()
-        );
-        println!(
-            "  {} data     {}",
-            check(&self.pi_data_dir),
-            self.pi_data_dir.display()
-        );
-        println!(
-            "  {} sessions {}",
-            check(&self.repo_sessions_dir),
-            self.repo_sessions_dir.display()
-        );
-        println!(
-            "  {} cache    {}",
-            check(&self.cache_dir),
-            self.cache_dir.display()
-        );
+        println!("  agent    {}", self.agent_dir.display());
+        println!("  data     {}", self.pi_data_dir.display());
+        println!("  sessions {}", self.repo_sessions_dir.display());
+        println!("  cache    {}", self.cache_dir.display());
 
         println!();
         println!("Volume mounts");
