@@ -187,24 +187,27 @@ impl Ramekin {
         if merged.is_empty() {
             println!("  (none)");
         } else {
+            let mut current_scope = None;
             for (scope, m) in &merged {
+                if current_scope != Some(*scope) {
+                    current_scope = Some(*scope);
+                    let label = self
+                        .config
+                        .layers
+                        .iter()
+                        .find(|l| l.scope == *scope)
+                        .and_then(|l| l.path.as_ref())
+                        .map(|p| format!("  {} ({})", scope, p.display()))
+                        .unwrap_or_else(|| format!("  {scope}"));
+                    println!("{label}");
+                }
                 println!(
-                    "  {} {} → {}  ({})",
+                    "    {} {} → {}",
                     check(&m.source),
                     m.source.display(),
-                    m.display_target(),
-                    scope,
+                    m.display_target()
                 );
             }
-        }
-
-        println!();
-        println!("Config sources");
-        for layer in &self.config.layers {
-            match layer.path {
-                Some(ref path) => println!("  {} {} {}", check(path), layer.scope, path.display()),
-                None => println!("  ✓ {}", layer.scope),
-            };
         }
 
         println!();
