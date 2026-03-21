@@ -68,7 +68,7 @@ struct Ramekin {
     cache_dir: PathBuf,
     custom_dockerfile: Option<PathBuf>,
     builtin_mounts: Vec<config::ResolvedMount>,
-    config: config::ResolvedConfig,
+    config: config::ScopedConfig,
 }
 
 impl Ramekin {
@@ -140,7 +140,8 @@ impl Ramekin {
             .collect();
 
         // Config mounts (user-configurable, skipped when source doesn't exist)
-        let config = config::Config::load().wrap_err("failed to load ramekin configuration")?;
+        let config =
+            config::Config::load(&workspace).wrap_err("failed to load ramekin configuration")?;
 
         Ok(Self {
             workspace,
@@ -194,18 +195,24 @@ impl Ramekin {
             );
         }
 
-        println!();
-        println!("Config volume mounts ({})", self.config.source);
-        if self.config.mounts.is_empty() {
-            println!("  (none)");
-        } else {
-            for m in &self.config.mounts {
-                println!(
-                    "  {} {} → {}",
-                    check(&m.source),
-                    m.source.display(),
-                    m.display_target()
-                );
+        for layer in &self.config.layers {
+            println!();
+            let label = match layer.path {
+                Some(ref path) => format!("Volume mounts — {} ({})", layer.scope, path.display()),
+                None => format!("Volume mounts — {}", layer.scope),
+            };
+            println!("{label}");
+            if layer.mounts.is_empty() {
+                println!("  (none)");
+            } else {
+                for m in &layer.mounts {
+                    println!(
+                        "  {} {} → {}",
+                        check(&m.source),
+                        m.source.display(),
+                        m.display_target()
+                    );
+                }
             }
         }
 
@@ -268,10 +275,10 @@ impl Ramekin {
             .create_cache_directory(format!("sessions/{session_id}"))
             .wrap_err("failed to create session directory")?;
 
-        let all_mounts: Vec<_> = self
+        let all_mounts: Vec<&config::ResolvedMount> = self
             .builtin_mounts
             .iter()
-            .chain(&self.config.mounts)
+            .chain(self.config.merged_mounts())
             .collect();
         let compose = generate_compose(&dockerfile, &build_context, &all_mounts);
         let compose_file = session_dir.join("compose.yml");

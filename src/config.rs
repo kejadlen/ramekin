@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,29 +20,53 @@ pub struct Mount {
     pub writable: bool,
 }
 
-/// Where a configuration was loaded from.
-#[derive(Debug, PartialEq)]
-pub enum ConfigSource {
-    /// Hardcoded defaults (no config file found).
+/// Configuration scope, ordered from lowest to highest precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Hardcoded defaults.
     Default,
-    /// User-level config file at the given path.
-    User(PathBuf),
+    /// User-level `~/.config/ramekin/config.kdl`.
+    User,
+    /// Project-level `<workspace>/.ramekin/config.kdl`.
+    Project,
 }
 
-impl fmt::Display for ConfigSource {
+impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Default => write!(f, "default"),
-            Self::User(path) => write!(f, "{}", path.display()),
+            Self::User => write!(f, "user"),
+            Self::Project => write!(f, "project"),
         }
     }
 }
 
-/// A loaded configuration together with its source.
+/// A single configuration layer: a scope, an optional file path, and resolved mounts.
 #[derive(Debug)]
-pub struct ResolvedConfig {
-    pub source: ConfigSource,
+pub struct ConfigLayer {
+    pub scope: Scope,
+    /// `None` for the default scope; `Some(path)` for file-backed scopes.
+    pub path: Option<PathBuf>,
     pub mounts: Vec<ResolvedMount>,
+}
+
+/// All configuration layers, ordered from lowest to highest precedence.
+///
+/// The effective configuration comes from the highest-precedence layer
+/// that is present.
+#[derive(Debug)]
+pub struct ScopedConfig {
+    pub layers: Vec<ConfigLayer>,
+}
+
+impl ScopedConfig {
+    /// Return merged mounts from all layers, lowest precedence first.
+    ///
+    /// Mounts accumulate across layers — each scope adds to the set rather
+    /// than replacing it.
+    pub fn merged_mounts(&self) -> Vec<&ResolvedMount> {
+        self.layers.iter().flat_map(|l| &l.mounts).collect()
+    }
 }
 
 /// A mount with tilde-expanded paths ready for Docker.
@@ -60,35 +84,61 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load configuration and resolve mounts.
+    /// Load all configuration layers for the given workspace.
     ///
-    /// Tries `~/.config/ramekin/config.kdl` first; falls back to hardcoded
-    /// defaults when the file doesn't exist. Returns an error if the file
-    /// exists but can't be parsed.
-    pub fn load() -> Result<ResolvedConfig> {
-        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
-        let config_path = xdg
-            .place_config_file("config.kdl")
-            .wrap_err("failed to determine config file path")?;
+    /// Layers are returned in precedence order (lowest first):
+    /// 1. Default (hardcoded)
+    /// 2. User (`~/.config/ramekin/config.kdl`) — only if the file exists
+    /// 3. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
+    ///
+    /// Returns an error if a config file exists but can't be parsed.
+    pub fn load(workspace: &Path) -> Result<ScopedConfig> {
+        let mut layers = Vec::new();
 
-        if config_path.exists() {
-            let content =
-                fs_err::read_to_string(&config_path).wrap_err("failed to read config file")?;
-            let config: Config =
-                serde_kdl2::from_str(&content).wrap_err("failed to parse config file")?;
-            let mounts = config.resolve_mounts();
-            Ok(ResolvedConfig {
-                source: ConfigSource::User(config_path),
-                mounts,
-            })
-        } else {
-            let config = Self::fallback();
-            let mounts = config.resolve_mounts();
-            Ok(ResolvedConfig {
-                source: ConfigSource::Default,
-                mounts,
-            })
+        // Default layer (always present)
+        let default_config = Self::fallback();
+        layers.push(ConfigLayer {
+            scope: Scope::Default,
+            path: None,
+            mounts: default_config.resolve_mounts(),
+        });
+
+        // User layer
+        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
+        let user_path = xdg
+            .place_config_file("config.kdl")
+            .wrap_err("failed to determine user config path")?;
+
+        if user_path.exists() {
+            let config = Self::load_file(&user_path)
+                .wrap_err_with(|| format!("failed to load user config: {}", user_path.display()))?;
+            layers.push(ConfigLayer {
+                scope: Scope::User,
+                path: Some(user_path),
+                mounts: config.resolve_mounts(),
+            });
         }
+
+        // Project layer
+        let project_path = workspace.join(".ramekin/config.kdl");
+        if project_path.exists() {
+            let config = Self::load_file(&project_path).wrap_err_with(|| {
+                format!("failed to load project config: {}", project_path.display())
+            })?;
+            layers.push(ConfigLayer {
+                scope: Scope::Project,
+                path: Some(project_path),
+                mounts: config.resolve_mounts(),
+            });
+        }
+
+        Ok(ScopedConfig { layers })
+    }
+
+    /// Parse a config file.
+    fn load_file(path: &Path) -> Result<Self> {
+        let content = fs_err::read_to_string(path).wrap_err("failed to read config file")?;
+        serde_kdl2::from_str(&content).wrap_err("failed to parse config file")
     }
 
     /// Fallback configuration with hardcoded mounts.
@@ -355,14 +405,132 @@ mod tests {
     }
 
     #[test]
-    fn config_source_display_default() {
-        let source = ConfigSource::Default;
-        assert_eq!(source.to_string(), "default");
+    fn scope_display() {
+        assert_eq!(Scope::Default.to_string(), "default");
+        assert_eq!(Scope::User.to_string(), "user");
+        assert_eq!(Scope::Project.to_string(), "project");
     }
 
     #[test]
-    fn config_source_display_user() {
-        let source = ConfigSource::User(PathBuf::from("/home/user/.config/ramekin/config.kdl"));
-        assert_eq!(source.to_string(), "/home/user/.config/ramekin/config.kdl");
+    fn merged_mounts_accumulates_across_layers() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::Default,
+                    path: None,
+                    mounts: vec![ResolvedMount {
+                        source: PathBuf::from("/a"),
+                        target: "/a".into(),
+                        writable: false,
+                    }],
+                },
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: Some(PathBuf::from("/user/config.kdl")),
+                    mounts: vec![ResolvedMount {
+                        source: PathBuf::from("/b"),
+                        target: "/b".into(),
+                        writable: true,
+                    }],
+                },
+            ],
+        };
+        let merged = config.merged_mounts();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].target, "/a");
+        assert_eq!(merged[1].target, "/b");
+    }
+
+    #[test]
+    fn merged_mounts_default_only() {
+        let config = ScopedConfig {
+            layers: vec![ConfigLayer {
+                scope: Scope::Default,
+                path: None,
+                mounts: vec![ResolvedMount {
+                    source: PathBuf::from("/a"),
+                    target: "/a".into(),
+                    writable: false,
+                }],
+            }],
+        };
+        let merged = config.merged_mounts();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].target, "/a");
+    }
+
+    #[test]
+    fn merged_mounts_all_three_layers() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::Default,
+                    path: None,
+                    mounts: vec![ResolvedMount {
+                        source: PathBuf::from("/a"),
+                        target: "/a".into(),
+                        writable: false,
+                    }],
+                },
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: Some(PathBuf::from("/user/config.kdl")),
+                    mounts: vec![ResolvedMount {
+                        source: PathBuf::from("/b"),
+                        target: "/b".into(),
+                        writable: true,
+                    }],
+                },
+                ConfigLayer {
+                    scope: Scope::Project,
+                    path: Some(PathBuf::from("/project/config.kdl")),
+                    mounts: vec![ResolvedMount {
+                        source: PathBuf::from("/c"),
+                        target: "/c".into(),
+                        writable: true,
+                    }],
+                },
+            ],
+        };
+        let merged = config.merged_mounts();
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].target, "/a");
+        assert_eq!(merged[1].target, "/b");
+        assert_eq!(merged[2].target, "/c");
+    }
+
+    #[test]
+    fn load_with_no_config_files() {
+        // Use a workspace with no .ramekin/config.kdl
+        let config = Config::load(Path::new("/tmp")).unwrap();
+        // Should have at least the default layer
+        assert!(!config.layers.is_empty());
+        assert_eq!(config.layers[0].scope, Scope::Default);
+    }
+
+    #[test]
+    fn load_with_project_config() {
+        let dir = PathBuf::from("/tmp/ramekin-test-project-config");
+        let ramekin_dir = dir.join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        let config_path = ramekin_dir.join("config.kdl");
+        // serde_kdl2 requires at least two repeated nodes for Vec deserialization
+        fs_err::write(
+            &config_path,
+            "mounts{\nsource \"/tmp\"\ntarget \"/container/tmp\"\n}\nmounts{\nsource \"/tmp\"\ntarget \"/container/tmp2\"\n}\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&dir).unwrap();
+
+        // Clean up
+        let _ = fs_err::remove_dir_all(&dir);
+
+        // Should have default + project layers
+        assert!(config.layers.len() >= 2);
+        let project_layer = config.layers.last().unwrap();
+        assert_eq!(project_layer.scope, Scope::Project);
+        assert_eq!(project_layer.mounts.len(), 2);
+        assert_eq!(project_layer.mounts[0].target, "/container/tmp");
     }
 }
