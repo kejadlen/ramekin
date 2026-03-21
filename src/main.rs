@@ -67,7 +67,6 @@ struct Ramekin {
     repo_sessions_dir: PathBuf,
     cache_dir: PathBuf,
     custom_dockerfile: Option<PathBuf>,
-    builtin_mounts: Vec<config::ResolvedMount>,
     config: config::ScopedConfig,
 }
 
@@ -123,7 +122,7 @@ impl Ramekin {
             .is_file()
             .then_some(custom_dockerfile_path);
 
-        // Builtin mounts (always present)
+        // Builtin mounts (always present, not overridable)
         let builtin_entries = [
             (&pi_data_dir, "/root/.pi"),
             (&agent_dir, "/root/.pi/agent"),
@@ -139,9 +138,8 @@ impl Ramekin {
             })
             .collect();
 
-        // Config mounts (user-configurable, skipped when source doesn't exist)
-        let config =
-            config::Config::load(&workspace).wrap_err("failed to load ramekin configuration")?;
+        let config = config::Config::load(&workspace, builtin_mounts)
+            .wrap_err("failed to load ramekin configuration")?;
 
         Ok(Self {
             workspace,
@@ -150,7 +148,6 @@ impl Ramekin {
             repo_sessions_dir,
             cache_dir,
             custom_dockerfile,
-            builtin_mounts,
             config,
         })
     }
@@ -185,18 +182,7 @@ impl Ramekin {
         );
 
         println!();
-        println!("Built-in volume mounts");
-        for m in &self.builtin_mounts {
-            println!(
-                "  {} {} → {}",
-                check(&m.source),
-                m.source.display(),
-                m.display_target()
-            );
-        }
-
-        println!();
-        println!("Config volume mounts");
+        println!("Volume mounts");
         let merged = self.config.merged_mounts();
         if merged.is_empty() {
             println!("  (none)");
@@ -280,14 +266,12 @@ impl Ramekin {
             .create_cache_directory(format!("sessions/{session_id}"))
             .wrap_err("failed to create session directory")?;
 
-        let config_mounts: Vec<_> = self
+        let all_mounts: Vec<_> = self
             .config
             .merged_mounts()
             .into_iter()
             .map(|(_, m)| m)
             .collect();
-        let all_mounts: Vec<&config::ResolvedMount> =
-            self.builtin_mounts.iter().chain(config_mounts).collect();
         let compose = generate_compose(&dockerfile, &build_context, &all_mounts);
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose)?;

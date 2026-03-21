@@ -29,6 +29,8 @@ pub enum Scope {
     User,
     /// Project-level `<workspace>/.ramekin/config.kdl`.
     Project,
+    /// Internal mounts managed by ramekin (highest precedence).
+    Builtin,
 }
 
 impl fmt::Display for Scope {
@@ -37,6 +39,7 @@ impl fmt::Display for Scope {
             Self::Default => write!(f, "default"),
             Self::User => write!(f, "user"),
             Self::Project => write!(f, "project"),
+            Self::Builtin => write!(f, "builtin"),
         }
     }
 }
@@ -103,9 +106,10 @@ impl Config {
     /// 1. Default (hardcoded)
     /// 2. User (`~/.config/ramekin/config.kdl`) — only if the file exists
     /// 3. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
+    /// 4. Builtin (internal mounts passed by the caller)
     ///
     /// Returns an error if a config file exists but can't be parsed.
-    pub fn load(workspace: &Path) -> Result<ScopedConfig> {
+    pub fn load(workspace: &Path, builtin_mounts: Vec<ResolvedMount>) -> Result<ScopedConfig> {
         let mut layers = Vec::new();
 
         // Default layer (always present)
@@ -144,6 +148,13 @@ impl Config {
                 mounts: config.resolve_mounts(),
             });
         }
+
+        // Builtin layer (always present, highest precedence)
+        layers.push(ConfigLayer {
+            scope: Scope::Builtin,
+            path: None,
+            mounts: builtin_mounts,
+        });
 
         Ok(ScopedConfig { layers })
     }
@@ -422,6 +433,7 @@ mod tests {
         assert_eq!(Scope::Default.to_string(), "default");
         assert_eq!(Scope::User.to_string(), "user");
         assert_eq!(Scope::Project.to_string(), "project");
+        assert_eq!(Scope::Builtin.to_string(), "builtin");
     }
 
     #[test]
@@ -560,7 +572,7 @@ mod tests {
     #[test]
     fn load_with_no_config_files() {
         // Use a workspace with no .ramekin/config.kdl
-        let config = Config::load(Path::new("/tmp")).unwrap();
+        let config = Config::load(Path::new("/tmp"), vec![]).unwrap();
         // Should have at least the default layer
         assert!(!config.layers.is_empty());
         assert_eq!(config.layers[0].scope, Scope::Default);
@@ -579,16 +591,21 @@ mod tests {
         )
         .unwrap();
 
-        let config = Config::load(&dir).unwrap();
+        let config = Config::load(&dir, vec![]).unwrap();
 
         // Clean up
         let _ = fs_err::remove_dir_all(&dir);
 
-        // Should have default + project layers
-        assert!(config.layers.len() >= 2);
-        let project_layer = config.layers.last().unwrap();
-        assert_eq!(project_layer.scope, Scope::Project);
+        // Should have default + project + builtin layers
+        assert!(config.layers.len() >= 3);
+        let project_layer = config
+            .layers
+            .iter()
+            .find(|l| l.scope == Scope::Project)
+            .expect("project layer missing");
         assert_eq!(project_layer.mounts.len(), 2);
         assert_eq!(project_layer.mounts[0].target, "/container/tmp");
+        // Builtin is always last (highest precedence)
+        assert_eq!(config.layers.last().unwrap().scope, Scope::Builtin);
     }
 }
