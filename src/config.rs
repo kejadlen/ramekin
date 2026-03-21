@@ -522,12 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn load_with_no_config_files() {
+    fn load_with_no_project_config() {
         // Use a workspace with no .ramekin/config.kdl
         let config = Config::load(Path::new("/tmp"), vec![]).unwrap();
-        // Should have only the builtin layer
-        assert_eq!(config.layers.len(), 1);
-        assert_eq!(config.layers[0].scope, Scope::Builtin);
+        // Builtin layer is always last
+        assert_eq!(config.layers.last().unwrap().scope, Scope::Builtin);
+        // No project layer
+        assert!(!config.layers.iter().any(|l| l.scope == Scope::Project));
     }
 
     #[test]

@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result, bail};
 use serde::Serialize;
 use tracing::{error, info};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
 const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
