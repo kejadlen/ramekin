@@ -201,12 +201,7 @@ impl Ramekin {
                         .unwrap_or_else(|| format!("  {scope}"));
                     println!("{label}");
                 }
-                println!(
-                    "    {} {} → {}",
-                    check(&m.source),
-                    m.source.display(),
-                    m.display_target()
-                );
+                println!("    {} → {}", m.source.display(), m.display_target());
             }
         }
 
