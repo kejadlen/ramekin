@@ -2,7 +2,7 @@
 
 ## Project
 
-Ramekin is a containerized harness for running the [pi coding agent](https://github.com/badlogic/pi-mono) with network-restricted access. A Rust CLI builds a Docker image, generates a compose config at runtime, and attaches the user's terminal to the agent container.
+Ramekin is a containerized harness for running the [pi coding agent](https://github.com/badlogic/pi-mono). A Rust CLI builds a Docker image, generates a compose config at runtime, and attaches the user's terminal to the agent container. Network restriction via a firewall sidecar is planned but not yet implemented.
 
 ## Repository layout
 
