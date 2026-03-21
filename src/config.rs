@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use color_eyre::eyre::{Context, Result};
@@ -19,6 +20,31 @@ pub struct Mount {
     pub writable: bool,
 }
 
+/// Where a configuration was loaded from.
+#[derive(Debug, PartialEq)]
+pub enum ConfigSource {
+    /// Hardcoded defaults (no config file found).
+    Default,
+    /// User-level config file at the given path.
+    User(PathBuf),
+}
+
+impl fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => write!(f, "default"),
+            Self::User(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// A loaded configuration together with its source.
+#[derive(Debug)]
+pub struct ResolvedConfig {
+    pub source: ConfigSource,
+    pub mounts: Vec<ResolvedMount>,
+}
+
 /// A mount with tilde-expanded paths ready for Docker.
 #[derive(Debug, PartialEq)]
 pub struct ResolvedMount {
@@ -34,24 +60,35 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load configuration from `~/.config/ramekin/config.kdl`.
+    /// Load configuration and resolve mounts.
     ///
-    /// Falls back to hardcoded defaults when the file doesn't exist.
-    /// Returns an error if the file exists but can't be parsed.
-    pub fn load() -> Result<Self> {
+    /// Tries `~/.config/ramekin/config.kdl` first; falls back to hardcoded
+    /// defaults when the file doesn't exist. Returns an error if the file
+    /// exists but can't be parsed.
+    pub fn load() -> Result<ResolvedConfig> {
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
         let config_path = xdg
             .place_config_file("config.kdl")
             .wrap_err("failed to determine config file path")?;
 
-        if !config_path.exists() {
-            return Ok(Self::fallback());
+        if config_path.exists() {
+            let content =
+                fs_err::read_to_string(&config_path).wrap_err("failed to read config file")?;
+            let config: Config =
+                serde_kdl2::from_str(&content).wrap_err("failed to parse config file")?;
+            let mounts = config.resolve_mounts();
+            Ok(ResolvedConfig {
+                source: ConfigSource::User(config_path),
+                mounts,
+            })
+        } else {
+            let config = Self::fallback();
+            let mounts = config.resolve_mounts();
+            Ok(ResolvedConfig {
+                source: ConfigSource::Default,
+                mounts,
+            })
         }
-
-        let content =
-            fs_err::read_to_string(&config_path).wrap_err("failed to read config file")?;
-
-        serde_kdl2::from_str(&content).wrap_err("failed to parse config file")
     }
 
     /// Fallback configuration with hardcoded mounts.
@@ -76,11 +113,9 @@ impl Config {
             ],
         }
     }
-}
 
-impl Config {
     /// Resolve all mounts, skipping any whose source directory does not exist.
-    pub fn resolve_mounts(&self) -> Vec<ResolvedMount> {
+    fn resolve_mounts(&self) -> Vec<ResolvedMount> {
         self.mounts.iter().filter_map(|m| m.resolve()).collect()
     }
 }
@@ -317,5 +352,17 @@ mod tests {
         let resolved = config.resolve_mounts();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].target, "/container/tmp");
+    }
+
+    #[test]
+    fn config_source_display_default() {
+        let source = ConfigSource::Default;
+        assert_eq!(source.to_string(), "default");
+    }
+
+    #[test]
+    fn config_source_display_user() {
+        let source = ConfigSource::User(PathBuf::from("/home/user/.config/ramekin/config.kdl"));
+        assert_eq!(source.to_string(), "/home/user/.config/ramekin/config.kdl");
     }
 }

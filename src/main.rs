@@ -68,7 +68,7 @@ struct Ramekin {
     cache_dir: PathBuf,
     custom_dockerfile: Option<PathBuf>,
     builtin_mounts: Vec<config::ResolvedMount>,
-    config_mounts: Vec<config::ResolvedMount>,
+    config: config::ResolvedConfig,
 }
 
 impl Ramekin {
@@ -141,7 +141,6 @@ impl Ramekin {
 
         // Config mounts (user-configurable, skipped when source doesn't exist)
         let config = config::Config::load().wrap_err("failed to load ramekin configuration")?;
-        let config_mounts = config.resolve_mounts();
 
         Ok(Self {
             workspace,
@@ -151,7 +150,7 @@ impl Ramekin {
             cache_dir,
             custom_dockerfile,
             builtin_mounts,
-            config_mounts,
+            config,
         })
     }
 
@@ -196,11 +195,11 @@ impl Ramekin {
         }
 
         println!();
-        println!("Config volume mounts");
-        if self.config_mounts.is_empty() {
+        println!("Config volume mounts ({})", self.config.source);
+        if self.config.mounts.is_empty() {
             println!("  (none)");
         } else {
-            for m in &self.config_mounts {
+            for m in &self.config.mounts {
                 println!(
                     "  {} {} → {}",
                     check(&m.source),
@@ -272,7 +271,7 @@ impl Ramekin {
         let all_mounts: Vec<_> = self
             .builtin_mounts
             .iter()
-            .chain(&self.config_mounts)
+            .chain(&self.config.mounts)
             .collect();
         let compose = generate_compose(&dockerfile, &build_context, &all_mounts);
         let compose_file = session_dir.join("compose.yml");
