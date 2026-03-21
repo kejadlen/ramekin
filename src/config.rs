@@ -164,8 +164,8 @@ impl Mount {
         }
 
         let target = match &self.target {
-            Some(t) => t.clone(),
-            None => tilde_to_root(&self.source),
+            Some(t) => resolve_container_tilde(t),
+            None => resolve_container_tilde(&self.source),
         };
 
         Some(ResolvedMount {
@@ -196,12 +196,17 @@ impl ResolvedMount {
     }
 }
 
-/// Replace a leading `~` with `/root` to derive a container path.
-fn tilde_to_root(path: &str) -> String {
+/// Home directory inside the agent container. The ramekin Dockerfile runs
+/// everything as root, so `~` in container target paths maps here. If the
+/// image ever switches to a non-root user, update this constant.
+const CONTAINER_HOME: &str = "/root";
+
+/// Replace a leading `~` with the container home directory.
+fn resolve_container_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
-        format!("/root/{rest}")
+        format!("{CONTAINER_HOME}/{rest}")
     } else if path == "~" {
-        "/root".to_string()
+        CONTAINER_HOME.to_string()
     } else {
         path.to_string()
     }
@@ -266,18 +271,21 @@ mod tests {
     }
 
     #[test]
-    fn tilde_to_root_with_subpath() {
-        assert_eq!(tilde_to_root("~/.config/git"), "/root/.config/git");
+    fn resolve_container_tilde_with_subpath() {
+        assert_eq!(
+            resolve_container_tilde("~/.config/git"),
+            "/root/.config/git"
+        );
     }
 
     #[test]
-    fn tilde_to_root_bare() {
-        assert_eq!(tilde_to_root("~"), "/root");
+    fn resolve_container_tilde_bare() {
+        assert_eq!(resolve_container_tilde("~"), "/root");
     }
 
     #[test]
-    fn tilde_to_root_absolute_unchanged() {
-        assert_eq!(tilde_to_root("/some/path"), "/some/path");
+    fn resolve_container_tilde_absolute_unchanged() {
+        assert_eq!(resolve_container_tilde("/some/path"), "/some/path");
     }
 
     #[test]
@@ -301,6 +309,17 @@ mod tests {
         assert_eq!(resolved.source, PathBuf::from("/tmp"));
         assert_eq!(resolved.target, "/container/tmp");
         assert!(!resolved.writable);
+    }
+
+    #[test]
+    fn resolve_expands_tilde_in_explicit_target() {
+        let mount = Mount {
+            source: "/tmp".into(),
+            target: Some("~/downloads".into()),
+            writable: true,
+        };
+        let resolved = mount.resolve().unwrap();
+        assert_eq!(resolved.target, "/root/downloads");
     }
 
     #[test]
