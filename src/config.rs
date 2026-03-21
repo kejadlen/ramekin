@@ -25,7 +25,6 @@ pub struct ResolvedMount {
     pub source: PathBuf,
     pub target: String,
     pub writable: bool,
-    pub builtin: bool,
 }
 
 impl Default for Config {
@@ -105,7 +104,6 @@ impl Mount {
             source: expanded,
             target,
             writable: self.writable,
-            builtin: false,
         })
     }
 }
@@ -241,7 +239,6 @@ mod tests {
         assert_eq!(resolved.source, PathBuf::from("/tmp"));
         assert_eq!(resolved.target, "/container/tmp");
         assert!(!resolved.writable);
-        assert!(!resolved.builtin);
     }
 
     #[test]
@@ -261,7 +258,6 @@ mod tests {
             source: PathBuf::from("/home/user/.config/git"),
             target: "/root/.config/git".into(),
             writable: false,
-            builtin: false,
         };
         assert_eq!(
             m.to_volume_string(),
@@ -275,7 +271,6 @@ mod tests {
             source: PathBuf::from("/home/user/.local/share/ranger"),
             target: "/root/.local/share/ranger".into(),
             writable: true,
-            builtin: false,
         };
         assert_eq!(
             m.to_volume_string(),
@@ -289,7 +284,6 @@ mod tests {
             source: PathBuf::from("/x"),
             target: "/root/.config/git".into(),
             writable: false,
-            builtin: false,
         };
         assert_eq!(m.display_target(), "/root/.config/git (ro)");
     }
@@ -300,7 +294,6 @@ mod tests {
             source: PathBuf::from("/x"),
             target: "/root/.local/share/ranger".into(),
             writable: true,
-            builtin: false,
         };
         assert_eq!(m.display_target(), "/root/.local/share/ranger");
     }

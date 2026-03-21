@@ -67,7 +67,8 @@ struct Ramekin {
     repo_sessions_dir: PathBuf,
     cache_dir: PathBuf,
     custom_dockerfile: Option<PathBuf>,
-    mounts: Vec<config::ResolvedMount>,
+    builtin_mounts: Vec<config::ResolvedMount>,
+    config_mounts: Vec<config::ResolvedMount>,
 }
 
 impl Ramekin {
@@ -123,25 +124,24 @@ impl Ramekin {
             .then_some(custom_dockerfile_path);
 
         // Builtin mounts (always present)
-        let builtin = [
+        let builtin_entries = [
             (&pi_data_dir, "/root/.pi"),
             (&agent_dir, "/root/.pi/agent"),
             (&repo_sessions_dir, "/root/.pi/agent/sessions"),
             (&workspace, "/workspace"),
         ];
-        let mut mounts: Vec<config::ResolvedMount> = builtin
+        let builtin_mounts: Vec<config::ResolvedMount> = builtin_entries
             .into_iter()
             .map(|(source, target)| config::ResolvedMount {
                 source: source.clone(),
                 target: target.into(),
                 writable: true,
-                builtin: true,
             })
             .collect();
 
         // Config mounts (user-configurable, skipped when source doesn't exist)
         let config = config::Config::load().wrap_err("failed to load ramekin configuration")?;
-        mounts.extend(config.resolve_mounts());
+        let config_mounts = config.resolve_mounts();
 
         Ok(Self {
             workspace,
@@ -150,7 +150,8 @@ impl Ramekin {
             repo_sessions_dir,
             cache_dir,
             custom_dockerfile,
-            mounts,
+            builtin_mounts,
+            config_mounts,
         })
     }
 
@@ -185,7 +186,7 @@ impl Ramekin {
 
         println!();
         println!("Built-in volume mounts");
-        for m in self.mounts.iter().filter(|m| m.builtin) {
+        for m in &self.builtin_mounts {
             println!(
                 "  {} {} → {}",
                 check(&m.source),
@@ -196,11 +197,10 @@ impl Ramekin {
 
         println!();
         println!("Config volume mounts");
-        let config_mounts: Vec<_> = self.mounts.iter().filter(|m| !m.builtin).collect();
-        if config_mounts.is_empty() {
+        if self.config_mounts.is_empty() {
             println!("  (none)");
         } else {
-            for m in config_mounts {
+            for m in &self.config_mounts {
                 println!(
                     "  {} {} → {}",
                     check(&m.source),
@@ -269,7 +269,12 @@ impl Ramekin {
             .create_cache_directory(format!("sessions/{session_id}"))
             .wrap_err("failed to create session directory")?;
 
-        let compose = generate_compose(&dockerfile, &build_context, &self.mounts);
+        let all_mounts: Vec<_> = self
+            .builtin_mounts
+            .iter()
+            .chain(&self.config_mounts)
+            .collect();
+        let compose = generate_compose(&dockerfile, &build_context, &all_mounts);
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose)?;
 
@@ -367,7 +372,7 @@ struct BuildConfig {
 fn generate_compose(
     dockerfile: &Path,
     build_context: &Path,
-    mounts: &[config::ResolvedMount],
+    mounts: &[&config::ResolvedMount],
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
 
