@@ -6,7 +6,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub mounts: Vec<Mount>,
+    #[serde(default)]
+    pub pi: Vec<PiEntry>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct PiEntry {
+    pub source: String,
+    pub target: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -394,6 +403,7 @@ mod tests {
                     writable: false,
                 },
             ],
+            pi: vec![],
         };
         let resolved = config.resolve_mounts();
         assert_eq!(resolved.len(), 1);
@@ -576,5 +586,76 @@ mod tests {
         assert_eq!(project_layer.mounts[0].target, "/container/tmp");
         // Builtin is always last (highest precedence)
         assert_eq!(config.layers.last().unwrap().scope, Scope::Builtin);
+    }
+
+    #[test]
+    fn kdl_pi_entries() {
+        let kdl = r#"
+            pi {
+                source "~/.dotfiles/ai/AGENTS.md"
+            }
+            pi {
+                source "~/.dotfiles/ai/skills"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert!(parsed.mounts.is_empty());
+        assert_eq!(parsed.pi.len(), 2);
+        assert_eq!(parsed.pi[0].source, "~/.dotfiles/ai/AGENTS.md");
+        assert_eq!(parsed.pi[0].target, None);
+        assert_eq!(parsed.pi[1].source, "~/.dotfiles/ai/skills");
+    }
+
+    #[test]
+    fn kdl_pi_with_explicit_target() {
+        let kdl = r#"
+            pi {
+                source "~/.dotfiles/ai/my-project-skills"
+                target "skills"
+            }
+            pi {
+                source "~/.dotfiles/ai/AGENTS.md"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.pi.len(), 2);
+        assert_eq!(parsed.pi[0].target, Some("skills".into()));
+        assert_eq!(parsed.pi[1].target, None);
+    }
+
+    #[test]
+    fn kdl_no_pi_section() {
+        let kdl = r#"
+            mounts {
+                source "/tmp"
+                target "/container/tmp"
+            }
+            mounts {
+                source "/tmp"
+                target "/container/tmp2"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert!(parsed.pi.is_empty());
+        assert_eq!(parsed.mounts.len(), 2);
+    }
+
+    #[test]
+    fn kdl_pi_and_mounts_together() {
+        let kdl = r#"
+            mounts {
+                source "~/.config/git"
+            }
+            mounts {
+                source "~/.config/jj"
+            }
+            pi {
+                source "~/.dotfiles/ai/AGENTS.md"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.mounts.len(), 2);
+        assert_eq!(parsed.pi.len(), 1);
+        assert_eq!(parsed.pi[0].source, "~/.dotfiles/ai/AGENTS.md");
     }
 }
