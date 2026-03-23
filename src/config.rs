@@ -185,6 +185,92 @@ impl Mount {
     }
 }
 
+/// A pi entry with its source path expanded and target resolved.
+#[derive(Debug)]
+pub struct ResolvedPiEntry {
+    pub source: PathBuf,
+    /// Target path relative to the agent dir.
+    pub target: String,
+}
+
+impl PiEntry {
+    /// Expand tildes and resolve the target.
+    ///
+    /// Uses the explicit target when set, otherwise falls back to
+    /// the source's basename.
+    pub fn resolve(&self) -> ResolvedPiEntry {
+        let source = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
+        let target = self.target.clone().unwrap_or_else(|| {
+            source
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        ResolvedPiEntry { source, target }
+    }
+}
+
+/// Clear the agent directory, preserving only `auth.json`.
+pub fn clear_agent_dir(agent_dir: &Path) -> Result<()> {
+    if !agent_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs_err::read_dir(agent_dir)? {
+        let entry = entry?;
+        if entry.file_name() == "auth.json" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs_err::remove_dir_all(entry.path())?;
+        } else {
+            fs_err::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy pi config entries into the agent directory.
+///
+/// Auto-detects file vs directory from the source. Warns and skips
+/// sources that don't exist on the host.
+pub fn assemble_pi(agent_dir: &Path, entries: &[ResolvedPiEntry]) -> Result<()> {
+    for entry in entries {
+        if !entry.source.exists() {
+            tracing::warn!(
+                source = %entry.source.display(),
+                target = %entry.target,
+                "pi source does not exist, skipping"
+            );
+            continue;
+        }
+
+        let target = agent_dir.join(&entry.target);
+
+        if entry.source.is_dir() {
+            copy_dir(&entry.source, &target)?;
+        } else {
+            fs_err::copy(&entry.source, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    fs_err::create_dir_all(dst)?;
+    for entry in fs_err::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            fs_err::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 impl ResolvedMount {
     /// Format as a Docker volume mount string (`source:target` or `source:target:ro`).
     pub fn to_volume_string(&self) -> String {
@@ -657,5 +743,160 @@ mod tests {
         assert_eq!(parsed.mounts.len(), 2);
         assert_eq!(parsed.pi.len(), 1);
         assert_eq!(parsed.pi[0].source, "~/.dotfiles/ai/AGENTS.md");
+    }
+
+    #[test]
+    fn clear_agent_dir_preserves_auth_json() {
+        let agent_dir = tempfile::tempdir().unwrap();
+
+        fs_err::write(agent_dir.path().join("auth.json"), "secret").unwrap();
+        fs_err::write(agent_dir.path().join("AGENTS.md"), "old").unwrap();
+        fs_err::write(agent_dir.path().join("settings.json"), "{}").unwrap();
+        fs_err::create_dir_all(agent_dir.path().join("skills")).unwrap();
+        fs_err::write(agent_dir.path().join("skills/x.md"), "x").unwrap();
+
+        clear_agent_dir(agent_dir.path()).unwrap();
+
+        assert!(agent_dir.path().join("auth.json").exists());
+        assert_eq!(
+            fs_err::read_to_string(agent_dir.path().join("auth.json")).unwrap(),
+            "secret"
+        );
+        assert!(!agent_dir.path().join("AGENTS.md").exists());
+        assert!(!agent_dir.path().join("settings.json").exists());
+        assert!(!agent_dir.path().join("skills").exists());
+    }
+
+    #[test]
+    fn clear_agent_dir_handles_empty_dir() {
+        let agent_dir = tempfile::tempdir().unwrap();
+        clear_agent_dir(agent_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn clear_agent_dir_handles_nonexistent_dir() {
+        clear_agent_dir(Path::new("/nonexistent/path")).unwrap();
+    }
+
+    #[test]
+    fn assemble_pi_copies_file() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+
+        let prompt = src_dir.path().join("AGENTS.md");
+        fs_err::write(&prompt, "# my prompt").unwrap();
+
+        let entries = vec![ResolvedPiEntry {
+            source: prompt,
+            target: "AGENTS.md".into(),
+        }];
+
+        assemble_pi(agent_dir.path(), &entries).unwrap();
+
+        assert_eq!(
+            fs_err::read_to_string(agent_dir.path().join("AGENTS.md")).unwrap(),
+            "# my prompt"
+        );
+    }
+
+    #[test]
+    fn assemble_pi_copies_directory() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+
+        let skills = src_dir.path().join("skills");
+        fs_err::create_dir_all(skills.join("my-skill")).unwrap();
+        fs_err::write(skills.join("my-skill/SKILL.md"), "# skill").unwrap();
+
+        let entries = vec![ResolvedPiEntry {
+            source: skills,
+            target: "skills".into(),
+        }];
+
+        assemble_pi(agent_dir.path(), &entries).unwrap();
+
+        assert_eq!(
+            fs_err::read_to_string(agent_dir.path().join("skills/my-skill/SKILL.md")).unwrap(),
+            "# skill"
+        );
+    }
+
+    #[test]
+    fn assemble_pi_skips_missing_source() {
+        let agent_dir = tempfile::tempdir().unwrap();
+
+        let entries = vec![ResolvedPiEntry {
+            source: PathBuf::from("/nonexistent/file"),
+            target: "file".into(),
+        }];
+
+        assemble_pi(agent_dir.path(), &entries).unwrap();
+        assert!(!agent_dir.path().join("file").exists());
+    }
+
+    #[test]
+    fn pi_resolve_defaults_target_to_basename() {
+        let entry = PiEntry {
+            source: "~/.dotfiles/ai/AGENTS.md".into(),
+            target: None,
+        };
+        let resolved = entry.resolve();
+        assert_eq!(resolved.target, "AGENTS.md");
+    }
+
+    #[test]
+    fn pi_resolve_defaults_target_to_directory_basename() {
+        let entry = PiEntry {
+            source: "~/.dotfiles/ai/skills".into(),
+            target: None,
+        };
+        let resolved = entry.resolve();
+        assert_eq!(resolved.target, "skills");
+    }
+
+    #[test]
+    fn pi_resolve_uses_explicit_target() {
+        let entry = PiEntry {
+            source: "~/.dotfiles/ai/my-project-skills".into(),
+            target: Some("skills".into()),
+        };
+        let resolved = entry.resolve();
+        assert_eq!(resolved.target, "skills");
+    }
+
+    #[test]
+    fn clear_then_assemble_full_cycle() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+
+        // Simulate previous run state.
+        fs_err::write(agent_dir.path().join("auth.json"), "secret").unwrap();
+        fs_err::write(agent_dir.path().join("AGENTS.md"), "old prompt").unwrap();
+        fs_err::create_dir_all(agent_dir.path().join("old-skills")).unwrap();
+
+        // New config only has a prompt.
+        let prompt = src_dir.path().join("AGENTS.md");
+        fs_err::write(&prompt, "new prompt").unwrap();
+
+        clear_agent_dir(agent_dir.path()).unwrap();
+
+        let entries = vec![ResolvedPiEntry {
+            source: prompt,
+            target: "AGENTS.md".into(),
+        }];
+        assemble_pi(agent_dir.path(), &entries).unwrap();
+
+        // auth.json preserved.
+        assert_eq!(
+            fs_err::read_to_string(agent_dir.path().join("auth.json")).unwrap(),
+            "secret"
+        );
+        // New prompt copied.
+        assert_eq!(
+            fs_err::read_to_string(agent_dir.path().join("AGENTS.md")).unwrap(),
+            "new prompt"
+        );
+        // Old stale dir gone.
+        assert!(!agent_dir.path().join("old-skills").exists());
     }
 }
