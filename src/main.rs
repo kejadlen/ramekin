@@ -89,25 +89,6 @@ impl Ramekin {
             .create_config_directory("agent")
             .wrap_err("failed to create agent config directory")?;
 
-        for file in ["settings.json", "keybindings.json"] {
-            let path = agent_dir.join(file);
-            if !path.is_file() {
-                fs_err::write(&path, "{}")?;
-            }
-        }
-        let agents_md = agent_dir.join("AGENTS.md");
-        if !agents_md.exists() {
-            fs_err::write(&agents_md, "")?;
-        }
-
-        let extensions_dir = xdg
-            .create_config_directory("agent/extensions")
-            .wrap_err("failed to create extensions directory")?;
-        fs_err::write(extensions_dir.join("ramekin.ts"), RAMEKIN_EXTENSION)?;
-
-        xdg.create_config_directory("agent/skills")
-            .wrap_err("failed to create skills directory")?;
-
         let pi_data_dir = xdg
             .create_data_directory("")
             .wrap_err("failed to create pi data directory")?;
@@ -144,6 +125,18 @@ impl Ramekin {
 
         let config = config::Config::load(&workspace, builtin_mounts)
             .wrap_err("failed to load ramekin configuration")?;
+
+        // Clear and reassemble the agent dir from pi config.
+        config::clear_agent_dir(&agent_dir).wrap_err("failed to clear agent directory")?;
+
+        let resolved_pi: Vec<config::ResolvedPiEntry> =
+            config.merged_pi().iter().map(|e| e.resolve()).collect();
+        config::assemble_pi(&agent_dir, &resolved_pi).wrap_err("failed to assemble pi config")?;
+
+        // Always write ramekin.ts after assembly.
+        let extensions_dir = agent_dir.join("extensions");
+        fs_err::create_dir_all(&extensions_dir)?;
+        fs_err::write(extensions_dir.join("ramekin.ts"), RAMEKIN_EXTENSION)?;
 
         Ok(Self {
             workspace,
