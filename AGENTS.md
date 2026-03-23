@@ -47,6 +47,24 @@ just           # All four
 - The `ramekin.ts` extension is written into the agent config directory on every run. It injects container environment context into the pi system prompt.
 - Version is set at build time via the `RAMEKIN_VERSION` env var (used by CI) or falls back to `dev+<short-sha>`.
 
+## Dependencies
+
+- Production dependencies use `*` (unpinned) versions, except for pre-release crates which pin the exact version (e.g. `serde-kdl2 = "0.1.1-alpha.5"`).
+- Dev dependencies also use `*`. Do not pin to the version `cargo add` resolves.
+- `Cargo.lock` is committed.
+
+## Version control
+
+- VCS is [jj](https://martinvonz.github.io/jj/latest/), not git.
+- Each logical change gets its own commit (`jj new -m "..."`). Do not bundle unrelated changes.
+- Keep commits out of the working copy: describe with `jj describe -m`, then `jj new` before starting the next change.
+- Unrelated files already in the working copy should be restored (`jj restore <path>`) before committing.
+
 ## Task management
 
 Tasks are tracked with `ranger` (backlog name: `ramekin`). Use the `ranger` skill for commands and workflow. Pick up the next queued task from the top of the queue unless directed otherwise.
+
+Key commands:
+- `ranger task list --backlog ramekin` — list tasks
+- `ranger task show <key>` — show task details
+- `ranger task edit <key> --state done` — mark complete
