@@ -25,6 +25,10 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Cmd>,
+
+    /// Extra arguments forwarded to pi inside the container (after --)
+    #[arg(last = true, global = true)]
+    pi_args: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -51,7 +55,7 @@ fn main() -> Result<()> {
     let ramekin = Ramekin::resolve(cli.workspace)?;
 
     match command {
-        Cmd::Run { rebuild } => ramekin.run(rebuild),
+        Cmd::Run { rebuild } => ramekin.run(rebuild, &cli.pi_args),
         Cmd::Config => ramekin.config(),
     }
 }
@@ -203,7 +207,7 @@ impl Ramekin {
         Ok(())
     }
 
-    fn run(&self, rebuild: bool) -> Result<()> {
+    fn run(&self, rebuild: bool, pi_args: &[String]) -> Result<()> {
         info!(agent = %self.agent_dir.display(), repo = %self.repo_sessions_dir.display(), "directories");
         info!(workspace = %self.workspace.display(), "starting agent");
 
@@ -252,7 +256,7 @@ impl Ramekin {
             .into_iter()
             .map(|(_, m)| m)
             .collect();
-        let compose = generate_compose(&dockerfile, &build_context, &all_mounts);
+        let compose = generate_compose(&dockerfile, &build_context, &all_mounts, pi_args);
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose)?;
 
@@ -338,6 +342,8 @@ struct AgentService {
     stdin_open: bool,
     tty: bool,
     volumes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    command: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -351,8 +357,18 @@ fn generate_compose(
     dockerfile: &Path,
     build_context: &Path,
     mounts: &[&config::ResolvedMount],
+    pi_args: &[String],
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
+
+    // When extra args are provided, build the full command: `pi <args...>`
+    let command: Vec<String> = if pi_args.is_empty() {
+        vec![]
+    } else {
+        std::iter::once("pi".to_string())
+            .chain(pi_args.iter().cloned())
+            .collect()
+    };
 
     let config = ComposeConfig {
         services: Services {
@@ -365,6 +381,7 @@ fn generate_compose(
                 stdin_open: true,
                 tty: true,
                 volumes,
+                command,
             },
         },
     };
