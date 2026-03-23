@@ -308,9 +308,9 @@ impl Ramekin {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a short random session ID.
+/// Generate a session ID from the current process ID.
 fn session_id() -> String {
-    format!("{:x}", std::process::id())
+    format!("{:08x}", fastrand::u32(..))
 }
 
 /// Create a slug for a workspace path: `<dirname>-<hash>`.

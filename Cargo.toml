@@ -8,6 +8,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "*", features = ["derive"] }
 color-eyre = "*"
+fastrand = "*"
 fs-err = "*"
 serde = { version = "*", features = ["derive"] }
 # Pinned to prerelease — alpha.4 fixes serde defaults with bare KDL values.
