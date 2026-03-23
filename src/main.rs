@@ -184,6 +184,32 @@ impl Ramekin {
             }
         }
 
+        let merged_pi = self.config.merged_pi();
+        if !merged_pi.is_empty() {
+            println!();
+            println!("Pi config");
+            for entry in &merged_pi {
+                let resolved = entry.resolve();
+                let kind = if resolved.source.is_dir() {
+                    "dir"
+                } else if resolved.source.is_file() {
+                    "file"
+                } else {
+                    "missing"
+                };
+                let marker = if resolved.source.exists() {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  {marker} {} → {} ({kind})",
+                    resolved.source.display(),
+                    resolved.target,
+                );
+            }
+        }
+
         println!();
         println!("Dockerfile");
         match &self.custom_dockerfile {
