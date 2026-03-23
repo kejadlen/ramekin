@@ -740,6 +740,34 @@ mod tests {
     }
 
     #[test]
+    fn kdl_dash_notation_pi() {
+        let kdl = r#"
+            pi {
+                - { source "~/.dotfiles/ai/_AGENTS.md"; target "AGENTS.md" }
+                - { source "~/.dotfiles/ai/skills" }
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.pi.len(), 2);
+        assert_eq!(parsed.pi[0].source, "~/.dotfiles/ai/_AGENTS.md");
+        assert_eq!(parsed.pi[0].target, Some("AGENTS.md".into()));
+        assert_eq!(parsed.pi[1].source, "~/.dotfiles/ai/skills");
+        assert_eq!(parsed.pi[1].target, None);
+    }
+
+    #[test]
+    fn kdl_dash_notation_mounts_writable() {
+        let kdl = r#"
+            mounts {
+                - { source "~/.local/share/ranger"; writable }
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.mounts.len(), 1);
+        assert!(parsed.mounts[0].writable);
+    }
+
+    #[test]
     fn kdl_no_pi_section() {
         let kdl = r#"
             mounts {
