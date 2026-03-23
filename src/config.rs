@@ -552,8 +552,8 @@ mod tests {
 
     #[test]
     fn load_with_project_config() {
-        let dir = PathBuf::from("/tmp/ramekin-test-project-config");
-        let ramekin_dir = dir.join(".ramekin");
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
         fs_err::create_dir_all(&ramekin_dir).unwrap();
         let config_path = ramekin_dir.join("config.kdl");
         // serde_kdl2 requires at least two repeated nodes for Vec deserialization
@@ -563,10 +563,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = Config::load(&dir, vec![]).unwrap();
-
-        // Clean up
-        let _ = fs_err::remove_dir_all(&dir);
+        let config = Config::load(dir.path(), vec![]).unwrap();
 
         // Should have project + builtin layers
         assert!(config.layers.len() >= 2);
