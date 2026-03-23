@@ -57,6 +57,7 @@ pub struct ConfigLayer {
     /// `None` for the default scope; `Some(path)` for file-backed scopes.
     pub path: Option<PathBuf>,
     pub mounts: Vec<ResolvedMount>,
+    pub pi: Vec<PiEntry>,
 }
 
 /// All configuration layers, ordered from lowest to highest precedence.
@@ -83,6 +84,24 @@ impl ScopedConfig {
             for mount in layer.mounts.iter().rev() {
                 if seen.insert(&mount.target) {
                     result.push((layer.scope, mount));
+                }
+            }
+        }
+        result.reverse();
+        result
+    }
+
+    /// Merge pi entries from all layers, de-duplicated by resolved target.
+    ///
+    /// Higher-precedence layers override entries with the same target.
+    pub fn merged_pi(&self) -> Vec<&PiEntry> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for layer in self.layers.iter().rev() {
+            for entry in layer.pi.iter().rev() {
+                let target = entry.resolve().target;
+                if seen.insert(target) {
+                    result.push(entry);
                 }
             }
         }
@@ -124,6 +143,7 @@ impl Config {
                 scope: Scope::User,
                 path: Some(user_path),
                 mounts: config.resolve_mounts(),
+                pi: config.pi,
             });
         }
 
@@ -137,6 +157,7 @@ impl Config {
                 scope: Scope::Project,
                 path: Some(project_path),
                 mounts: config.resolve_mounts(),
+                pi: config.pi,
             });
         }
 
@@ -145,6 +166,7 @@ impl Config {
             scope: Scope::Builtin,
             path: None,
             mounts: builtin_mounts,
+            pi: vec![],
         });
 
         Ok(ScopedConfig { layers })
@@ -515,6 +537,7 @@ mod tests {
                         target: "/a".into(),
                         writable: false,
                     }],
+                    pi: vec![],
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -524,6 +547,7 @@ mod tests {
                         target: "/b".into(),
                         writable: true,
                     }],
+                    pi: vec![],
                 },
             ],
         };
@@ -544,6 +568,7 @@ mod tests {
                     target: "/a".into(),
                     writable: false,
                 }],
+                pi: vec![],
             }],
         };
         let merged = config.merged_mounts();
@@ -563,6 +588,7 @@ mod tests {
                         target: "/a".into(),
                         writable: false,
                     }],
+                    pi: vec![],
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -572,6 +598,7 @@ mod tests {
                         target: "/b".into(),
                         writable: true,
                     }],
+                    pi: vec![],
                 },
                 ConfigLayer {
                     scope: Scope::Builtin,
@@ -581,6 +608,7 @@ mod tests {
                         target: "/c".into(),
                         writable: true,
                     }],
+                    pi: vec![],
                 },
             ],
         };
@@ -610,6 +638,7 @@ mod tests {
                             writable: false,
                         },
                     ],
+                    pi: vec![],
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -620,6 +649,7 @@ mod tests {
                         target: "/root/.config/git".into(),
                         writable: true,
                     }],
+                    pi: vec![],
                 },
             ],
         };
@@ -898,5 +928,101 @@ mod tests {
         );
         // Old stale dir gone.
         assert!(!agent_dir.path().join("old-skills").exists());
+    }
+
+    #[test]
+    fn merged_pi_accumulates() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![PiEntry {
+                        source: "~/.dotfiles/AGENTS.md".into(),
+                        target: None,
+                    }],
+                },
+                ConfigLayer {
+                    scope: Scope::Project,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![PiEntry {
+                        source: "/project/skills".into(),
+                        target: None,
+                    }],
+                },
+                ConfigLayer {
+                    scope: Scope::Builtin,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![],
+                },
+            ],
+        };
+        let merged = config.merged_pi();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].source, "~/.dotfiles/AGENTS.md");
+        assert_eq!(merged[1].source, "/project/skills");
+    }
+
+    #[test]
+    fn merged_pi_deduplicates_by_resolved_target() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![PiEntry {
+                        source: "~/.dotfiles/AGENTS.md".into(),
+                        target: None,
+                    }],
+                },
+                ConfigLayer {
+                    scope: Scope::Project,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![PiEntry {
+                        source: "/project/AGENTS.md".into(),
+                        target: None,
+                    }],
+                },
+            ],
+        };
+        let merged = config.merged_pi();
+        assert_eq!(merged.len(), 1);
+        // Project wins.
+        assert_eq!(merged[0].source, "/project/AGENTS.md");
+    }
+
+    #[test]
+    fn merged_pi_explicit_target_deduplicates_with_basename() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![PiEntry {
+                        source: "~/.dotfiles/ai/skills".into(),
+                        target: None,
+                    }],
+                },
+                ConfigLayer {
+                    scope: Scope::Project,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![PiEntry {
+                        source: "/project/my-custom-skills".into(),
+                        target: Some("skills".into()),
+                    }],
+                },
+            ],
+        };
+        let merged = config.merged_pi();
+        assert_eq!(merged.len(), 1);
+        // Project wins — explicit target "skills" matches user's basename "skills".
+        assert_eq!(merged[0].source, "/project/my-custom-skills");
     }
 }
