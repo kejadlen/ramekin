@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{Context, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -134,6 +134,7 @@ impl Config {
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
         let user_path = xdg
             .place_config_file("config.kdl")
+            .into_diagnostic()
             .wrap_err("failed to determine user config path")?;
 
         if user_path.exists() {
@@ -174,8 +175,12 @@ impl Config {
 
     /// Parse a config file.
     fn load_file(path: &Path) -> Result<Self> {
-        let content = fs_err::read_to_string(path).wrap_err("failed to read config file")?;
-        serde_kdl2::from_str(&content).wrap_err("failed to parse config file")
+        let content = fs_err::read_to_string(path)
+            .into_diagnostic()
+            .wrap_err("failed to read config file")?;
+        serde_kdl2::from_str(&content)
+            .into_diagnostic()
+            .wrap_err("failed to parse config file")
     }
 
     /// Resolve all mounts, skipping any whose source directory does not exist.
@@ -237,15 +242,15 @@ pub fn clear_agent_dir(agent_dir: &Path) -> Result<()> {
     if !agent_dir.exists() {
         return Ok(());
     }
-    for entry in fs_err::read_dir(agent_dir)? {
-        let entry = entry?;
+    for entry in fs_err::read_dir(agent_dir).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
         if entry.file_name() == "auth.json" {
             continue;
         }
-        if entry.file_type()?.is_dir() {
-            fs_err::remove_dir_all(entry.path())?;
+        if entry.file_type().into_diagnostic()?.is_dir() {
+            fs_err::remove_dir_all(entry.path()).into_diagnostic()?;
         } else {
-            fs_err::remove_file(entry.path())?;
+            fs_err::remove_file(entry.path()).into_diagnostic()?;
         }
     }
     Ok(())
@@ -271,7 +276,7 @@ pub fn assemble_pi(agent_dir: &Path, entries: &[ResolvedPiEntry]) -> Result<()> 
         if entry.source.is_dir() {
             copy_dir(&entry.source, &target)?;
         } else {
-            fs_err::copy(&entry.source, &target)?;
+            fs_err::copy(&entry.source, &target).into_diagnostic()?;
         }
     }
     Ok(())
@@ -279,15 +284,15 @@ pub fn assemble_pi(agent_dir: &Path, entries: &[ResolvedPiEntry]) -> Result<()> 
 
 /// Recursively copy a directory tree.
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    fs_err::create_dir_all(dst)?;
-    for entry in fs_err::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    fs_err::create_dir_all(dst).into_diagnostic()?;
+    for entry in fs_err::read_dir(src).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        let file_type = entry.file_type().into_diagnostic()?;
         let target = dst.join(entry.file_name());
         if file_type.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else {
-            fs_err::copy(entry.path(), &target)?;
+            fs_err::copy(entry.path(), &target).into_diagnostic()?;
         }
     }
     Ok(())

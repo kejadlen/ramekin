@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{Context, Result, bail};
+use miette::{Context, IntoDiagnostic, Result, bail};
 use serde::Serialize;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -42,7 +42,9 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    color_eyre::install()?;
+    miette::set_hook(Box::new(|_| {
+        Box::new(miette::MietteHandlerOpts::new().build())
+    }))?;
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
@@ -77,28 +79,35 @@ impl Ramekin {
     /// Resolve all paths, create XDG directories, seed default files, and
     /// resolve mounts.
     fn resolve(workspace_arg: PathBuf) -> Result<Self> {
-        let workspace = workspace_arg.canonicalize().wrap_err_with(|| {
-            format!("workspace path does not exist: {}", workspace_arg.display())
-        })?;
+        let workspace = workspace_arg
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("workspace path does not exist: {}", workspace_arg.display())
+            })?;
 
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
 
         // Agent directory mirrors /root/.pi/agent in the container.
         let agent_dir = xdg
             .create_config_directory("agent")
+            .into_diagnostic()
             .wrap_err("failed to create agent config directory")?;
 
         let pi_data_dir = xdg
             .create_data_directory("")
+            .into_diagnostic()
             .wrap_err("failed to create pi data directory")?;
 
         let repo_slug = repo_slug(&workspace);
         let repo_sessions_dir = xdg
             .create_data_directory(format!("repos/{repo_slug}/sessions"))
+            .into_diagnostic()
             .wrap_err("failed to create repo sessions directory")?;
 
         let cache_dir = xdg
             .create_cache_directory("")
+            .into_diagnostic()
             .wrap_err("failed to create cache directory")?;
 
         let custom_dockerfile_path = workspace.join(".ramekin/Dockerfile");
@@ -134,8 +143,8 @@ impl Ramekin {
 
         // Always write ramekin.ts after assembly.
         let extensions_dir = agent_dir.join("extensions");
-        fs_err::create_dir_all(&extensions_dir)?;
-        fs_err::write(extensions_dir.join("ramekin.ts"), RAMEKIN_EXTENSION)?;
+        fs_err::create_dir_all(&extensions_dir).into_diagnostic()?;
+        fs_err::write(extensions_dir.join("ramekin.ts"), RAMEKIN_EXTENSION).into_diagnostic()?;
 
         Ok(Self {
             workspace,
@@ -232,7 +241,7 @@ impl Ramekin {
 
         // Write the embedded Dockerfile to the cache directory
         let base_dockerfile = self.cache_dir.join("Dockerfile");
-        fs_err::write(&base_dockerfile, DOCKERFILE)?;
+        fs_err::write(&base_dockerfile, DOCKERFILE).into_diagnostic()?;
 
         // Build the base image
         if rebuild {
@@ -248,7 +257,10 @@ impl Ramekin {
             build_cmd.args(["--no-cache", "--pull"]);
         }
         build_cmd.arg(&self.cache_dir);
-        let status = build_cmd.status().wrap_err("failed to build base image")?;
+        let status = build_cmd
+            .status()
+            .into_diagnostic()
+            .wrap_err("failed to build base image")?;
         if !status.success() {
             bail!("base image build failed ({})", status);
         }
@@ -267,6 +279,7 @@ impl Ramekin {
         let session_dir = self
             .xdg
             .create_cache_directory(format!("sessions/{session_id}"))
+            .into_diagnostic()
             .wrap_err("failed to create session directory")?;
 
         let all_mounts: Vec<_> = self
@@ -277,7 +290,7 @@ impl Ramekin {
             .collect();
         let compose = generate_compose(&dockerfile, &build_context, &all_mounts, pi_args);
         let compose_file = session_dir.join("compose.yml");
-        fs_err::write(&compose_file, &compose)?;
+        fs_err::write(&compose_file, &compose).into_diagnostic()?;
 
         let project_name = format!("ramekin-{session_id}");
         let docker_compose = |args: &[&str]| -> Result<Command> {
@@ -291,6 +304,7 @@ impl Ramekin {
 
         let status = docker_compose(&["up", "-d", "--build"])?
             .status()
+            .into_diagnostic()
             .wrap_err("failed to run docker compose up")?;
         if !status.success() {
             bail!("docker compose up failed ({})", status);
@@ -301,11 +315,13 @@ impl Ramekin {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
+            .into_diagnostic()
             .wrap_err("failed to attach to agent")?;
 
         // Always tear down, regardless of attach exit status
         let down_status = docker_compose(&["down"])?
             .status()
+            .into_diagnostic()
             .wrap_err("failed to run docker compose down")?;
         if !down_status.success() {
             error!("docker compose down failed ({})", down_status);
