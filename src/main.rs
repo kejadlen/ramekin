@@ -3,7 +3,8 @@ mod config;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use miette::{Context, IntoDiagnostic, Result, bail};
 use serde::Serialize;
 use tracing::{error, info};
@@ -39,6 +40,11 @@ enum Cmd {
     },
     /// Show resolved paths and mount configuration
     Config,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
 }
 
 fn main() -> Result<()> {
@@ -52,11 +58,19 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Cmd::Run { rebuild: false });
+
+    // Completions doesn't need workspace resolution.
+    if let Cmd::Completions { shell } = command {
+        clap_complete::generate(shell, &mut Cli::command(), "ramekin", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let ramekin = Ramekin::resolve(cli.workspace)?;
 
     match command {
         Cmd::Run { rebuild } => ramekin.run(rebuild, &cli.pi_args),
         Cmd::Config => ramekin.config(),
+        Cmd::Completions { .. } => unreachable!(),
     }
 }
 
