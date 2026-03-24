@@ -66,6 +66,7 @@ fn main() -> Result<()> {
 
 struct Ramekin {
     workspace: PathBuf,
+    xdg: xdg::BaseDirectories,
     agent_dir: PathBuf,
     pi_data_dir: PathBuf,
     repo_sessions_dir: PathBuf,
@@ -140,6 +141,7 @@ impl Ramekin {
 
         Ok(Self {
             workspace,
+            xdg,
             agent_dir,
             pi_data_dir,
             repo_sessions_dir,
@@ -263,9 +265,9 @@ impl Ramekin {
         };
 
         // Session-scoped: unique compose file and project name
-        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
         let session_id = session_id();
-        let session_dir = xdg
+        let session_dir = self
+            .xdg
             .create_cache_directory(format!("sessions/{session_id}"))
             .wrap_err("failed to create session directory")?;
 
