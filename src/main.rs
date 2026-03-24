@@ -1,7 +1,5 @@
 mod config;
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -334,15 +332,25 @@ fn session_id() -> String {
     format!("{:08x}", fastrand::u32(..))
 }
 
+/// FNV-1a 64-bit hash. Deterministic across Rust toolchain versions, unlike DefaultHasher.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001B3;
+    let mut hash = BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Create a slug for a workspace path: `<dirname>-<hash>`.
 fn repo_slug(workspace: &Path) -> String {
     let name = workspace
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "root".into());
-    let mut hasher = DefaultHasher::new();
-    workspace.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = fnv1a_64(workspace.as_os_str().as_encoded_bytes());
     format!("{name}-{hash:08x}")
 }
 
