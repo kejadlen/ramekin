@@ -38,13 +38,7 @@ ramekin completions bash > ~/.local/share/bash-completion/completions/ramekin
 
 ### Persistence
 
-The agent directory (`$XDG_CONFIG_HOME/ramekin/agent/`) is mounted into the container at `/root/.pi/agent`. It holds:
-
-| File | Seeded as |
-|---|---|
-| settings.json | `{}` |
-| keybindings.json | `{}` |
-| AGENTS.md | empty |
+The agent directory (`$XDG_CONFIG_HOME/ramekin/agent/`) is mounted into the container at `/root/.pi/agent`. On each run, everything except `auth.json` is cleared and reassembled from pi config entries defined in KDL config files. The `ramekin.ts` extension is always written fresh.
 
 The full pi data directory (`$XDG_DATA_HOME/ramekin/`) is mounted at `/root/.pi` for auth tokens and session history. Each workspace also gets its own sessions directory under `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`.
 

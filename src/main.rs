@@ -90,7 +90,7 @@ struct Ramekin {
 }
 
 impl Ramekin {
-    /// Resolve all paths, create XDG directories, seed default files, and
+    /// Resolve all paths, create XDG directories, assemble pi config, and
     /// resolve mounts.
     fn resolve(workspace_arg: PathBuf) -> Result<Self> {
         let workspace = workspace_arg
