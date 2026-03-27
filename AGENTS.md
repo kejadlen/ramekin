@@ -58,6 +58,7 @@ just           # All four
 ## Version control
 
 - VCS is [jj](https://martinvonz.github.io/jj/latest/), not git.
+- Run `just` before committing to catch format, lint, and test failures.
 - Each logical change gets its own commit (`jj new -m "..."`). Do not bundle unrelated changes.
 - Keep commits out of the working copy: describe with `jj describe -m`, then `jj new` before starting the next change.
 - Unrelated files already in the working copy should be restored (`jj restore <path>`) before committing.
