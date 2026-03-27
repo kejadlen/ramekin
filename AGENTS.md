@@ -8,7 +8,9 @@ Ramekin is a containerized harness for running the [pi coding agent](https://git
 
 ```
 Cargo.toml              # Single-crate workspace
-src/main.rs             # CLI: builds image, generates compose, starts container, attaches
+src/
+  main.rs               # CLI: builds image, generates compose, starts container, attaches
+  config.rs             # KDL config loading, mount resolution, pi assembly
 build.rs                # Sets RAMEKIN_VERSION from env or git rev
 assets/
   Dockerfile            # Agent container image (Node.js + pi + jj + Rust)
@@ -49,7 +51,7 @@ just           # All four
 
 ## Dependencies
 
-- Production dependencies use `*` (unpinned) versions, except for pre-release crates which pin the exact version (e.g. `serde-kdl2 = "0.1.1-alpha.5"`).
+- Production dependencies use `*` (unpinned) versions, except for pre-release crates which pin the exact version (e.g. `serde-kdl2 = "0.1.1-alpha.6"`).
 - Dev dependencies also use `*`. Do not pin to the version `cargo add` resolves.
 - `Cargo.lock` is committed.
 

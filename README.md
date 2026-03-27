@@ -1,6 +1,6 @@
 # Ramekin
 
-Containerized harness for running the [pi coding agent](https://github.com/badlogic/pi-mono) with network-restricted access.
+Containerized harness for running the [pi coding agent](https://github.com/badlogic/pi-mono).
 
 ## Quick start
 
@@ -10,7 +10,7 @@ ramekin /some/path   # mount a specific workspace
 ramekin run --rebuild  # force a full image rebuild
 ```
 
-Ramekin builds a Docker image with pi and its dependencies, starts it via Docker Compose, and attaches your terminal. Auth state, settings, and keybindings persist across runs.
+Ramekin builds a Docker image with pi and its dependencies, starts it via Docker Compose, and attaches your terminal. Auth tokens and session history persist across runs.
 
 ## How it works
 
@@ -90,7 +90,7 @@ A built-in pi extension (`ramekin.ts`) is mounted into the agent container. It a
 
 ### Custom Dockerfile
 
-Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base agent image. Use `FROM ramekin-agent` to layer on top — the base image includes Node.js, pi, git, jj, ripgrep, fd, just, and Rust tooling.
+Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base agent image. Use `FROM ramekin-agent` to layer on top — the base image includes Node.js, pi, git, jj, ripgrep, fd, just, jq, difftastic, ranger, and Rust tooling.
 
 The workspace is used as the build context, so `COPY` instructions work relative to the project root.
 
