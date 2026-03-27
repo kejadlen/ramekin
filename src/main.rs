@@ -61,7 +61,12 @@ fn main() -> Result<()> {
 
     // Completions doesn't need workspace resolution.
     if let Cmd::Completions { shell } = command {
-        clap_complete::generate(shell, &mut Cli::command(), "ramekin", &mut std::io::stdout());
+        clap_complete::generate(
+            shell,
+            &mut Cli::command(),
+            "ramekin",
+            &mut std::io::stdout(),
+        );
         return Ok(());
     }
 

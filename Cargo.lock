@@ -673,9 +673,9 @@ dependencies = [
 
 [[package]]
 name = "serde-kdl2"
-version = "0.1.1-alpha.5"
+version = "0.1.1-alpha.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a493fc9d82a61b70ff3575cf934cb9cceefc4d8836856b788b9fe1040c098eb1"
+checksum = "d2f4e8799918040f88aaf3fae3d26fa405ca45b66eb653aecc597cfe9709170a"
 dependencies = [
  "kdl",
  "serde",
