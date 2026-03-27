@@ -33,7 +33,7 @@ just           # All four
 ## Conventions
 
 - Rust edition 2024, resolver v2 workspace.
-- Error handling uses `color-eyre`. Prefer `wrap_err` / `bail!` over `.unwrap()`.
+- Error handling uses `miette`. Prefer `wrap_err` / `bail!` over `.unwrap()`. Use `.into_diagnostic()` to convert standard errors before `?` or `.wrap_err()`.
 - File I/O uses `fs-err` instead of `std::fs`. The clippy config enforces this.
 - Logging uses `tracing` with `tracing-subscriber` and `EnvFilter`. Use `tracing::info`, `tracing::error`, etc. — not `println!` or `eprintln!`.
 - All CI checks must pass: `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.

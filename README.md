@@ -29,6 +29,13 @@ A Rust CLI orchestrates a Docker Compose stack. On each run it:
 
 `config` prints resolved paths, volume mounts, and Dockerfile status without starting anything — useful for debugging mount issues.
 
+`completions <shell>` generates shell completions for bash, zsh, fish, elvish, or powershell. Pipe the output to a file sourced by your shell:
+
+```sh
+ramekin completions zsh > ~/.zfunc/_ramekin
+ramekin completions bash > ~/.local/share/bash-completion/completions/ramekin
+```
+
 ### Persistence
 
 The agent directory (`$XDG_CONFIG_HOME/ramekin/agent/`) is mounted into the container at `/root/.pi/agent`. It holds:
