@@ -22,14 +22,13 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Calculate version
         id: version
         run: |
           CALVER=$(date -u +"%Y-%m-%d")
-          SHORT_SHA=$(git rev-parse --short HEAD)
+          SHORT_SHA="${GITHUB_SHA::7}"
           echo "version=${CALVER}+${SHORT_SHA}" >> $GITHUB_OUTPUT
 
       - name: Build
@@ -42,11 +41,10 @@ jobs:
       - name: Publish
         run: |
           VERSION="${STEPS_VERSION_OUTPUTS_VERSION}"
-          git tag "v${VERSION}"
-          git push origin "v${VERSION}"
           gh release create "v${VERSION}" \
             --title "v${VERSION}" \
             --generate-notes \
+            --target "${GITHUB_SHA}" \
             ramekin-aarch64-apple-darwin.tar.gz
         env:
           GH_TOKEN: ${{ github.token }}
