@@ -2,13 +2,12 @@ name: Release
 
 on:
   workflow_dispatch:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- scoped to main branch, checks conclusion
     workflows: [CI]
     types: [completed]
     branches: [main]
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   build:
@@ -16,12 +15,15 @@ jobs:
       github.event_name == 'workflow_dispatch'
       || github.event.workflow_run.conclusion == 'success'
     runs-on: macos-latest
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Calculate version
         id: version
@@ -32,12 +34,14 @@ jobs:
 
       - name: Build
         run: |
-          RAMEKIN_VERSION="${{ steps.version.outputs.version }}" cargo build --release
+          RAMEKIN_VERSION="${STEPS_VERSION_OUTPUTS_VERSION}" cargo build --release
           tar -czf ramekin-aarch64-apple-darwin.tar.gz -C target/release ramekin
+        env:
+          STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
 
       - name: Publish
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${STEPS_VERSION_OUTPUTS_VERSION}"
           git tag "v${VERSION}"
           git push origin "v${VERSION}"
           gh release create "v${VERSION}" \
@@ -46,15 +50,20 @@ jobs:
             ramekin-aarch64-apple-darwin.tar.gz
         env:
           GH_TOKEN: ${{ github.token }}
+          STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
 
   dotslash:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Generate DotSlash file
-        uses: facebook/dotslash-publish-release@v1
+        uses: facebook/dotslash-publish-release@2539c4d8ae00a42773306c8731d2dd3724d979d2 # v1
         with:
           config: .github/dotslash-config.json
           tag: v${{ needs.build.outputs.version }}
