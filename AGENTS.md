@@ -14,7 +14,7 @@ src/
 build.rs                # Sets RAMEKIN_VERSION from env or git rev
 assets/
   Dockerfile            # Agent container image (Node.js + pi + jj + Rust)
-  ramekin.ts            # Pi extension injected into the container
+  ramekin-prompt.md     # System prompt appended inside the container
 clippy.toml             # Disallows std::fs in favor of fs-err
 justfile                # Local dev tasks (check, fmt, clippy, test, install)
 .github/workflows/
@@ -46,7 +46,7 @@ just           # All four
 - XDG directories under the `ramekin` prefix store pi state: data in `$XDG_DATA_HOME/ramekin`, config in `$XDG_CONFIG_HOME/ramekin`.
 - Each workspace gets a per-repo sessions directory keyed by a `<dirname>-<hash>` slug.
 - If the workspace contains `.ramekin/Dockerfile`, the CLI builds it on top of `ramekin-agent` instead of using the base image directly.
-- The `ramekin.ts` extension is written into the agent config directory on every run. It injects container environment context into the pi system prompt.
+- The `ramekin-prompt.md` file is written into the agent config directory on every run and passed to pi via `--append-system-prompt`. It injects container environment context into the system prompt.
 - Version is set at build time via the `RAMEKIN_VERSION` env var (used by CI) or falls back to `dev+<short-sha>`.
 
 ## Dependencies

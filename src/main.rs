@@ -11,7 +11,7 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
-const RAMEKIN_EXTENSION: &str = include_str!("../assets/ramekin.ts");
+const RAMEKIN_PROMPT: &str = include_str!("../assets/ramekin-prompt.md");
 
 const VERSION: &str = env!("RAMEKIN_VERSION");
 
@@ -160,10 +160,9 @@ impl Ramekin {
             config.merged_pi().iter().map(|e| e.resolve()).collect();
         config::assemble_pi(&agent_dir, &resolved_pi).wrap_err("failed to assemble pi config")?;
 
-        // Always write ramekin.ts after assembly.
-        let extensions_dir = agent_dir.join("extensions");
-        fs_err::create_dir_all(&extensions_dir).into_diagnostic()?;
-        fs_err::write(extensions_dir.join("ramekin.ts"), RAMEKIN_EXTENSION).into_diagnostic()?;
+        // Write the system prompt file so pi can read it via --append-system-prompt.
+        let prompt_path = agent_dir.join("ramekin-prompt.md");
+        fs_err::write(&prompt_path, RAMEKIN_PROMPT).into_diagnostic()?;
 
         Ok(Self {
             workspace,
@@ -406,7 +405,6 @@ struct AgentService {
     stdin_open: bool,
     tty: bool,
     volumes: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     command: Vec<String>,
 }
 
@@ -425,14 +423,13 @@ fn generate_compose(
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
 
-    // When extra args are provided, build the full command: `pi <args...>`
-    let command: Vec<String> = if pi_args.is_empty() {
-        vec![]
-    } else {
-        std::iter::once("pi".to_string())
-            .chain(pi_args.iter().cloned())
-            .collect()
-    };
+    // Always pass --append-system-prompt for the ramekin container context.
+    // The prompt file is written into the agent dir which is mounted at /root/.pi/agent.
+    let prompt_path = "/root/.pi/agent/ramekin-prompt.md";
+    let command: Vec<String> = std::iter::once("pi".to_string())
+        .chain(["--append-system-prompt".to_string(), prompt_path.to_string()])
+        .chain(pi_args.iter().cloned())
+        .collect();
 
     let config = ComposeConfig {
         services: Services {
