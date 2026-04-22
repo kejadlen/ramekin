@@ -1,6 +1,5 @@
 mod config;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -157,8 +156,11 @@ impl Ramekin {
         // Clear and reassemble the agent dir from pi config.
         config::clear_agent_dir(&agent_dir).wrap_err("failed to clear agent directory")?;
 
-        let resolved_pi: Vec<config::ResolvedPiEntry> =
-            config.merged_pi().iter().map(|e| e.resolve()).collect();
+        let resolved_pi: Vec<config::ResolvedPiEntry> = config
+            .merged_pi()
+            .iter()
+            .map(|sv| sv.value.resolve())
+            .collect();
         config::assemble_pi(&agent_dir, &resolved_pi).wrap_err("failed to assemble pi config")?;
 
         // Write the system prompt file so pi can read it via --append-system-prompt.
@@ -188,63 +190,80 @@ impl Ramekin {
         println!("  sessions {}", self.repo_sessions_dir.display());
         println!("  cache    {}", self.cache_dir.display());
 
-        println!();
-        println!("Volume mounts");
-        let merged = self.config.merged_mounts();
-        if merged.is_empty() {
-            println!("  (none)");
-        } else {
-            let mut current_scope = None;
-            for (scope, m) in &merged {
-                if current_scope != Some(*scope) {
-                    current_scope = Some(*scope);
-                    let label = self
-                        .config
-                        .layers
-                        .iter()
-                        .find(|l| l.scope == *scope)
-                        .and_then(|l| l.path.as_ref())
-                        .map(|p| format!("  {} ({})", scope, p.display()))
-                        .unwrap_or_else(|| format!("  {scope}"));
-                    println!("{label}");
-                }
-                println!("    {} → {}", m.source.display(), m.display_target());
-            }
-        }
-
+        let merged_mounts = self.config.merged_mounts();
         let merged_pi = self.config.merged_pi();
         let merged_env = self.config.merged_env();
-        if !merged_pi.is_empty() || !merged_env.is_empty() {
-            println!();
-            println!("Agent config");
-        }
 
-        if !merged_env.is_empty() {
-            for (name, value) in &merged_env {
-                println!("  {name}={value}");
+        let scope_label = |scope: config::Scope| -> String {
+            self.config
+                .layers
+                .iter()
+                .find(|l| l.scope == scope)
+                .and_then(|l| l.path.as_ref())
+                .map(|p| format!("{scope} ({})", p.display()))
+                .unwrap_or_else(|| scope.to_string())
+        };
+
+        // Mounts
+        if !merged_mounts.is_empty() {
+            println!();
+            println!("Mounts");
+            let scopes: std::collections::BTreeSet<_> =
+                merged_mounts.iter().map(|sv| sv.scope).collect();
+            for scope in scopes {
+                println!("  {}", scope_label(scope));
+                for sv in merged_mounts.iter().filter(|sv| sv.scope == scope) {
+                    println!(
+                        "    {} → {}",
+                        sv.value.source.display(),
+                        sv.value.display_target()
+                    );
+                }
             }
         }
 
+        // Environment
+        if !merged_env.is_empty() {
+            println!();
+            println!("Environment");
+            let scopes: std::collections::BTreeSet<_> =
+                merged_env.iter().map(|sv| sv.scope).collect();
+            for scope in scopes {
+                println!("  {}", scope_label(scope));
+                for sv in merged_env.iter().filter(|sv| sv.scope == scope) {
+                    println!("    {}={}", sv.value.0, sv.value.1);
+                }
+            }
+        }
+
+        // Pi config
         if !merged_pi.is_empty() {
-            for entry in &merged_pi {
-                let resolved = entry.resolve();
-                let kind = if resolved.source.is_dir() {
-                    "dir"
-                } else if resolved.source.is_file() {
-                    "file"
-                } else {
-                    "missing"
-                };
-                let marker = if resolved.source.exists() {
-                    "✓"
-                } else {
-                    "✗"
-                };
-                println!(
-                    "  {marker} {} → {} ({kind})",
-                    resolved.source.display(),
-                    resolved.target,
-                );
+            println!();
+            println!("Pi config");
+            let scopes: std::collections::BTreeSet<_> =
+                merged_pi.iter().map(|sv| sv.scope).collect();
+            for scope in scopes {
+                println!("  {}", scope_label(scope));
+                for sv in merged_pi.iter().filter(|sv| sv.scope == scope) {
+                    let resolved = sv.value.resolve();
+                    let kind = if resolved.source.is_dir() {
+                        "dir"
+                    } else if resolved.source.is_file() {
+                        "file"
+                    } else {
+                        "missing"
+                    };
+                    let marker = if resolved.source.exists() {
+                        "✓"
+                    } else {
+                        "✗"
+                    };
+                    println!(
+                        "    {marker} {} → {} ({kind})",
+                        resolved.source.display(),
+                        resolved.target
+                    );
+                }
             }
         }
 
@@ -315,7 +334,7 @@ impl Ramekin {
             .config
             .merged_mounts()
             .into_iter()
-            .map(|(_, m)| m)
+            .map(|sv| sv.value)
             .collect();
         let env_vars = self.config.merged_env();
         let compose =
@@ -433,26 +452,26 @@ fn generate_compose(
     dockerfile: &Path,
     build_context: &Path,
     mounts: &[&config::ResolvedMount],
-    env_vars: &HashMap<&str, &str>,
+    env_vars: &[config::ScopedValue<(&str, &str)>],
     pi_args: &[String],
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
 
     let environment: Vec<String> = env_vars
         .iter()
-        .map(|(name, value)| format!("{name}={value}"))
+        .map(|sv| format!("{}={}", sv.value.0, sv.value.1))
         .collect();
 
     // Always pass --append-system-prompt for the ramekin container context.
     // The prompt file is written into the agent dir which is mounted at /root/.pi/agent.
     let prompt_path = "/root/.pi/agent/ramekin-prompt.md";
-    let command: Vec<String> = std::iter::once("pi".to_string())
-        .chain([
-            "--append-system-prompt".to_string(),
-            prompt_path.to_string(),
-        ])
-        .chain(pi_args.iter().cloned())
-        .collect();
+    let command: Vec<String> = [
+        "--append-system-prompt".to_string(),
+        prompt_path.to_string(),
+    ]
+    .into_iter()
+    .chain(pi_args.iter().cloned())
+    .collect();
 
     let config = ComposeConfig {
         services: Services {

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,7 @@ pub struct Mount {
 }
 
 /// Configuration scope, ordered from lowest to highest precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// User-level `~/.config/ramekin/config.kdl`.
     User,
@@ -64,6 +64,13 @@ pub struct ConfigLayer {
     pub env: HashMap<String, String>,
 }
 
+/// A value tagged with the config scope it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedValue<T> {
+    pub scope: Scope,
+    pub value: T,
+}
+
 /// All configuration layers, ordered from lowest to highest precedence.
 ///
 /// The effective configuration comes from the highest-precedence layer
@@ -76,51 +83,67 @@ pub struct ScopedConfig {
 impl ScopedConfig {
     /// Return merged mounts from all layers, de-duplicated by container target.
     ///
-    /// Mounts accumulate across layers. When multiple layers define mounts with
-    /// the same container target path, the higher-precedence layer wins.
-    /// Each mount is tagged with the scope it came from.
-    pub fn merged_mounts(&self) -> Vec<(Scope, &ResolvedMount)> {
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-        // Iterate in reverse (highest precedence first) so higher layers win,
-        // then reverse the result to preserve low-to-high ordering.
-        for layer in self.layers.iter().rev() {
-            for mount in layer.mounts.iter().rev() {
-                if seen.insert(&mount.target) {
-                    result.push((layer.scope, mount));
-                }
-            }
-        }
-        result.reverse();
-        result
+    /// Higher-precedence layers override mounts with the same target.
+    pub fn merged_mounts(&self) -> Vec<ScopedValue<&ResolvedMount>> {
+        self.layers
+            .iter()
+            .flat_map(|layer| {
+                layer.mounts.iter().map(move |mount| {
+                    (
+                        &mount.target,
+                        ScopedValue {
+                            scope: layer.scope,
+                            value: mount,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>()
+            .into_values()
+            .collect()
     }
 
     /// Merge pi entries from all layers, de-duplicated by resolved target.
     ///
     /// Higher-precedence layers override entries with the same target.
-    pub fn merged_pi(&self) -> Vec<&PiEntry> {
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-        for layer in self.layers.iter().rev() {
-            for entry in layer.pi.iter().rev() {
-                let target = entry.resolve().target;
-                if seen.insert(target) {
-                    result.push(entry);
-                }
-            }
-        }
-        result.reverse();
-        result
+    pub fn merged_pi(&self) -> Vec<ScopedValue<&PiEntry>> {
+        self.layers
+            .iter()
+            .flat_map(|layer| {
+                layer.pi.iter().map(move |entry| {
+                    (
+                        entry.resolve().target,
+                        ScopedValue {
+                            scope: layer.scope,
+                            value: entry,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>()
+            .into_values()
+            .collect()
     }
 
     /// Merge environment variables from all layers, de-duplicated by name.
     ///
     /// Higher-precedence layers override variables with the same name.
-    pub fn merged_env(&self) -> HashMap<&str, &str> {
+    pub fn merged_env(&self) -> Vec<ScopedValue<(&str, &str)>> {
         self.layers
             .iter()
-            .flat_map(|l| l.env.iter())
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .flat_map(|layer| {
+                layer.env.iter().map(move |(name, value)| {
+                    (
+                        name.as_str(),
+                        ScopedValue {
+                            scope: layer.scope,
+                            value: (name.as_str(), value.as_str()),
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>()
+            .into_values()
             .collect()
     }
 }
@@ -579,8 +602,10 @@ mod tests {
         };
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].1.target, "/a");
-        assert_eq!(merged[1].1.target, "/b");
+        let a = merged.iter().find(|sv| sv.value.target == "/a").unwrap();
+        assert_eq!(a.scope, Scope::User);
+        let b = merged.iter().find(|sv| sv.value.target == "/b").unwrap();
+        assert_eq!(b.scope, Scope::Project);
     }
 
     #[test]
@@ -600,7 +625,7 @@ mod tests {
         };
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].1.target, "/a");
+        assert_eq!(merged[0].value.target, "/a");
     }
 
     #[test]
@@ -644,9 +669,12 @@ mod tests {
         };
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged[0].1.target, "/a");
-        assert_eq!(merged[1].1.target, "/b");
-        assert_eq!(merged[2].1.target, "/c");
+        let a = merged.iter().find(|sv| sv.value.target == "/a").unwrap();
+        assert_eq!(a.scope, Scope::User);
+        let b = merged.iter().find(|sv| sv.value.target == "/b").unwrap();
+        assert_eq!(b.scope, Scope::Project);
+        let c = merged.iter().find(|sv| sv.value.target == "/c").unwrap();
+        assert_eq!(c.scope, Scope::Builtin);
     }
 
     #[test]
@@ -688,14 +716,18 @@ mod tests {
         let merged = config.merged_mounts();
         // /root/.config/git appears in both layers; project layer wins
         assert_eq!(merged.len(), 2);
-        // jj from user (not overridden)
-        assert_eq!(merged[0].0, Scope::User);
-        assert_eq!(merged[0].1.target, "/root/.config/jj");
-        // git from project (overrides user)
-        assert_eq!(merged[1].0, Scope::Project);
-        assert_eq!(merged[1].1.target, "/root/.config/git");
-        assert_eq!(merged[1].1.source, PathBuf::from("/project/git"));
-        assert!(merged[1].1.writable);
+        let jj = merged
+            .iter()
+            .find(|sv| sv.value.target == "/root/.config/jj")
+            .unwrap();
+        assert_eq!(jj.scope, Scope::User);
+        let git = merged
+            .iter()
+            .find(|sv| sv.value.target == "/root/.config/git")
+            .unwrap();
+        assert_eq!(git.scope, Scope::Project);
+        assert_eq!(git.value.source, PathBuf::from("/project/git"));
+        assert!(git.value.writable);
     }
 
     #[test]
@@ -1025,8 +1057,16 @@ mod tests {
         };
         let merged = config.merged_pi();
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].source, "~/.dotfiles/AGENTS.md");
-        assert_eq!(merged[1].source, "/project/skills");
+        let agents = merged
+            .iter()
+            .find(|sv| sv.value.source == "~/.dotfiles/AGENTS.md")
+            .unwrap();
+        assert_eq!(agents.scope, Scope::User);
+        let skills = merged
+            .iter()
+            .find(|sv| sv.value.source == "/project/skills")
+            .unwrap();
+        assert_eq!(skills.scope, Scope::Project);
     }
 
     #[test]
@@ -1058,7 +1098,11 @@ mod tests {
         let merged = config.merged_pi();
         assert_eq!(merged.len(), 1);
         // Project wins.
-        assert_eq!(merged[0].source, "/project/AGENTS.md");
+        let entry = merged
+            .iter()
+            .find(|sv| sv.value.source == "/project/AGENTS.md")
+            .unwrap();
+        assert_eq!(entry.scope, Scope::Project);
     }
 
     #[test]
@@ -1090,7 +1134,11 @@ mod tests {
         let merged = config.merged_pi();
         assert_eq!(merged.len(), 1);
         // Project wins — explicit target "skills" matches user's basename "skills".
-        assert_eq!(merged[0].source, "/project/my-custom-skills");
+        let entry = merged
+            .iter()
+            .find(|sv| sv.value.source == "/project/my-custom-skills")
+            .unwrap();
+        assert_eq!(entry.scope, Scope::Project);
     }
 
     #[test]
@@ -1145,7 +1193,11 @@ mod tests {
         };
         let merged = config.merged_env();
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged.get("FOO").unwrap(), &"project");
-        assert_eq!(merged.get("BAR").unwrap(), &"user");
+        let foo = merged.iter().find(|sv| sv.value.0 == "FOO").unwrap();
+        assert_eq!(foo.value.1, "project");
+        assert_eq!(foo.scope, Scope::Project);
+        let bar = merged.iter().find(|sv| sv.value.0 == "BAR").unwrap();
+        assert_eq!(bar.value.1, "user");
+        assert_eq!(bar.scope, Scope::User);
     }
 }
