@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,8 @@ pub struct Config {
     pub mounts: Vec<Mount>,
     #[serde(default)]
     pub pi: Vec<PiEntry>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -58,6 +61,7 @@ pub struct ConfigLayer {
     pub path: Option<PathBuf>,
     pub mounts: Vec<ResolvedMount>,
     pub pi: Vec<PiEntry>,
+    pub env: HashMap<String, String>,
 }
 
 /// All configuration layers, ordered from lowest to highest precedence.
@@ -76,7 +80,7 @@ impl ScopedConfig {
     /// the same container target path, the higher-precedence layer wins.
     /// Each mount is tagged with the scope it came from.
     pub fn merged_mounts(&self) -> Vec<(Scope, &ResolvedMount)> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut result = Vec::new();
         // Iterate in reverse (highest precedence first) so higher layers win,
         // then reverse the result to preserve low-to-high ordering.
@@ -95,7 +99,7 @@ impl ScopedConfig {
     ///
     /// Higher-precedence layers override entries with the same target.
     pub fn merged_pi(&self) -> Vec<&PiEntry> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut result = Vec::new();
         for layer in self.layers.iter().rev() {
             for entry in layer.pi.iter().rev() {
@@ -107,6 +111,17 @@ impl ScopedConfig {
         }
         result.reverse();
         result
+    }
+
+    /// Merge environment variables from all layers, de-duplicated by name.
+    ///
+    /// Higher-precedence layers override variables with the same name.
+    pub fn merged_env(&self) -> HashMap<&str, &str> {
+        self.layers
+            .iter()
+            .flat_map(|l| l.env.iter())
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
     }
 }
 
@@ -145,6 +160,7 @@ impl Config {
                 path: Some(user_path),
                 mounts: config.resolve_mounts(),
                 pi: config.pi,
+                env: config.env,
             });
         }
 
@@ -159,6 +175,7 @@ impl Config {
                 path: Some(project_path),
                 mounts: config.resolve_mounts(),
                 pi: config.pi,
+                env: config.env,
             });
         }
 
@@ -168,6 +185,7 @@ impl Config {
             path: None,
             mounts: builtin_mounts,
             pi: vec![],
+            env: HashMap::new(),
         });
 
         Ok(ScopedConfig { layers })
@@ -517,6 +535,7 @@ mod tests {
                 },
             ],
             pi: vec![],
+            env: HashMap::new(),
         };
         let resolved = config.resolve_mounts();
         assert_eq!(resolved.len(), 1);
@@ -543,6 +562,7 @@ mod tests {
                         writable: false,
                     }],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -553,6 +573,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
             ],
         };
@@ -574,6 +595,7 @@ mod tests {
                     writable: false,
                 }],
                 pi: vec![],
+                env: HashMap::new(),
             }],
         };
         let merged = config.merged_mounts();
@@ -594,6 +616,7 @@ mod tests {
                         writable: false,
                     }],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -604,6 +627,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Builtin,
@@ -614,6 +638,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
             ],
         };
@@ -644,6 +669,7 @@ mod tests {
                         },
                     ],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -655,6 +681,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
             ],
         };
@@ -975,6 +1002,7 @@ mod tests {
                         source: "~/.dotfiles/AGENTS.md".into(),
                         target: None,
                     }],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -984,12 +1012,14 @@ mod tests {
                         source: "/project/skills".into(),
                         target: None,
                     }],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Builtin,
                     path: None,
                     mounts: vec![],
                     pi: vec![],
+                    env: HashMap::new(),
                 },
             ],
         };
@@ -1011,6 +1041,7 @@ mod tests {
                         source: "~/.dotfiles/AGENTS.md".into(),
                         target: None,
                     }],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -1020,6 +1051,7 @@ mod tests {
                         source: "/project/AGENTS.md".into(),
                         target: None,
                     }],
+                    env: HashMap::new(),
                 },
             ],
         };
@@ -1041,6 +1073,7 @@ mod tests {
                         source: "~/.dotfiles/ai/skills".into(),
                         target: None,
                     }],
+                    env: HashMap::new(),
                 },
                 ConfigLayer {
                     scope: Scope::Project,
@@ -1050,6 +1083,7 @@ mod tests {
                         source: "/project/my-custom-skills".into(),
                         target: Some("skills".into()),
                     }],
+                    env: HashMap::new(),
                 },
             ],
         };
@@ -1057,5 +1091,61 @@ mod tests {
         assert_eq!(merged.len(), 1);
         // Project wins — explicit target "skills" matches user's basename "skills".
         assert_eq!(merged[0].source, "/project/my-custom-skills");
+    }
+
+    #[test]
+    fn kdl_env_flat_props() {
+        let kdl = r#"
+            env FOO="bar"
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.env.get("FOO").unwrap(), "bar");
+    }
+
+    #[test]
+    fn kdl_env_multiple() {
+        let kdl = r#"
+            env {
+                API_KEY "secret123"
+                NODE_ENV "production"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.env.len(), 2);
+        assert_eq!(parsed.env.get("API_KEY").unwrap(), "secret123");
+        assert_eq!(parsed.env.get("NODE_ENV").unwrap(), "production");
+    }
+
+    #[test]
+    fn merged_env_deduplicates_by_name() {
+        let mut user_env = HashMap::new();
+        user_env.insert("FOO".into(), "user".into());
+        user_env.insert("BAR".into(), "user".into());
+
+        let mut project_env = HashMap::new();
+        project_env.insert("FOO".into(), "project".into());
+
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![],
+                    env: user_env,
+                },
+                ConfigLayer {
+                    scope: Scope::Project,
+                    path: None,
+                    mounts: vec![],
+                    pi: vec![],
+                    env: project_env,
+                },
+            ],
+        };
+        let merged = config.merged_env();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.get("FOO").unwrap(), &"project");
+        assert_eq!(merged.get("BAR").unwrap(), &"user");
     }
 }

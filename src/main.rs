@@ -1,5 +1,6 @@
 mod config;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -212,9 +213,19 @@ impl Ramekin {
         }
 
         let merged_pi = self.config.merged_pi();
-        if !merged_pi.is_empty() {
+        let merged_env = self.config.merged_env();
+        if !merged_pi.is_empty() || !merged_env.is_empty() {
             println!();
-            println!("Pi config");
+            println!("Agent config");
+        }
+
+        if !merged_env.is_empty() {
+            for (name, value) in &merged_env {
+                println!("  {name}={value}");
+            }
+        }
+
+        if !merged_pi.is_empty() {
             for entry in &merged_pi {
                 let resolved = entry.resolve();
                 let kind = if resolved.source.is_dir() {
@@ -306,7 +317,9 @@ impl Ramekin {
             .into_iter()
             .map(|(_, m)| m)
             .collect();
-        let compose = generate_compose(&dockerfile, &build_context, &all_mounts, pi_args);
+        let env_vars = self.config.merged_env();
+        let compose =
+            generate_compose(&dockerfile, &build_context, &all_mounts, &env_vars, pi_args);
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose).into_diagnostic()?;
 
@@ -404,6 +417,7 @@ struct AgentService {
     image: String,
     stdin_open: bool,
     tty: bool,
+    environment: Vec<String>,
     volumes: Vec<String>,
     command: Vec<String>,
 }
@@ -419,15 +433,24 @@ fn generate_compose(
     dockerfile: &Path,
     build_context: &Path,
     mounts: &[&config::ResolvedMount],
+    env_vars: &HashMap<&str, &str>,
     pi_args: &[String],
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
+
+    let environment: Vec<String> = env_vars
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
 
     // Always pass --append-system-prompt for the ramekin container context.
     // The prompt file is written into the agent dir which is mounted at /root/.pi/agent.
     let prompt_path = "/root/.pi/agent/ramekin-prompt.md";
     let command: Vec<String> = std::iter::once("pi".to_string())
-        .chain(["--append-system-prompt".to_string(), prompt_path.to_string()])
+        .chain([
+            "--append-system-prompt".to_string(),
+            prompt_path.to_string(),
+        ])
         .chain(pi_args.iter().cloned())
         .collect();
 
@@ -441,6 +464,7 @@ fn generate_compose(
                 image: "ramekin-agent".into(),
                 stdin_open: true,
                 tty: true,
+                environment,
                 volumes,
                 command,
             },
