@@ -25,9 +25,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
 
-    /// Extra arguments forwarded to pi inside the container (after --)
+    /// Extra arguments forwarded to the agent inside the container (after --)
     #[arg(last = true, global = true)]
-    pi_args: Vec<String>,
+    agent_args: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     let ramekin = Ramekin::resolve(cli.workspace)?;
 
     match command {
-        Cmd::Run { rebuild } => ramekin.run(rebuild, &cli.pi_args),
+        Cmd::Run { rebuild } => ramekin.run(rebuild, &cli.agent_args),
         Cmd::Config => ramekin.config(),
         Cmd::Completions { .. } => unreachable!(),
     }
@@ -283,7 +283,7 @@ impl Ramekin {
         Ok(())
     }
 
-    fn run(&self, rebuild: bool, pi_args: &[String]) -> Result<()> {
+    fn run(&self, rebuild: bool, agent_args: &[String]) -> Result<()> {
         info!(agent = %self.agent_dir.display(), repo = %self.repo_sessions_dir.display(), "directories");
         info!(workspace = %self.workspace.display(), "starting agent");
 
@@ -337,8 +337,13 @@ impl Ramekin {
             .map(|sv| sv.value)
             .collect();
         let env_vars = self.config.merged_env();
-        let compose =
-            generate_compose(&dockerfile, &build_context, &all_mounts, &env_vars, pi_args);
+        let compose = generate_compose(
+            &dockerfile,
+            &build_context,
+            &all_mounts,
+            &env_vars,
+            agent_args,
+        );
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose).into_diagnostic()?;
 
@@ -453,7 +458,7 @@ fn generate_compose(
     build_context: &Path,
     mounts: &[&config::ResolvedMount],
     env_vars: &[config::ScopedValue<(&str, &str)>],
-    pi_args: &[String],
+    agent_args: &[String],
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
 
@@ -470,7 +475,7 @@ fn generate_compose(
         prompt_path.to_string(),
     ]
     .into_iter()
-    .chain(pi_args.iter().cloned())
+    .chain(agent_args.iter().cloned())
     .collect();
 
     let config = ComposeConfig {
