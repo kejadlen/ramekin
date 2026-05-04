@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -153,24 +153,26 @@ impl ScopedConfig {
 
     /// Return merged mounts from all layers, de-duplicated by container target.
     ///
-    /// Higher-precedence layers override mounts with the same target.
+    /// Higher-precedence layers override mounts with the same target. Output
+    /// order is lexicographic by target, which puts parent paths before any
+    /// child path (`/root/.claude` precedes `/root/.claude/CLAUDE.md`).
+    /// Docker processes mount declarations in order; a parent declared after
+    /// its child would shadow the child. The deterministic ordering also
+    /// keeps repeat runs identical.
     pub fn merged_mounts(&self) -> Vec<ScopedValue<&ResolvedMount>> {
-        self.layers
-            .iter()
-            .flat_map(|layer| {
-                layer.mounts.iter().map(move |mount| {
-                    (
-                        &mount.target,
-                        ScopedValue {
-                            scope: layer.scope,
-                            value: mount,
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>()
-            .into_values()
-            .collect()
+        let mut by_target: BTreeMap<&str, ScopedValue<&ResolvedMount>> = BTreeMap::new();
+        for layer in &self.layers {
+            for mount in &layer.mounts {
+                by_target.insert(
+                    mount.target.as_str(),
+                    ScopedValue {
+                        scope: layer.scope,
+                        value: mount,
+                    },
+                );
+            }
+        }
+        by_target.into_values().collect()
     }
 
     /// Merge claude entries from all layers, de-duplicated by resolved target.
@@ -179,44 +181,38 @@ impl ScopedConfig {
     /// These entries inform `ramekin config` output; the actual mounts come
     /// from `expand_claude_mounts`.
     pub fn merged_claude(&self) -> Vec<ScopedValue<&ClaudeEntry>> {
-        self.layers
-            .iter()
-            .flat_map(|layer| {
-                layer.claude.iter().map(move |entry| {
-                    (
-                        entry.target_in_claude_dir(),
-                        ScopedValue {
-                            scope: layer.scope,
-                            value: entry,
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>()
-            .into_values()
-            .collect()
+        let mut by_target: BTreeMap<String, ScopedValue<&ClaudeEntry>> = BTreeMap::new();
+        for layer in &self.layers {
+            for entry in &layer.claude {
+                by_target.insert(
+                    entry.target_in_claude_dir(),
+                    ScopedValue {
+                        scope: layer.scope,
+                        value: entry,
+                    },
+                );
+            }
+        }
+        by_target.into_values().collect()
     }
 
     /// Merge pi entries from all layers, de-duplicated by resolved target.
     ///
     /// Higher-precedence layers override entries with the same target.
     pub fn merged_pi(&self) -> Vec<ScopedValue<&PiEntry>> {
-        self.layers
-            .iter()
-            .flat_map(|layer| {
-                layer.pi.iter().map(move |entry| {
-                    (
-                        entry.resolve().target,
-                        ScopedValue {
-                            scope: layer.scope,
-                            value: entry,
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>()
-            .into_values()
-            .collect()
+        let mut by_target: BTreeMap<String, ScopedValue<&PiEntry>> = BTreeMap::new();
+        for layer in &self.layers {
+            for entry in &layer.pi {
+                by_target.insert(
+                    entry.resolve().target,
+                    ScopedValue {
+                        scope: layer.scope,
+                        value: entry,
+                    },
+                );
+            }
+        }
+        by_target.into_values().collect()
     }
 
     /// The effective agent — the highest-precedence layer that set one,
@@ -233,22 +229,19 @@ impl ScopedConfig {
     ///
     /// Higher-precedence layers override variables with the same name.
     pub fn merged_env(&self) -> Vec<ScopedValue<(&str, &str)>> {
-        self.layers
-            .iter()
-            .flat_map(|layer| {
-                layer.env.iter().map(move |(name, value)| {
-                    (
-                        name.as_str(),
-                        ScopedValue {
-                            scope: layer.scope,
-                            value: (name.as_str(), value.as_str()),
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>()
-            .into_values()
-            .collect()
+        let mut by_name: BTreeMap<&str, ScopedValue<(&str, &str)>> = BTreeMap::new();
+        for layer in &self.layers {
+            for (name, value) in &layer.env {
+                by_name.insert(
+                    name.as_str(),
+                    ScopedValue {
+                        scope: layer.scope,
+                        value: (name.as_str(), value.as_str()),
+                    },
+                );
+            }
+        }
+        by_name.into_values().collect()
     }
 }
 
@@ -787,6 +780,56 @@ mod tests {
         assert_eq!(b.scope, Scope::Project);
         let c = merged.iter().find(|sv| sv.value.target == "/c").unwrap();
         assert_eq!(c.scope, Scope::Builtin);
+    }
+
+    #[test]
+    fn merged_mounts_orders_parents_before_children() {
+        // Builtin layer mounts the parent dir; user layer mounts a child file.
+        // The parent must come first in iteration order — Docker shadows a
+        // child mount if its parent is declared after it.
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: None,
+                    agent: None,
+                    mounts: vec![ResolvedMount {
+                        source: PathBuf::from("/host/CLAUDE.md"),
+                        target: "/root/.claude/CLAUDE.md".into(),
+                        writable: false,
+                    }],
+                    pi: vec![],
+                    claude: vec![],
+                    env: HashMap::new(),
+                },
+                ConfigLayer {
+                    scope: Scope::Builtin,
+                    path: None,
+                    agent: None,
+                    mounts: vec![ResolvedMount {
+                        source: PathBuf::from("/host/.claude"),
+                        target: "/root/.claude".into(),
+                        writable: true,
+                    }],
+                    pi: vec![],
+                    claude: vec![],
+                    env: HashMap::new(),
+                },
+            ],
+        };
+        let merged = config.merged_mounts();
+        let parent = merged
+            .iter()
+            .position(|sv| sv.value.target == "/root/.claude")
+            .unwrap();
+        let child = merged
+            .iter()
+            .position(|sv| sv.value.target == "/root/.claude/CLAUDE.md")
+            .unwrap();
+        assert!(
+            parent < child,
+            "parent /root/.claude (idx {parent}) must precede child /root/.claude/CLAUDE.md (idx {child})"
+        );
     }
 
     #[test]
