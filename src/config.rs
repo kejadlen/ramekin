@@ -473,15 +473,6 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 }
 
 impl ResolvedMount {
-    /// Format as a Docker volume mount string (`source:target` or `source:target:ro`).
-    pub fn to_volume_string(&self) -> String {
-        if self.writable {
-            format!("{}:{}", self.source.display(), self.target)
-        } else {
-            format!("{}:{}:ro", self.source.display(), self.target)
-        }
-    }
-
     /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
     pub fn display_target(&self) -> String {
         if self.writable {
@@ -627,32 +618,6 @@ mod tests {
         };
         let resolved = mount.resolve().unwrap();
         assert_eq!(resolved.target, "/tmp");
-    }
-
-    #[test]
-    fn volume_string_read_only() {
-        let m = ResolvedMount {
-            source: PathBuf::from("/home/user/.config/git"),
-            target: "/root/.config/git".into(),
-            writable: false,
-        };
-        assert_eq!(
-            m.to_volume_string(),
-            "/home/user/.config/git:/root/.config/git:ro"
-        );
-    }
-
-    #[test]
-    fn volume_string_read_write() {
-        let m = ResolvedMount {
-            source: PathBuf::from("/home/user/.local/share/ranger"),
-            target: "/root/.local/share/ranger".into(),
-            writable: true,
-        };
-        assert_eq!(
-            m.to_volume_string(),
-            "/home/user/.local/share/ranger:/root/.local/share/ranger"
-        );
     }
 
     #[test]

@@ -673,7 +673,7 @@ struct AgentService {
     stdin_open: bool,
     tty: bool,
     environment: Vec<String>,
-    volumes: Vec<String>,
+    volumes: Vec<VolumeBind>,
     command: Vec<String>,
 }
 
@@ -681,6 +681,17 @@ struct AgentService {
 struct BuildConfig {
     context: String,
     dockerfile: String,
+}
+
+/// Long-form compose bind mount. Avoids the `source:target[:ro]` short form,
+/// which can't represent paths containing colons.
+#[derive(Serialize)]
+struct VolumeBind {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    source: String,
+    target: String,
+    read_only: bool,
 }
 
 /// Generate a Docker Compose config with all volume mounts.
@@ -692,7 +703,15 @@ fn generate_compose(
     prompt_path: &str,
     agent_args: &[String],
 ) -> String {
-    let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
+    let volumes: Vec<VolumeBind> = mounts
+        .iter()
+        .map(|m| VolumeBind {
+            kind: "bind",
+            source: m.source.display().to_string(),
+            target: m.target.clone(),
+            read_only: !m.writable,
+        })
+        .collect();
 
     let environment: Vec<String> = env_vars
         .iter()
