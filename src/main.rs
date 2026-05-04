@@ -108,6 +108,14 @@ enum AgentLayout {
         /// mounts at `/workspace`, the encoded cwd path is always `-workspace`,
         /// and we have to split per-repo on the host side to avoid collisions.
         claude_projects_dir: PathBuf,
+        /// `~/.claude.json` inside the container — sibling to `~/.claude/`,
+        /// not inside it. One per host repo.
+        ///
+        /// Claude Code's global state file has a top-level `projects` map
+        /// keyed by absolute cwd. Without a per-repo split every host repo
+        /// would share the same `/workspace` entry — including granted
+        /// permissions and prompt history. Each repo gets its own file.
+        claude_state_file: PathBuf,
     },
 }
 
@@ -132,16 +140,30 @@ impl AgentLayout {
                     .into_diagnostic()
                     .wrap_err("failed to create repo sessions directory")?,
             }),
-            config::Agent::Claude => Ok(Self::Claude {
-                claude_data_dir: xdg
+            config::Agent::Claude => {
+                let claude_data_dir = xdg
                     .create_data_directory("agents/claude")
                     .into_diagnostic()
-                    .wrap_err("failed to create claude data directory")?,
-                claude_projects_dir: xdg
+                    .wrap_err("failed to create claude data directory")?;
+                let claude_projects_dir = xdg
                     .create_data_directory(format!("repos/{repo_slug}/claude-projects"))
                     .into_diagnostic()
-                    .wrap_err("failed to create claude projects directory")?,
-            }),
+                    .wrap_err("failed to create claude projects directory")?;
+                let claude_state_file = xdg
+                    .place_data_file(format!("repos/{repo_slug}/claude.json"))
+                    .into_diagnostic()
+                    .wrap_err("failed to determine claude state file path")?;
+                // Docker bind-mounts of files require the host file to exist;
+                // otherwise it creates a directory with that name.
+                if !claude_state_file.exists() {
+                    fs_err::write(&claude_state_file, "{}\n").into_diagnostic()?;
+                }
+                Ok(Self::Claude {
+                    claude_data_dir,
+                    claude_projects_dir,
+                    claude_state_file,
+                })
+            }
         }
     }
 
@@ -194,12 +216,14 @@ impl AgentLayout {
             Self::Claude {
                 claude_data_dir,
                 claude_projects_dir,
+                claude_state_file,
             } => vec![
                 (claude_data_dir.clone(), "/root/.claude"),
                 (
                     claude_projects_dir.clone(),
                     "/root/.claude/projects/-workspace",
                 ),
+                (claude_state_file.clone(), "/root/.claude.json"),
             ],
         };
         entries.push((workspace.to_path_buf(), "/workspace"));
@@ -228,9 +252,11 @@ impl AgentLayout {
             Self::Claude {
                 claude_data_dir,
                 claude_projects_dir,
+                claude_state_file,
             } => vec![
                 ("claude  ", claude_data_dir),
                 ("projects", claude_projects_dir),
+                ("state   ", claude_state_file),
             ],
         }
     }
