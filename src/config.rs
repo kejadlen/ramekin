@@ -14,6 +14,8 @@ pub struct Config {
     #[serde(default)]
     pub pi: Vec<PiEntry>,
     #[serde(default)]
+    pub claude: Vec<ClaudeEntry>,
+    #[serde(default)]
     pub env: HashMap<String, String>,
 }
 
@@ -39,6 +41,23 @@ impl fmt::Display for Agent {
 pub struct PiEntry {
     pub source: String,
     pub target: Option<String>,
+}
+
+/// An entry in the `claude { ... }` block.
+///
+/// Each entry expands to a Docker bind mount at `/root/.claude/<target>`,
+/// not a copy. That keeps host-side edits live in the container, lets
+/// auth and runtime state in the surrounding `~/.claude/` mount stay
+/// untouched, and avoids any clear-and-reassemble ceremony.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClaudeEntry {
+    pub source: String,
+    pub target: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "serde_kdl2::bare_defaults::bool::bare_true"
+    )]
+    pub writable: bool,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +101,7 @@ pub struct ConfigLayer {
     pub agent: Option<Agent>,
     pub mounts: Vec<ResolvedMount>,
     pub pi: Vec<PiEntry>,
+    pub claude: Vec<ClaudeEntry>,
     pub env: HashMap<String, String>,
 }
 
@@ -110,9 +130,25 @@ impl ScopedConfig {
             agent: None,
             mounts,
             pi: vec![],
+            claude: vec![],
             env: HashMap::new(),
         });
         self
+    }
+
+    /// Expand each layer's `claude { ... }` entries into bind mounts under
+    /// `/root/.claude/`, appended to that layer's mount list.
+    ///
+    /// Call this when the effective agent is `Claude`. Pi runs leave the
+    /// entries inert.
+    pub fn expand_claude_mounts(&mut self) {
+        for layer in &mut self.layers {
+            for entry in &layer.claude {
+                if let Some(mount) = entry.resolve_as_mount() {
+                    layer.mounts.push(mount);
+                }
+            }
+        }
     }
 
     /// Return merged mounts from all layers, de-duplicated by container target.
@@ -128,6 +164,30 @@ impl ScopedConfig {
                         ScopedValue {
                             scope: layer.scope,
                             value: mount,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>()
+            .into_values()
+            .collect()
+    }
+
+    /// Merge claude entries from all layers, de-duplicated by resolved target.
+    ///
+    /// Higher-precedence layers override entries with the same target.
+    /// These entries inform `ramekin config` output; the actual mounts come
+    /// from `expand_claude_mounts`.
+    pub fn merged_claude(&self) -> Vec<ScopedValue<&ClaudeEntry>> {
+        self.layers
+            .iter()
+            .flat_map(|layer| {
+                layer.claude.iter().map(move |entry| {
+                    (
+                        entry.target_in_claude_dir(),
+                        ScopedValue {
+                            scope: layer.scope,
+                            value: entry,
                         },
                     )
                 })
@@ -231,6 +291,7 @@ impl Config {
                 agent: config.agent,
                 mounts: config.resolve_mounts(),
                 pi: config.pi,
+                claude: config.claude,
                 env: config.env,
             });
         }
@@ -247,6 +308,7 @@ impl Config {
                 agent: config.agent,
                 mounts: config.resolve_mounts(),
                 pi: config.pi,
+                claude: config.claude,
                 env: config.env,
             });
         }
@@ -315,6 +377,37 @@ impl PiEntry {
                 .unwrap_or_default()
         });
         ResolvedPiEntry { source, target }
+    }
+}
+
+impl ClaudeEntry {
+    /// Path inside the container, relative to the claude data dir
+    /// (so just the basename portion under `/root/.claude/`).
+    pub fn target_relative(&self) -> String {
+        self.target.clone().unwrap_or_else(|| {
+            PathBuf::from(shellexpand::tilde(&self.source).as_ref())
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Full container path (`/root/.claude/<target>`).
+    pub fn target_in_claude_dir(&self) -> String {
+        format!("/root/.claude/{}", self.target_relative())
+    }
+
+    /// Resolve to a Docker bind mount, or `None` if the host source is missing.
+    pub fn resolve_as_mount(&self) -> Option<ResolvedMount> {
+        let expanded = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
+        if !expanded.exists() {
+            return None;
+        }
+        Some(ResolvedMount {
+            source: expanded,
+            target: self.target_in_claude_dir(),
+            writable: self.writable,
+        })
     }
 }
 
@@ -599,6 +692,7 @@ mod tests {
                 },
             ],
             pi: vec![],
+            claude: vec![],
             env: HashMap::new(),
         };
         let resolved = config.resolve_mounts();
@@ -627,6 +721,7 @@ mod tests {
                         writable: false,
                     }],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -639,6 +734,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
             ],
@@ -664,6 +760,7 @@ mod tests {
                     writable: false,
                 }],
                 pi: vec![],
+                claude: vec![],
                 env: HashMap::new(),
             }],
         };
@@ -686,6 +783,7 @@ mod tests {
                         writable: false,
                     }],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -698,6 +796,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -710,6 +809,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
             ],
@@ -745,6 +845,7 @@ mod tests {
                         },
                     ],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -758,6 +859,7 @@ mod tests {
                         writable: true,
                     }],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
             ],
@@ -1086,6 +1188,7 @@ mod tests {
                         source: "~/.dotfiles/AGENTS.md".into(),
                         target: None,
                     }],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -1097,6 +1200,7 @@ mod tests {
                         source: "/project/skills".into(),
                         target: None,
                     }],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -1105,6 +1209,7 @@ mod tests {
                     agent: None,
                     mounts: vec![],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
             ],
@@ -1136,6 +1241,7 @@ mod tests {
                         source: "~/.dotfiles/AGENTS.md".into(),
                         target: None,
                     }],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -1147,6 +1253,7 @@ mod tests {
                         source: "/project/AGENTS.md".into(),
                         target: None,
                     }],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
             ],
@@ -1174,6 +1281,7 @@ mod tests {
                         source: "~/.dotfiles/ai/skills".into(),
                         target: None,
                     }],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -1185,6 +1293,7 @@ mod tests {
                         source: "/project/my-custom-skills".into(),
                         target: Some("skills".into()),
                     }],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
             ],
@@ -1239,6 +1348,7 @@ mod tests {
                     agent: None,
                     mounts: vec![],
                     pi: vec![],
+                    claude: vec![],
                     env: user_env,
                 },
                 ConfigLayer {
@@ -1247,6 +1357,7 @@ mod tests {
                     agent: None,
                     mounts: vec![],
                     pi: vec![],
+                    claude: vec![],
                     env: project_env,
                 },
             ],
@@ -1305,6 +1416,7 @@ mod tests {
                 agent: None,
                 mounts: vec![],
                 pi: vec![],
+                claude: vec![],
                 env: HashMap::new(),
             }],
         };
@@ -1321,6 +1433,7 @@ mod tests {
                     agent: Some(Agent::Pi),
                     mounts: vec![],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -1329,6 +1442,7 @@ mod tests {
                     agent: Some(Agent::Claude),
                     mounts: vec![],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
                 ConfigLayer {
@@ -1337,6 +1451,7 @@ mod tests {
                     agent: None,
                     mounts: vec![],
                     pi: vec![],
+                    claude: vec![],
                     env: HashMap::new(),
                 },
             ],
@@ -1349,5 +1464,204 @@ mod tests {
     fn agent_display() {
         assert_eq!(Agent::Pi.to_string(), "pi");
         assert_eq!(Agent::Claude.to_string(), "claude");
+    }
+
+    // -- claude { ... } block ----------------------------------------------
+
+    #[test]
+    fn kdl_claude_entries() {
+        let kdl = r#"
+            claude {
+                source "~/.dotfiles/ai/CLAUDE.md"
+            }
+            claude {
+                source "~/.dotfiles/ai/skills"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert!(parsed.pi.is_empty());
+        assert_eq!(parsed.claude.len(), 2);
+        assert_eq!(parsed.claude[0].source, "~/.dotfiles/ai/CLAUDE.md");
+        assert_eq!(parsed.claude[0].target, None);
+        assert!(!parsed.claude[0].writable);
+    }
+
+    #[test]
+    fn kdl_claude_with_explicit_target_and_writable() {
+        let kdl = r#"
+            claude {
+                source "~/.dotfiles/my-skills"
+                target "skills"
+                writable
+            }
+            claude {
+                source "~/.dotfiles/CLAUDE.md"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.claude.len(), 2);
+        assert_eq!(parsed.claude[0].target, Some("skills".into()));
+        assert!(parsed.claude[0].writable);
+        assert!(!parsed.claude[1].writable);
+    }
+
+    #[test]
+    fn kdl_pi_and_claude_coexist() {
+        // Both blocks may appear; the active agent picks which one applies.
+        let kdl = r#"
+            pi {
+                source "~/.dotfiles/AGENTS.md"
+            }
+            pi {
+                source "~/.dotfiles/skills"
+            }
+            claude {
+                source "~/.dotfiles/CLAUDE.md"
+            }
+            claude {
+                source "~/.dotfiles/skills"
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.pi.len(), 2);
+        assert_eq!(parsed.claude.len(), 2);
+    }
+
+    #[test]
+    fn claude_entry_target_in_claude_dir_uses_basename() {
+        let entry = ClaudeEntry {
+            source: "~/.dotfiles/CLAUDE.md".into(),
+            target: None,
+            writable: false,
+        };
+        assert_eq!(entry.target_in_claude_dir(), "/root/.claude/CLAUDE.md");
+    }
+
+    #[test]
+    fn claude_entry_target_in_claude_dir_uses_explicit_target() {
+        let entry = ClaudeEntry {
+            source: "~/.dotfiles/my-skills".into(),
+            target: Some("skills".into()),
+            writable: false,
+        };
+        assert_eq!(entry.target_in_claude_dir(), "/root/.claude/skills");
+    }
+
+    #[test]
+    fn claude_entry_resolve_as_mount_returns_none_when_source_missing() {
+        let entry = ClaudeEntry {
+            source: "/nonexistent/path/that/does/not/exist".into(),
+            target: None,
+            writable: false,
+        };
+        assert!(entry.resolve_as_mount().is_none());
+    }
+
+    #[test]
+    fn claude_entry_resolve_as_mount_default_read_only() {
+        let entry = ClaudeEntry {
+            source: "/tmp".into(),
+            target: Some("workspace".into()),
+            writable: false,
+        };
+        let mount = entry.resolve_as_mount().unwrap();
+        assert_eq!(mount.source, PathBuf::from("/tmp"));
+        assert_eq!(mount.target, "/root/.claude/workspace");
+        assert!(!mount.writable);
+    }
+
+    #[test]
+    fn claude_entry_resolve_as_mount_writable() {
+        let entry = ClaudeEntry {
+            source: "/tmp".into(),
+            target: Some("scratch".into()),
+            writable: true,
+        };
+        let mount = entry.resolve_as_mount().unwrap();
+        assert!(mount.writable);
+    }
+
+    #[test]
+    fn expand_claude_mounts_appends_to_layer() {
+        let mut config = ScopedConfig {
+            layers: vec![ConfigLayer {
+                scope: Scope::User,
+                path: None,
+                agent: None,
+                mounts: vec![],
+                pi: vec![],
+                claude: vec![ClaudeEntry {
+                    source: "/tmp".into(),
+                    target: Some("scratch".into()),
+                    writable: false,
+                }],
+                env: HashMap::new(),
+            }],
+        };
+        config.expand_claude_mounts();
+        assert_eq!(config.layers[0].mounts.len(), 1);
+        assert_eq!(config.layers[0].mounts[0].target, "/root/.claude/scratch");
+    }
+
+    #[test]
+    fn expand_claude_mounts_skips_missing_source() {
+        let mut config = ScopedConfig {
+            layers: vec![ConfigLayer {
+                scope: Scope::User,
+                path: None,
+                agent: None,
+                mounts: vec![],
+                pi: vec![],
+                claude: vec![ClaudeEntry {
+                    source: "/nonexistent".into(),
+                    target: None,
+                    writable: false,
+                }],
+                env: HashMap::new(),
+            }],
+        };
+        config.expand_claude_mounts();
+        assert!(config.layers[0].mounts.is_empty());
+    }
+
+    #[test]
+    fn merged_claude_deduplicates_by_target() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: None,
+                    agent: None,
+                    mounts: vec![],
+                    pi: vec![],
+                    claude: vec![ClaudeEntry {
+                        source: "/user/CLAUDE.md".into(),
+                        target: None,
+                        writable: false,
+                    }],
+                    env: HashMap::new(),
+                },
+                ConfigLayer {
+                    scope: Scope::Project,
+                    path: None,
+                    agent: None,
+                    mounts: vec![],
+                    pi: vec![],
+                    claude: vec![ClaudeEntry {
+                        source: "/project/CLAUDE.md".into(),
+                        target: None,
+                        writable: false,
+                    }],
+                    env: HashMap::new(),
+                },
+            ],
+        };
+        let merged = config.merged_claude();
+        assert_eq!(merged.len(), 1);
+        let entry = merged
+            .iter()
+            .find(|sv| sv.value.source == "/project/CLAUDE.md")
+            .unwrap();
+        assert_eq!(entry.scope, Scope::Project);
     }
 }

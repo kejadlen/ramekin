@@ -281,10 +281,17 @@ impl Ramekin {
         let repo_slug = repo_slug(&workspace);
         let layout = AgentLayout::for_agent(agent, &xdg, &repo_slug)?;
 
+        // Expand `claude { ... }` entries into bind mounts before the builtin
+        // layer is appended, so synthesized mounts inherit the user/project
+        // scope they came from. (No-op for pi.)
+        let mut pre_config = pre_config;
+        if matches!(layout, AgentLayout::Claude { .. }) {
+            pre_config.expand_claude_mounts();
+        }
         let config = pre_config.with_builtin(layout.builtin_mounts(&workspace));
 
-        // Agent-specific prep: reassemble pi's config dir from KDL pi entries.
-        // Claude support lives in a follow-up commit.
+        // Pi assembles its agent config dir per run by clearing and copying
+        // from KDL pi entries. Claude uses bind mounts (handled above).
         if let AgentLayout::Pi { agent_dir, .. } = &layout {
             config::clear_agent_dir(agent_dir).wrap_err("failed to clear agent directory")?;
             let resolved_pi: Vec<config::ResolvedPiEntry> = config
@@ -327,6 +334,7 @@ impl Ramekin {
 
         let merged_mounts = self.config.merged_mounts();
         let merged_pi = self.config.merged_pi();
+        let merged_claude = self.config.merged_claude();
         let merged_env = self.config.merged_env();
 
         let scope_label = |scope: config::Scope| -> String {
@@ -381,13 +389,7 @@ impl Ramekin {
                 println!("  {}", scope_label(scope));
                 for sv in merged_pi.iter().filter(|sv| sv.scope == scope) {
                     let resolved = sv.value.resolve();
-                    let kind = if resolved.source.is_dir() {
-                        "dir"
-                    } else if resolved.source.is_file() {
-                        "file"
-                    } else {
-                        "missing"
-                    };
+                    let kind = entry_kind(&resolved.source);
                     let marker = if resolved.source.exists() {
                         "✓"
                     } else {
@@ -397,6 +399,28 @@ impl Ramekin {
                         "    {marker} {} → {} ({kind})",
                         resolved.source.display(),
                         resolved.target
+                    );
+                }
+            }
+        }
+
+        // Claude config (shown only when claude is the active agent)
+        if !merged_claude.is_empty() && self.layout.agent() == config::Agent::Claude {
+            println!();
+            println!("Claude config");
+            let scopes: std::collections::BTreeSet<_> =
+                merged_claude.iter().map(|sv| sv.scope).collect();
+            for scope in scopes {
+                println!("  {}", scope_label(scope));
+                for sv in merged_claude.iter().filter(|sv| sv.scope == scope) {
+                    let host = PathBuf::from(shellexpand::tilde(&sv.value.source).as_ref());
+                    let kind = entry_kind(&host);
+                    let marker = if host.exists() { "✓" } else { "✗" };
+                    let suffix = if sv.value.writable { "" } else { " (ro)" };
+                    println!(
+                        "    {marker} {} → {}{suffix} ({kind})",
+                        host.display(),
+                        sv.value.target_in_claude_dir(),
                     );
                 }
             }
@@ -563,6 +587,17 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// Classify a host path for `ramekin config` display.
+fn entry_kind(path: &Path) -> &'static str {
+    if path.is_dir() {
+        "dir"
+    } else if path.is_file() {
+        "file"
+    } else {
+        "missing"
+    }
 }
 
 /// Look up a GitHub token from the host environment for build-time API calls.
