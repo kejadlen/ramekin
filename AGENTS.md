@@ -43,7 +43,7 @@ just           # All four
 
 ## Architecture notes
 
-- Docker compose config is generated at runtime, not a static file. The `generate_compose` function builds a YAML string from resolved paths and volume mounts.
+- Docker compose config is generated at runtime via `serde_yaml` over a typed `ComposeConfig` struct, not a static file. Volume mounts use the long-form bind syntax (`{type: bind, source, target, read_only}`), which sidesteps the colon-delimited `source:target[:ro]` format and its quoting hazards.
 - `AgentLayout` (in `main.rs`) is an enum with `Pi` and `Claude` variants. Each variant carries the host paths, builtin mounts, embedded Dockerfile, and prompt path for that agent. `Ramekin::resolve` reads the effective agent from KDL, then builds the matching layout.
 - XDG directories under the `ramekin` prefix store all agent state: data in `$XDG_DATA_HOME/ramekin`, config in `$XDG_CONFIG_HOME/ramekin`. Pi keeps its agent dir under `$XDG_CONFIG_HOME/ramekin/agent/`. Claude data lives at `$XDG_DATA_HOME/ramekin/agents/claude/`.
 - Each workspace gets a per-repo state directory keyed by a `<dirname>-<hash>` slug at `$XDG_DATA_HOME/ramekin/repos/<slug>/`. Pi uses `sessions/`, claude uses `claude-projects/` and a `claude.json` file. The per-repo splits prevent cross-repo collisions on cwd-keyed paths inside `~/.claude/`.
