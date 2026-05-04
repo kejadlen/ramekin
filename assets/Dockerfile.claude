@@ -22,7 +22,13 @@ RUN --mount=type=cache,target=/tmp/downloads \
     && curl -fsSL "https://github.com/kejadlen/ranger/releases/latest/download/ranger-aarch64-unknown-linux-gnu.tar.gz" \
       | tar xz -C /usr/local/bin ranger
 
-RUN JJ_VERSION=$(curl -s https://api.github.com/repos/jj-vcs/jj/releases/latest | jq -r .tag_name) && \
+RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
+    if [ -s /run/secrets/github-token ]; then \
+      JJ_VERSION=$(curl -s -H "Authorization: Bearer $(cat /run/secrets/github-token)" \
+        https://api.github.com/repos/jj-vcs/jj/releases/latest | jq -r .tag_name); \
+    else \
+      JJ_VERSION=$(curl -s https://api.github.com/repos/jj-vcs/jj/releases/latest | jq -r .tag_name); \
+    fi && \
     curl -fsSL "https://github.com/jj-vcs/jj/releases/download/${JJ_VERSION}/jj-${JJ_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
       | tar xz --strip-components=0 -C /usr/local/bin ./jj
 

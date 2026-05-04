@@ -428,6 +428,13 @@ impl Ramekin {
         let base_dockerfile = self.cache_dir.join("Dockerfile");
         fs_err::write(&base_dockerfile, self.layout.dockerfile_content()).into_diagnostic()?;
 
+        // The base image fetches release metadata from the GitHub API at build
+        // time. Pass a host token so the build doesn't get rate-limited.
+        let gh_token = host_github_token();
+        if gh_token.is_some() {
+            info!("authenticated GitHub API for image build");
+        }
+
         // Build the base image
         if rebuild {
             info!("rebuilding base image (no cache)");
@@ -438,6 +445,11 @@ impl Ramekin {
         build_cmd
             .args(["build", "-t", "ramekin-agent", "-f"])
             .arg(&base_dockerfile);
+        if let Some(token) = &gh_token {
+            build_cmd
+                .env("RAMEKIN_GH_TOKEN", token)
+                .args(["--secret", "id=github-token,env=RAMEKIN_GH_TOKEN"]);
+        }
         if rebuild {
             build_cmd.args(["--no-cache", "--pull"]);
         }
@@ -551,6 +563,26 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// Look up a GitHub token from the host environment for build-time API calls.
+///
+/// Tries env vars first, then falls back to `gh auth token`. Returns `None`
+/// if no token is available; the build degrades to anonymous API access.
+fn host_github_token() -> Option<String> {
+    for var in ["RAMEKIN_GH_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+    }
+    let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
 /// Create a slug for a workspace path: `<dirname>-<hash>`.
