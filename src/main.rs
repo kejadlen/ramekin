@@ -184,6 +184,10 @@ impl Ramekin {
         println!("  {}", self.workspace.display());
 
         println!();
+        println!("Agent");
+        println!("  {}", self.config.effective_agent());
+
+        println!();
         println!("Ramekin directories");
         println!("  agent    {}", self.agent_dir.display());
         println!("  data     {}", self.pi_data_dir.display());

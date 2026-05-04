@@ -8,11 +8,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub agent: Option<Agent>,
+    #[serde(default)]
     pub mounts: Vec<Mount>,
     #[serde(default)]
     pub pi: Vec<PiEntry>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// Which agent to run inside the container.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Agent {
+    #[default]
+    Pi,
+    Claude,
+}
+
+impl fmt::Display for Agent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pi => write!(f, "pi"),
+            Self::Claude => write!(f, "claude"),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -59,6 +79,7 @@ pub struct ConfigLayer {
     pub scope: Scope,
     /// `None` for the default scope; `Some(path)` for file-backed scopes.
     pub path: Option<PathBuf>,
+    pub agent: Option<Agent>,
     pub mounts: Vec<ResolvedMount>,
     pub pi: Vec<PiEntry>,
     pub env: HashMap<String, String>,
@@ -125,6 +146,16 @@ impl ScopedConfig {
             .collect()
     }
 
+    /// The effective agent — the highest-precedence layer that set one,
+    /// falling back to the default (`Agent::Pi`).
+    pub fn effective_agent(&self) -> Agent {
+        self.layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.agent)
+            .unwrap_or_default()
+    }
+
     /// Merge environment variables from all layers, de-duplicated by name.
     ///
     /// Higher-precedence layers override variables with the same name.
@@ -181,6 +212,7 @@ impl Config {
             layers.push(ConfigLayer {
                 scope: Scope::User,
                 path: Some(user_path),
+                agent: config.agent,
                 mounts: config.resolve_mounts(),
                 pi: config.pi,
                 env: config.env,
@@ -196,6 +228,7 @@ impl Config {
             layers.push(ConfigLayer {
                 scope: Scope::Project,
                 path: Some(project_path),
+                agent: config.agent,
                 mounts: config.resolve_mounts(),
                 pi: config.pi,
                 env: config.env,
@@ -206,6 +239,7 @@ impl Config {
         layers.push(ConfigLayer {
             scope: Scope::Builtin,
             path: None,
+            agent: None,
             mounts: builtin_mounts,
             pi: vec![],
             env: HashMap::new(),
@@ -545,6 +579,7 @@ mod tests {
     #[test]
     fn resolve_mounts_filters_nonexistent() {
         let config = Config {
+            agent: None,
             mounts: vec![
                 Mount {
                     source: "/tmp".into(),
@@ -579,6 +614,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::User,
                     path: Some(PathBuf::from("/user/config.kdl")),
+                    agent: None,
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/a"),
                         target: "/a".into(),
@@ -590,6 +626,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Project,
                     path: Some(PathBuf::from("/project/config.kdl")),
+                    agent: None,
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/b"),
                         target: "/b".into(),
@@ -614,6 +651,7 @@ mod tests {
             layers: vec![ConfigLayer {
                 scope: Scope::User,
                 path: Some(PathBuf::from("/user/config.kdl")),
+                agent: None,
                 mounts: vec![ResolvedMount {
                     source: PathBuf::from("/a"),
                     target: "/a".into(),
@@ -635,6 +673,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::User,
                     path: Some(PathBuf::from("/user/config.kdl")),
+                    agent: None,
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/a"),
                         target: "/a".into(),
@@ -646,6 +685,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Project,
                     path: Some(PathBuf::from("/project/config.kdl")),
+                    agent: None,
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/b"),
                         target: "/b".into(),
@@ -657,6 +697,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Builtin,
                     path: None,
+                    agent: None,
                     mounts: vec![ResolvedMount {
                         source: PathBuf::from("/c"),
                         target: "/c".into(),
@@ -684,6 +725,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::User,
                     path: Some(PathBuf::from("/user/config.kdl")),
+                    agent: None,
                     mounts: vec![
                         ResolvedMount {
                             source: PathBuf::from("/user/git"),
@@ -702,6 +744,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Project,
                     path: Some(PathBuf::from("/project/config.kdl")),
+                    agent: None,
                     mounts: vec![ResolvedMount {
                         // Override the user git mount with a different source
                         source: PathBuf::from("/project/git"),
@@ -1029,6 +1072,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::User,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![PiEntry {
                         source: "~/.dotfiles/AGENTS.md".into(),
@@ -1039,6 +1083,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Project,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![PiEntry {
                         source: "/project/skills".into(),
@@ -1049,6 +1094,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Builtin,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![],
                     env: HashMap::new(),
@@ -1076,6 +1122,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::User,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![PiEntry {
                         source: "~/.dotfiles/AGENTS.md".into(),
@@ -1086,6 +1133,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Project,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![PiEntry {
                         source: "/project/AGENTS.md".into(),
@@ -1112,6 +1160,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::User,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![PiEntry {
                         source: "~/.dotfiles/ai/skills".into(),
@@ -1122,6 +1171,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Project,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![PiEntry {
                         source: "/project/my-custom-skills".into(),
@@ -1178,6 +1228,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::User,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![],
                     env: user_env,
@@ -1185,6 +1236,7 @@ mod tests {
                 ConfigLayer {
                     scope: Scope::Project,
                     path: None,
+                    agent: None,
                     mounts: vec![],
                     pi: vec![],
                     env: project_env,
@@ -1199,5 +1251,95 @@ mod tests {
         let bar = merged.iter().find(|sv| sv.value.0 == "BAR").unwrap();
         assert_eq!(bar.value.1, "user");
         assert_eq!(bar.scope, Scope::User);
+    }
+
+    #[test]
+    fn kdl_agent_omitted_is_none() {
+        // serde_kdl2 needs at least one node, so include something else.
+        let kdl = r#"env FOO="bar""#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.agent, None);
+    }
+
+    #[test]
+    fn kdl_agent_pi() {
+        let kdl = r#"
+            agent "pi"
+            env FOO="bar"
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.agent, Some(Agent::Pi));
+    }
+
+    #[test]
+    fn kdl_agent_claude_code() {
+        let kdl = r#"
+            agent "claude"
+            env FOO="bar"
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.agent, Some(Agent::Claude));
+    }
+
+    #[test]
+    fn kdl_agent_invalid_value_errors() {
+        let kdl = r#"agent "nonsense""#;
+        let result: Result<Config, _> = serde_kdl2::from_str(kdl);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn effective_agent_defaults_to_pi() {
+        let config = ScopedConfig {
+            layers: vec![ConfigLayer {
+                scope: Scope::Builtin,
+                path: None,
+                agent: None,
+                mounts: vec![],
+                pi: vec![],
+                env: HashMap::new(),
+            }],
+        };
+        assert_eq!(config.effective_agent(), Agent::Pi);
+    }
+
+    #[test]
+    fn effective_agent_picks_highest_precedence() {
+        let config = ScopedConfig {
+            layers: vec![
+                ConfigLayer {
+                    scope: Scope::User,
+                    path: None,
+                    agent: Some(Agent::Pi),
+                    mounts: vec![],
+                    pi: vec![],
+                    env: HashMap::new(),
+                },
+                ConfigLayer {
+                    scope: Scope::Project,
+                    path: None,
+                    agent: Some(Agent::Claude),
+                    mounts: vec![],
+                    pi: vec![],
+                    env: HashMap::new(),
+                },
+                ConfigLayer {
+                    scope: Scope::Builtin,
+                    path: None,
+                    agent: None,
+                    mounts: vec![],
+                    pi: vec![],
+                    env: HashMap::new(),
+                },
+            ],
+        };
+        // Project overrides user; builtin's None is skipped.
+        assert_eq!(config.effective_agent(), Agent::Claude);
+    }
+
+    #[test]
+    fn agent_display() {
+        assert_eq!(Agent::Pi.to_string(), "pi");
+        assert_eq!(Agent::Claude.to_string(), "claude");
     }
 }
