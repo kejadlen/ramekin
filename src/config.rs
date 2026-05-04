@@ -102,6 +102,19 @@ pub struct ScopedConfig {
 }
 
 impl ScopedConfig {
+    /// Append the builtin layer (highest precedence) holding ramekin-managed mounts.
+    pub fn with_builtin(mut self, mounts: Vec<ResolvedMount>) -> Self {
+        self.layers.push(ConfigLayer {
+            scope: Scope::Builtin,
+            path: None,
+            agent: None,
+            mounts,
+            pi: vec![],
+            env: HashMap::new(),
+        });
+        self
+    }
+
     /// Return merged mounts from all layers, de-duplicated by container target.
     ///
     /// Higher-precedence layers override mounts with the same target.
@@ -188,15 +201,18 @@ pub struct ResolvedMount {
 }
 
 impl Config {
-    /// Load all configuration layers for the given workspace.
+    /// Load user and project configuration layers for the given workspace.
     ///
     /// Layers are returned in precedence order (lowest first):
     /// 1. User (`~/.config/ramekin/config.kdl`) — only if the file exists
     /// 2. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
-    /// 3. Builtin (internal mounts passed by the caller)
+    ///
+    /// Builtin mounts are added separately via [`ScopedConfig::with_builtin`].
+    /// This split lets callers consult the loaded config (e.g. to read the
+    /// effective agent) before deciding what builtin mounts to inject.
     ///
     /// Returns an error if a config file exists but can't be parsed.
-    pub fn load(workspace: &Path, builtin_mounts: Vec<ResolvedMount>) -> Result<ScopedConfig> {
+    pub fn load(workspace: &Path) -> Result<ScopedConfig> {
         let mut layers = Vec::new();
 
         // User layer
@@ -234,16 +250,6 @@ impl Config {
                 env: config.env,
             });
         }
-
-        // Builtin layer (always present, highest precedence)
-        layers.push(ConfigLayer {
-            scope: Scope::Builtin,
-            path: None,
-            agent: None,
-            mounts: builtin_mounts,
-            pi: vec![],
-            env: HashMap::new(),
-        });
 
         Ok(ScopedConfig { layers })
     }
@@ -776,7 +782,9 @@ mod tests {
     #[test]
     fn load_with_no_project_config() {
         // Use a workspace with no .ramekin/config.kdl
-        let config = Config::load(Path::new("/tmp"), vec![]).unwrap();
+        let config = Config::load(Path::new("/tmp"))
+            .unwrap()
+            .with_builtin(vec![]);
         // Builtin layer is always last
         assert_eq!(config.layers.last().unwrap().scope, Scope::Builtin);
         // No project layer
@@ -796,7 +804,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = Config::load(dir.path(), vec![]).unwrap();
+        let config = Config::load(dir.path()).unwrap().with_builtin(vec![]);
 
         // Should have project + builtin layers
         assert!(config.layers.len() >= 2);

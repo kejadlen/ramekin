@@ -150,8 +150,9 @@ impl Ramekin {
             })
             .collect();
 
-        let config = config::Config::load(&workspace, builtin_mounts)
-            .wrap_err("failed to load ramekin configuration")?;
+        let config = config::Config::load(&workspace)
+            .wrap_err("failed to load ramekin configuration")?
+            .with_builtin(builtin_mounts);
 
         // Clear and reassemble the agent dir from pi config.
         config::clear_agent_dir(&agent_dir).wrap_err("failed to clear agent directory")?;
