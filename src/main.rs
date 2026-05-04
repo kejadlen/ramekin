@@ -10,7 +10,8 @@ use serde::Serialize;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
+const PI_DOCKERFILE: &str = include_str!("../assets/Dockerfile");
+const CLAUDE_DOCKERFILE: &str = include_str!("../assets/Dockerfile.claude");
 const RAMEKIN_PROMPT: &str = include_str!("../assets/ramekin-prompt.md");
 
 const VERSION: &str = env!("RAMEKIN_VERSION");
@@ -80,23 +81,177 @@ fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// AgentLayout
+// ---------------------------------------------------------------------------
+
+/// Per-agent host paths and container layout.
+///
+/// Each variant carries everything ramekin needs to set up the chosen
+/// agent's container: state directories on the host, embedded Dockerfile
+/// content, and the path the system-prompt file should land at inside
+/// the container.
+enum AgentLayout {
+    Pi {
+        /// `~/.pi/agent` inside the container; cleared and reassembled per run.
+        agent_dir: PathBuf,
+        /// `~/.pi` inside the container; holds auth and global pi state.
+        pi_data_dir: PathBuf,
+        /// `~/.pi/agent/sessions` inside the container; one per host repo.
+        repo_sessions_dir: PathBuf,
+    },
+    Claude {
+        /// `~/.claude` inside the container; persistent settings, auth, history.
+        claude_data_dir: PathBuf,
+        /// `~/.claude/projects/-workspace` inside the container; one per host repo.
+        ///
+        /// Claude Code keys session history off the cwd; since every workspace
+        /// mounts at `/workspace`, the encoded cwd path is always `-workspace`,
+        /// and we have to split per-repo on the host side to avoid collisions.
+        claude_projects_dir: PathBuf,
+    },
+}
+
+impl AgentLayout {
+    fn for_agent(
+        agent: config::Agent,
+        xdg: &xdg::BaseDirectories,
+        repo_slug: &str,
+    ) -> Result<Self> {
+        match agent {
+            config::Agent::Pi => Ok(Self::Pi {
+                agent_dir: xdg
+                    .create_config_directory("agent")
+                    .into_diagnostic()
+                    .wrap_err("failed to create agent config directory")?,
+                pi_data_dir: xdg
+                    .create_data_directory("")
+                    .into_diagnostic()
+                    .wrap_err("failed to create pi data directory")?,
+                repo_sessions_dir: xdg
+                    .create_data_directory(format!("repos/{repo_slug}/sessions"))
+                    .into_diagnostic()
+                    .wrap_err("failed to create repo sessions directory")?,
+            }),
+            config::Agent::Claude => Ok(Self::Claude {
+                claude_data_dir: xdg
+                    .create_data_directory("agents/claude")
+                    .into_diagnostic()
+                    .wrap_err("failed to create claude data directory")?,
+                claude_projects_dir: xdg
+                    .create_data_directory(format!("repos/{repo_slug}/claude-projects"))
+                    .into_diagnostic()
+                    .wrap_err("failed to create claude projects directory")?,
+            }),
+        }
+    }
+
+    fn agent(&self) -> config::Agent {
+        match self {
+            Self::Pi { .. } => config::Agent::Pi,
+            Self::Claude { .. } => config::Agent::Claude,
+        }
+    }
+
+    fn dockerfile_content(&self) -> &'static str {
+        match self {
+            Self::Pi { .. } => PI_DOCKERFILE,
+            Self::Claude { .. } => CLAUDE_DOCKERFILE,
+        }
+    }
+
+    /// Container path the prompt file is mounted at (passed to the agent
+    /// via `--append-system-prompt`).
+    fn prompt_path_in_container(&self) -> &'static str {
+        match self {
+            Self::Pi { .. } => "/root/.pi/agent/ramekin-prompt.md",
+            Self::Claude { .. } => "/root/.claude/ramekin-prompt.md",
+        }
+    }
+
+    /// Host path where the prompt file should be written so it lands at
+    /// `prompt_path_in_container` inside the container.
+    fn prompt_host_path(&self) -> PathBuf {
+        match self {
+            Self::Pi { agent_dir, .. } => agent_dir.join("ramekin-prompt.md"),
+            Self::Claude {
+                claude_data_dir, ..
+            } => claude_data_dir.join("ramekin-prompt.md"),
+        }
+    }
+
+    /// Builtin mounts that ramekin always injects for this agent.
+    fn builtin_mounts(&self, workspace: &Path) -> Vec<config::ResolvedMount> {
+        let mut entries: Vec<(PathBuf, &str)> = match self {
+            Self::Pi {
+                agent_dir,
+                pi_data_dir,
+                repo_sessions_dir,
+            } => vec![
+                (pi_data_dir.clone(), "/root/.pi"),
+                (agent_dir.clone(), "/root/.pi/agent"),
+                (repo_sessions_dir.clone(), "/root/.pi/agent/sessions"),
+            ],
+            Self::Claude {
+                claude_data_dir,
+                claude_projects_dir,
+            } => vec![
+                (claude_data_dir.clone(), "/root/.claude"),
+                (
+                    claude_projects_dir.clone(),
+                    "/root/.claude/projects/-workspace",
+                ),
+            ],
+        };
+        entries.push((workspace.to_path_buf(), "/workspace"));
+        entries
+            .into_iter()
+            .map(|(source, target)| config::ResolvedMount {
+                source,
+                target: target.into(),
+                writable: true,
+            })
+            .collect()
+    }
+
+    /// Labelled host paths to display in the `config` subcommand output.
+    fn state_dirs(&self) -> Vec<(&'static str, &Path)> {
+        match self {
+            Self::Pi {
+                agent_dir,
+                pi_data_dir,
+                repo_sessions_dir,
+            } => vec![
+                ("agent   ", agent_dir),
+                ("data    ", pi_data_dir),
+                ("sessions", repo_sessions_dir),
+            ],
+            Self::Claude {
+                claude_data_dir,
+                claude_projects_dir,
+            } => vec![
+                ("claude  ", claude_data_dir),
+                ("projects", claude_projects_dir),
+            ],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ramekin
 // ---------------------------------------------------------------------------
 
 struct Ramekin {
     workspace: PathBuf,
     xdg: xdg::BaseDirectories,
-    agent_dir: PathBuf,
-    pi_data_dir: PathBuf,
-    repo_sessions_dir: PathBuf,
     cache_dir: PathBuf,
     custom_dockerfile: Option<PathBuf>,
     config: config::ScopedConfig,
+    layout: AgentLayout,
 }
 
 impl Ramekin {
-    /// Resolve all paths, create XDG directories, assemble pi config, and
-    /// resolve mounts.
+    /// Resolve all paths, create XDG directories, assemble agent config,
+    /// and resolve mounts.
     fn resolve(workspace_arg: PathBuf) -> Result<Self> {
         let workspace = workspace_arg
             .canonicalize()
@@ -106,23 +261,6 @@ impl Ramekin {
             })?;
 
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
-
-        // Agent directory mirrors /root/.pi/agent in the container.
-        let agent_dir = xdg
-            .create_config_directory("agent")
-            .into_diagnostic()
-            .wrap_err("failed to create agent config directory")?;
-
-        let pi_data_dir = xdg
-            .create_data_directory("")
-            .into_diagnostic()
-            .wrap_err("failed to create pi data directory")?;
-
-        let repo_slug = repo_slug(&workspace);
-        let repo_sessions_dir = xdg
-            .create_data_directory(format!("repos/{repo_slug}/sessions"))
-            .into_diagnostic()
-            .wrap_err("failed to create repo sessions directory")?;
 
         let cache_dir = xdg
             .create_cache_directory("")
@@ -134,49 +272,41 @@ impl Ramekin {
             .is_file()
             .then_some(custom_dockerfile_path);
 
-        // Builtin mounts (always present, not overridable)
-        let builtin_entries = [
-            (&pi_data_dir, "/root/.pi"),
-            (&agent_dir, "/root/.pi/agent"),
-            (&repo_sessions_dir, "/root/.pi/agent/sessions"),
-            (&workspace, "/workspace"),
-        ];
-        let builtin_mounts: Vec<config::ResolvedMount> = builtin_entries
-            .into_iter()
-            .map(|(source, target)| config::ResolvedMount {
-                source: source.clone(),
-                target: target.into(),
-                writable: true,
-            })
-            .collect();
+        // Load user/project layers first so we can read the effective agent
+        // before deciding which builtin mounts to inject.
+        let pre_config =
+            config::Config::load(&workspace).wrap_err("failed to load ramekin configuration")?;
+        let agent = pre_config.effective_agent();
 
-        let config = config::Config::load(&workspace)
-            .wrap_err("failed to load ramekin configuration")?
-            .with_builtin(builtin_mounts);
+        let repo_slug = repo_slug(&workspace);
+        let layout = AgentLayout::for_agent(agent, &xdg, &repo_slug)?;
 
-        // Clear and reassemble the agent dir from pi config.
-        config::clear_agent_dir(&agent_dir).wrap_err("failed to clear agent directory")?;
+        let config = pre_config.with_builtin(layout.builtin_mounts(&workspace));
 
-        let resolved_pi: Vec<config::ResolvedPiEntry> = config
-            .merged_pi()
-            .iter()
-            .map(|sv| sv.value.resolve())
-            .collect();
-        config::assemble_pi(&agent_dir, &resolved_pi).wrap_err("failed to assemble pi config")?;
+        // Agent-specific prep: reassemble pi's config dir from KDL pi entries.
+        // Claude support lives in a follow-up commit.
+        if let AgentLayout::Pi { agent_dir, .. } = &layout {
+            config::clear_agent_dir(agent_dir).wrap_err("failed to clear agent directory")?;
+            let resolved_pi: Vec<config::ResolvedPiEntry> = config
+                .merged_pi()
+                .iter()
+                .map(|sv| sv.value.resolve())
+                .collect();
+            config::assemble_pi(agent_dir, &resolved_pi)
+                .wrap_err("failed to assemble pi config")?;
+        }
 
-        // Write the system prompt file so pi can read it via --append-system-prompt.
-        let prompt_path = agent_dir.join("ramekin-prompt.md");
-        fs_err::write(&prompt_path, RAMEKIN_PROMPT).into_diagnostic()?;
+        // Write the system prompt where the agent will pick it up via
+        // --append-system-prompt.
+        fs_err::write(layout.prompt_host_path(), RAMEKIN_PROMPT).into_diagnostic()?;
 
         Ok(Self {
             workspace,
             xdg,
-            agent_dir,
-            pi_data_dir,
-            repo_sessions_dir,
             cache_dir,
             custom_dockerfile,
             config,
+            layout,
         })
     }
 
@@ -186,13 +316,13 @@ impl Ramekin {
 
         println!();
         println!("Agent");
-        println!("  {}", self.config.effective_agent());
+        println!("  {}", self.layout.agent());
 
         println!();
         println!("Ramekin directories");
-        println!("  agent    {}", self.agent_dir.display());
-        println!("  data     {}", self.pi_data_dir.display());
-        println!("  sessions {}", self.repo_sessions_dir.display());
+        for (label, path) in self.layout.state_dirs() {
+            println!("  {label} {}", path.display());
+        }
         println!("  cache    {}", self.cache_dir.display());
 
         let merged_mounts = self.config.merged_mounts();
@@ -241,8 +371,8 @@ impl Ramekin {
             }
         }
 
-        // Pi config
-        if !merged_pi.is_empty() {
+        // Pi config (shown only when pi is the active agent; entries are inert otherwise)
+        if !merged_pi.is_empty() && self.layout.agent() == config::Agent::Pi {
             println!();
             println!("Pi config");
             let scopes: std::collections::BTreeSet<_> =
@@ -274,10 +404,13 @@ impl Ramekin {
 
         println!();
         println!("Dockerfile");
+        let base_label = format!("embedded ({})", self.layout.agent());
         match &self.custom_dockerfile {
-            Some(path) => println!("  ✓ {}", path.display()),
+            Some(path) => {
+                println!("  ✓ {} (FROM ramekin-agent: {base_label})", path.display());
+            }
             None => {
-                println!("  embedded (default)");
+                println!("  {base_label}");
                 println!(
                     "  ✗ {} (not found)",
                     self.workspace.join(".ramekin/Dockerfile").display()
@@ -289,12 +422,11 @@ impl Ramekin {
     }
 
     fn run(&self, rebuild: bool, agent_args: &[String]) -> Result<()> {
-        info!(agent = %self.agent_dir.display(), repo = %self.repo_sessions_dir.display(), "directories");
-        info!(workspace = %self.workspace.display(), "starting agent");
+        info!(agent = %self.layout.agent(), workspace = %self.workspace.display(), "starting agent");
 
         // Write the embedded Dockerfile to the cache directory
         let base_dockerfile = self.cache_dir.join("Dockerfile");
-        fs_err::write(&base_dockerfile, DOCKERFILE).into_diagnostic()?;
+        fs_err::write(&base_dockerfile, self.layout.dockerfile_content()).into_diagnostic()?;
 
         // Build the base image
         if rebuild {
@@ -347,6 +479,7 @@ impl Ramekin {
             &build_context,
             &all_mounts,
             &env_vars,
+            self.layout.prompt_path_in_container(),
             agent_args,
         );
         let compose_file = session_dir.join("compose.yml");
@@ -463,6 +596,7 @@ fn generate_compose(
     build_context: &Path,
     mounts: &[&config::ResolvedMount],
     env_vars: &[config::ScopedValue<(&str, &str)>],
+    prompt_path: &str,
     agent_args: &[String],
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
@@ -473,8 +607,6 @@ fn generate_compose(
         .collect();
 
     // Always pass --append-system-prompt for the ramekin container context.
-    // The prompt file is written into the agent dir which is mounted at /root/.pi/agent.
-    let prompt_path = "/root/.pi/agent/ramekin-prompt.md";
     let command: Vec<String> = [
         "--append-system-prompt".to_string(),
         prompt_path.to_string(),
