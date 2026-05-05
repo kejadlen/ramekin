@@ -214,6 +214,17 @@ impl AgentLayout {
         }
     }
 
+    /// Default flags ramekin always passes to the agent, before any
+    /// user-supplied `agent_args`. The container's whole point is to
+    /// confine the agent, so Claude runs with `--dangerously-skip-permissions`
+    /// (yolo mode) by default.
+    fn default_args(&self) -> &'static [&'static str] {
+        match self {
+            Self::Pi { .. } => &[],
+            Self::Claude { .. } => &["--dangerously-skip-permissions"],
+        }
+    }
+
     /// Host path where the prompt file should be written so it lands at
     /// `prompt_path_in_container` inside the container.
     fn prompt_host_path(&self) -> PathBuf {
@@ -583,6 +594,7 @@ impl Ramekin {
             &all_mounts,
             &env_vars,
             self.layout.prompt_path_in_container(),
+            self.layout.default_args(),
             agent_args,
         );
         let compose_file = session_dir.join("compose.yml");
@@ -742,6 +754,7 @@ fn generate_compose(
     mounts: &[&config::ResolvedMount],
     env_vars: &[config::ScopedValue<(&str, &str)>],
     prompt_path: &str,
+    default_args: &[&str],
     agent_args: &[String],
 ) -> String {
     let volumes: Vec<VolumeBind> = mounts
@@ -759,14 +772,18 @@ fn generate_compose(
         .map(|sv| format!("{}={}", sv.value.0, sv.value.1))
         .collect();
 
-    // Always pass --append-system-prompt for the ramekin container context.
-    let command: Vec<String> = [
-        "--append-system-prompt".to_string(),
-        prompt_path.to_string(),
-    ]
-    .into_iter()
-    .chain(agent_args.iter().cloned())
-    .collect();
+    // Always pass --append-system-prompt for the ramekin container context,
+    // preceded by any agent-specific defaults (e.g. claude's yolo flag).
+    // User-supplied agent_args come last so they can override.
+    let command: Vec<String> = default_args
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain([
+            "--append-system-prompt".to_string(),
+            prompt_path.to_string(),
+        ])
+        .chain(agent_args.iter().cloned())
+        .collect();
 
     let config = ComposeConfig {
         services: Services {
