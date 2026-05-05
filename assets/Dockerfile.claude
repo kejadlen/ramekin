@@ -35,6 +35,10 @@ RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
 RUN --mount=type=cache,target=/root/.npm \
     npm install -g @anthropic-ai/claude-code
 
+# Claude Code refuses --dangerously-skip-permissions when running as root
+# unless IS_SANDBOX=1 acknowledges the sandbox. The container is the sandbox.
+ENV IS_SANDBOX=1
+
 WORKDIR /workspace
 
 ENTRYPOINT ["claude"]
