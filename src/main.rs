@@ -1,11 +1,12 @@
 mod config;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use miette::{Context, IntoDiagnostic, Result, bail};
+use miette::{Context, IntoDiagnostic, Result, bail, miette};
 use serde::Serialize;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -120,51 +121,74 @@ enum AgentLayout {
 }
 
 impl AgentLayout {
+    /// Resolve container-state paths for the chosen agent. Pure: no
+    /// directories created, no files written. Use [`Self::prepare`] to
+    /// materialize the on-disk state before launching a container.
     fn for_agent(
         agent: config::Agent,
         xdg: &xdg::BaseDirectories,
         repo_slug: &str,
     ) -> Result<Self> {
+        let data_home = xdg
+            .get_data_home()
+            .ok_or_else(|| miette!("could not determine XDG data home"))?;
+        let config_home = xdg
+            .get_config_home()
+            .ok_or_else(|| miette!("could not determine XDG config home"))?;
         match agent {
             config::Agent::Pi => Ok(Self::Pi {
-                agent_dir: xdg
-                    .create_config_directory("agent")
-                    .into_diagnostic()
-                    .wrap_err("failed to create agent config directory")?,
-                pi_data_dir: xdg
-                    .create_data_directory("")
-                    .into_diagnostic()
-                    .wrap_err("failed to create pi data directory")?,
-                repo_sessions_dir: xdg
-                    .create_data_directory(format!("repos/{repo_slug}/sessions"))
-                    .into_diagnostic()
-                    .wrap_err("failed to create repo sessions directory")?,
+                agent_dir: config_home.join("agent"),
+                pi_data_dir: data_home.clone(),
+                repo_sessions_dir: data_home.join(format!("repos/{repo_slug}/sessions")),
             }),
-            config::Agent::Claude => {
-                let claude_data_dir = xdg
-                    .create_data_directory("agents/claude")
-                    .into_diagnostic()
-                    .wrap_err("failed to create claude data directory")?;
-                let claude_projects_dir = xdg
-                    .create_data_directory(format!("repos/{repo_slug}/claude-projects"))
-                    .into_diagnostic()
-                    .wrap_err("failed to create claude projects directory")?;
-                let claude_state_file = xdg
-                    .place_data_file(format!("repos/{repo_slug}/claude.json"))
-                    .into_diagnostic()
-                    .wrap_err("failed to determine claude state file path")?;
-                // Docker bind-mounts of files require the host file to exist;
-                // otherwise it creates a directory with that name.
-                if !claude_state_file.exists() {
-                    fs_err::write(&claude_state_file, "{}\n").into_diagnostic()?;
+            config::Agent::Claude => Ok(Self::Claude {
+                claude_data_dir: data_home.join("agents/claude"),
+                claude_projects_dir: data_home.join(format!("repos/{repo_slug}/claude-projects")),
+                claude_state_file: data_home.join(format!("repos/{repo_slug}/claude.json")),
+            }),
+        }
+    }
+
+    /// Create the directories this layout points at and ensure files that
+    /// must exist before container start (the Claude `~/.claude.json` bind
+    /// target) are present. Idempotent.
+    fn prepare(&self) -> Result<()> {
+        match self {
+            Self::Pi {
+                agent_dir,
+                pi_data_dir,
+                repo_sessions_dir,
+            } => {
+                fs_err::create_dir_all(agent_dir).into_diagnostic()?;
+                fs_err::create_dir_all(pi_data_dir).into_diagnostic()?;
+                fs_err::create_dir_all(repo_sessions_dir).into_diagnostic()?;
+            }
+            Self::Claude {
+                claude_data_dir,
+                claude_projects_dir,
+                claude_state_file,
+            } => {
+                fs_err::create_dir_all(claude_data_dir).into_diagnostic()?;
+                fs_err::create_dir_all(claude_projects_dir).into_diagnostic()?;
+                if let Some(parent) = claude_state_file.parent() {
+                    fs_err::create_dir_all(parent).into_diagnostic()?;
                 }
-                Ok(Self::Claude {
-                    claude_data_dir,
-                    claude_projects_dir,
-                    claude_state_file,
-                })
+                // Docker bind-mounts of files require the host file to exist;
+                // otherwise it creates a directory with that name. `create_new`
+                // is race-safe — concurrent runs in the same repo can't
+                // overwrite an existing file with `{}\n`.
+                match fs_err::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(claude_state_file)
+                {
+                    Ok(mut f) => f.write_all(b"{}\n").into_diagnostic()?,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e).into_diagnostic(),
+                }
             }
         }
+        Ok(())
     }
 
     fn agent(&self) -> config::Agent {
@@ -276,8 +300,11 @@ struct Ramekin {
 }
 
 impl Ramekin {
-    /// Resolve all paths, create XDG directories, assemble agent config,
-    /// and resolve mounts.
+    /// Compute all paths and the merged config layers. Pure: no directories
+    /// created, no files written, no agent state mutated. `ramekin config`
+    /// reads from the resolved value to print state without touching it.
+    /// `ramekin run` calls [`Self::prepare`] afterwards to materialize the
+    /// on-disk state.
     fn resolve(workspace_arg: PathBuf) -> Result<Self> {
         let workspace = workspace_arg
             .canonicalize()
@@ -289,9 +316,8 @@ impl Ramekin {
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
 
         let cache_dir = xdg
-            .create_cache_directory("")
-            .into_diagnostic()
-            .wrap_err("failed to create cache directory")?;
+            .get_cache_home()
+            .ok_or_else(|| miette!("could not determine XDG cache home"))?;
 
         let custom_dockerfile_path = workspace.join(".ramekin/Dockerfile");
         let custom_dockerfile = custom_dockerfile_path
@@ -316,11 +342,30 @@ impl Ramekin {
         }
         let config = pre_config.with_builtin(layout.builtin_mounts(&workspace));
 
+        Ok(Self {
+            workspace,
+            xdg,
+            cache_dir,
+            custom_dockerfile,
+            config,
+            layout,
+        })
+    }
+
+    /// Materialize all on-disk state needed for `run`. Creates XDG
+    /// directories, ensures the Claude state file exists, clears and
+    /// re-assembles the pi agent dir, and writes the system prompt.
+    /// Idempotent.
+    fn prepare(&self) -> Result<()> {
+        fs_err::create_dir_all(&self.cache_dir).into_diagnostic()?;
+        self.layout.prepare()?;
+
         // Pi assembles its agent config dir per run by clearing and copying
-        // from KDL pi entries. Claude uses bind mounts (handled above).
-        if let AgentLayout::Pi { agent_dir, .. } = &layout {
+        // from KDL pi entries. Claude uses bind mounts.
+        if let AgentLayout::Pi { agent_dir, .. } = &self.layout {
             config::clear_agent_dir(agent_dir).wrap_err("failed to clear agent directory")?;
-            let resolved_pi: Vec<config::ResolvedPiEntry> = config
+            let resolved_pi: Vec<config::ResolvedPiEntry> = self
+                .config
                 .merged_pi()
                 .iter()
                 .map(|sv| sv.value.resolve())
@@ -331,16 +376,8 @@ impl Ramekin {
 
         // Write the system prompt where the agent will pick it up via
         // --append-system-prompt.
-        fs_err::write(layout.prompt_host_path(), RAMEKIN_PROMPT).into_diagnostic()?;
-
-        Ok(Self {
-            workspace,
-            xdg,
-            cache_dir,
-            custom_dockerfile,
-            config,
-            layout,
-        })
+        fs_err::write(self.layout.prompt_host_path(), RAMEKIN_PROMPT).into_diagnostic()?;
+        Ok(())
     }
 
     fn config(&self) -> Result<()> {
@@ -473,6 +510,10 @@ impl Ramekin {
 
     fn run(&self, rebuild: bool, agent_args: &[String]) -> Result<()> {
         info!(agent = %self.layout.agent(), workspace = %self.workspace.display(), "starting agent");
+
+        // Materialize cache and agent-state directories, write prompt, etc.
+        // Deferred from `resolve` so `ramekin config` stays read-only.
+        self.prepare()?;
 
         // Write the embedded Dockerfile to the cache directory
         let base_dockerfile = self.cache_dir.join("Dockerfile");
