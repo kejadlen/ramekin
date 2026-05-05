@@ -102,21 +102,24 @@ enum AgentLayout {
     },
     Claude {
         /// `~/.claude` inside the container; persistent settings, auth, history.
+        /// Global across repos so OAuth tokens, account identity, and onboarding
+        /// state survive switching workspaces.
         claude_data_dir: PathBuf,
-        /// `~/.claude/projects/-workspace` inside the container; one per host repo.
-        ///
-        /// Claude Code keys session history off the cwd; since every workspace
-        /// mounts at `/workspace`, the encoded cwd path is always `-workspace`,
-        /// and we have to split per-repo on the host side to avoid collisions.
-        claude_projects_dir: PathBuf,
         /// `~/.claude.json` inside the container — sibling to `~/.claude/`,
-        /// not inside it. One per host repo.
+        /// not inside it. Global across repos.
         ///
-        /// Claude Code's global state file has a top-level `projects` map
-        /// keyed by absolute cwd. Without a per-repo split every host repo
-        /// would share the same `/workspace` entry — including granted
-        /// permissions and prompt history. Each repo gets its own file.
+        /// Claude Code's state file holds account identity (`oauthAccount`,
+        /// `userID`), onboarding flags, and a `projects` map keyed by absolute
+        /// cwd. Per-repo isolation of the `projects` map comes from mounting
+        /// each workspace at a distinct path (`/workspace/<slug>`) rather than
+        /// splitting the file — so identity/onboarding stays global while
+        /// project-specific permissions and history namespace themselves
+        /// naturally via the cwd key.
         claude_state_file: PathBuf,
+        /// Slug embedded into the workspace mount target. Distinguishes
+        /// each host repo's cwd inside the container so Claude Code's
+        /// `projects` map keys don't collide.
+        repo_slug: String,
     },
 }
 
@@ -143,8 +146,8 @@ impl AgentLayout {
             }),
             config::Agent::Claude => Ok(Self::Claude {
                 claude_data_dir: data_home.join("agents/claude"),
-                claude_projects_dir: data_home.join(format!("repos/{repo_slug}/claude-projects")),
-                claude_state_file: data_home.join(format!("repos/{repo_slug}/claude.json")),
+                claude_state_file: data_home.join("agents/claude.json"),
+                repo_slug: repo_slug.to_string(),
             }),
         }
     }
@@ -165,11 +168,10 @@ impl AgentLayout {
             }
             Self::Claude {
                 claude_data_dir,
-                claude_projects_dir,
                 claude_state_file,
+                ..
             } => {
                 fs_err::create_dir_all(claude_data_dir).into_diagnostic()?;
-                fs_err::create_dir_all(claude_projects_dir).into_diagnostic()?;
                 if let Some(parent) = claude_state_file.parent() {
                     fs_err::create_dir_all(parent).into_diagnostic()?;
                 }
@@ -236,37 +238,44 @@ impl AgentLayout {
         }
     }
 
+    /// Path inside the container where the workspace is mounted (and where
+    /// the agent should chdir to). Pi keeps the simple `/workspace`; Claude
+    /// uses a per-repo subpath so its cwd-keyed state doesn't collide
+    /// across repos.
+    fn workspace_target_in_container(&self) -> String {
+        match self {
+            Self::Pi { .. } => "/workspace".to_string(),
+            Self::Claude { repo_slug, .. } => format!("/workspace/{repo_slug}"),
+        }
+    }
+
     /// Builtin mounts that ramekin always injects for this agent.
     fn builtin_mounts(&self, workspace: &Path) -> Vec<config::ResolvedMount> {
-        let mut entries: Vec<(PathBuf, &str)> = match self {
+        let mut entries: Vec<(PathBuf, String)> = match self {
             Self::Pi {
                 agent_dir,
                 pi_data_dir,
                 repo_sessions_dir,
             } => vec![
-                (pi_data_dir.clone(), "/root/.pi"),
-                (agent_dir.clone(), "/root/.pi/agent"),
-                (repo_sessions_dir.clone(), "/root/.pi/agent/sessions"),
+                (pi_data_dir.clone(), "/root/.pi".into()),
+                (agent_dir.clone(), "/root/.pi/agent".into()),
+                (repo_sessions_dir.clone(), "/root/.pi/agent/sessions".into()),
             ],
             Self::Claude {
                 claude_data_dir,
-                claude_projects_dir,
                 claude_state_file,
+                ..
             } => vec![
-                (claude_data_dir.clone(), "/root/.claude"),
-                (
-                    claude_projects_dir.clone(),
-                    "/root/.claude/projects/-workspace",
-                ),
-                (claude_state_file.clone(), "/root/.claude.json"),
+                (claude_data_dir.clone(), "/root/.claude".into()),
+                (claude_state_file.clone(), "/root/.claude.json".into()),
             ],
         };
-        entries.push((workspace.to_path_buf(), "/workspace"));
+        entries.push((workspace.to_path_buf(), self.workspace_target_in_container()));
         entries
             .into_iter()
             .map(|(source, target)| config::ResolvedMount {
                 source,
-                target: target.into(),
+                target,
                 writable: true,
             })
             .collect()
@@ -286,11 +295,10 @@ impl AgentLayout {
             ],
             Self::Claude {
                 claude_data_dir,
-                claude_projects_dir,
                 claude_state_file,
+                ..
             } => vec![
                 ("claude  ", claude_data_dir),
-                ("projects", claude_projects_dir),
                 ("state   ", claude_state_file),
             ],
         }
@@ -386,8 +394,11 @@ impl Ramekin {
         }
 
         // Write the system prompt where the agent will pick it up via
-        // --append-system-prompt.
-        fs_err::write(self.layout.prompt_host_path(), RAMEKIN_PROMPT).into_diagnostic()?;
+        // --append-system-prompt. Substitute the agent-specific workspace
+        // path so the prompt tells the agent the right cwd.
+        let prompt = RAMEKIN_PROMPT
+            .replace("{{WORKSPACE_PATH}}", &self.layout.workspace_target_in_container());
+        fs_err::write(self.layout.prompt_host_path(), prompt).into_diagnostic()?;
         Ok(())
     }
 
@@ -588,15 +599,16 @@ impl Ramekin {
             .map(|sv| sv.value)
             .collect();
         let env_vars = self.config.merged_env();
-        let compose = generate_compose(
-            &dockerfile,
-            &build_context,
-            &all_mounts,
-            &env_vars,
-            self.layout.prompt_path_in_container(),
-            self.layout.default_args(),
+        let compose = generate_compose(ComposeParams {
+            dockerfile: &dockerfile,
+            build_context: &build_context,
+            mounts: &all_mounts,
+            env_vars: &env_vars,
+            prompt_path: self.layout.prompt_path_in_container(),
+            default_args: self.layout.default_args(),
             agent_args,
-        );
+            working_dir: &self.layout.workspace_target_in_container(),
+        });
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose).into_diagnostic()?;
 
@@ -725,6 +737,7 @@ struct AgentService {
     image: String,
     stdin_open: bool,
     tty: bool,
+    working_dir: String,
     environment: Vec<String>,
     volumes: Vec<VolumeBind>,
     command: Vec<String>,
@@ -747,16 +760,33 @@ struct VolumeBind {
     read_only: bool,
 }
 
+/// Inputs for [`generate_compose`], grouped so the container command,
+/// mounts, environment, and build context travel together instead of as a
+/// long positional argument list.
+struct ComposeParams<'a> {
+    dockerfile: &'a Path,
+    build_context: &'a Path,
+    mounts: &'a [&'a config::ResolvedMount],
+    env_vars: &'a [config::ScopedValue<(&'a str, &'a str)>],
+    prompt_path: &'a str,
+    default_args: &'a [&'a str],
+    agent_args: &'a [String],
+    working_dir: &'a str,
+}
+
 /// Generate a Docker Compose config with all volume mounts.
-fn generate_compose(
-    dockerfile: &Path,
-    build_context: &Path,
-    mounts: &[&config::ResolvedMount],
-    env_vars: &[config::ScopedValue<(&str, &str)>],
-    prompt_path: &str,
-    default_args: &[&str],
-    agent_args: &[String],
-) -> String {
+fn generate_compose(params: ComposeParams) -> String {
+    let ComposeParams {
+        dockerfile,
+        build_context,
+        mounts,
+        env_vars,
+        prompt_path,
+        default_args,
+        agent_args,
+        working_dir,
+    } = params;
+
     let volumes: Vec<VolumeBind> = mounts
         .iter()
         .map(|m| VolumeBind {
@@ -795,6 +825,7 @@ fn generate_compose(
                 image: "ramekin-agent".into(),
                 stdin_open: true,
                 tty: true,
+                working_dir: working_dir.to_string(),
                 environment,
                 volumes,
                 command,

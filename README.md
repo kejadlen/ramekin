@@ -20,7 +20,7 @@ A Rust CLI orchestrates a Docker Compose stack. On each run it:
 2. Writes the embedded Dockerfile to `$XDG_CACHE_HOME/ramekin/`
 3. Generates a compose config and writes it to a session-scoped cache directory
 4. Builds the agent image (and a project-specific layer, if one exists)
-5. Starts the agent container with the workspace mounted at `/workspace`
+5. Starts the agent container with the workspace mounted (at `/workspace` for pi, at `/workspace/<slug>` for Claude — see [Persistence](#persistence))
 6. Attaches interactively, then tears down on exit
 
 ### Subcommands
@@ -57,9 +57,9 @@ Project-scope KDL (`<workspace>/.ramekin/config.kdl`) can override the user sett
 
 #### Claude
 
-- Claude data dir (`$XDG_DATA_HOME/ramekin/agents/claude/`) mounts at `/root/.claude` for settings, auth, history, and runtime state.
-- Each workspace gets a per-repo projects directory at `$XDG_DATA_HOME/ramekin/repos/<slug>/claude-projects/`, mounted at `/root/.claude/projects/-workspace`. Claude Code keys session history off the cwd; the workspace always mounts at `/workspace`, so the encoded path is always `-workspace`. Without the per-repo split every host repo would share the same history.
-- Each workspace also gets a per-repo `.claude.json` at `$XDG_DATA_HOME/ramekin/repos/<slug>/claude.json`, mounted at `/root/.claude.json`. Claude Code's global state file has a `projects` map keyed by absolute cwd; without the split, granted permissions and prompt history would leak across host repos.
+- Claude data dir (`$XDG_DATA_HOME/ramekin/agents/claude/`) mounts at `/root/.claude` and is shared across all repos. Auth, account identity, onboarding state, and project transcripts all live here.
+- The state file at `$XDG_DATA_HOME/ramekin/agents/claude.json` mounts at `/root/.claude.json`, also shared across repos.
+- Each workspace mounts at `/workspace/<slug>` (where `<slug>` is `<dirname>-<hash>`) instead of `/workspace`. Claude Code keys its `projects` map and session-history directory off the cwd, so the per-repo path naturally namespaces granted permissions, prompt history, and transcripts without splitting `~/.claude.json` itself. Identity and onboarding state stay global.
 
 ### Volume mounts
 
