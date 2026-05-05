@@ -246,7 +246,7 @@ impl ScopedConfig {
 }
 
 /// A mount with tilde-expanded paths ready for Docker.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedMount {
     pub source: PathBuf,
     pub target: String,
