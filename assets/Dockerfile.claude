@@ -39,6 +39,13 @@ RUN --mount=type=cache,target=/root/.npm \
 # unless IS_SANDBOX=1 acknowledges the sandbox. The container is the sandbox.
 ENV IS_SANDBOX=1
 
+# Skip the bypass-permissions dialog: the container already opts into yolo
+# mode via --dangerously-skip-permissions and IS_SANDBOX=1, so prompting for
+# acceptance on every run is redundant. Managed settings is the highest tier
+# and applies regardless of what's in the user's mounted ~/.claude.
+RUN mkdir -p /etc/claude-code && \
+    echo '{"skipDangerousModePermissionPrompt": true}' > /etc/claude-code/managed-settings.json
+
 WORKDIR /workspace
 
 ENTRYPOINT ["claude"]
