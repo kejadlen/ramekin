@@ -107,9 +107,8 @@ struct AgentLayout {
     /// `prompt_path_in_container` inside the container.
     prompt_host_path: PathBuf,
     /// Default flags ramekin always passes to the agent, before any
-    /// user-supplied `agent_args`. The container's whole point is to
-    /// confine the agent, so Claude runs with `--dangerously-skip-permissions`
-    /// (yolo mode) by default.
+    /// user-supplied `agent_args`. Currently empty for both agents; Claude's
+    /// yolo mode is now expressed via managed-settings baked into the image.
     default_args: &'static [&'static str],
     /// Container path the workspace is mounted at; the agent's working dir.
     /// Pi keeps the simple `/workspace`; Claude uses `/workspace/<repo_slug>`
@@ -223,7 +222,7 @@ impl AgentLayout {
             prompt_path_in_container: "/root/.claude/ramekin-prompt.md",
             prompt_flag: "--append-system-prompt-file",
             prompt_host_path: claude_data_dir.join("ramekin-prompt.md"),
-            default_args: &["--dangerously-skip-permissions"],
+            default_args: &[],
             workspace_target_in_container: workspace_target,
             mounts,
             dirs_to_create: vec![claude_data_dir.clone()],
@@ -778,8 +777,8 @@ fn generate_compose(params: ComposeParams) -> String {
         .collect();
 
     // Always pass the prompt flag for the ramekin container context,
-    // preceded by any agent-specific defaults (e.g. claude's yolo flag).
-    // User-supplied agent_args come last so they can override.
+    // preceded by any agent-specific defaults. User-supplied agent_args come
+    // last so they can override.
     let command: Vec<String> = default_args
         .iter()
         .map(|s| (*s).to_string())
