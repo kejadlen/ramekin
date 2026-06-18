@@ -165,7 +165,10 @@ impl AgentLayout {
         let mounts = build_mounts([
             (pi_data_dir.clone(), "/root/.pi".to_string()),
             (agent_dir.clone(), "/root/.pi/agent".to_string()),
-            (repo_sessions_dir.clone(), "/root/.pi/agent/sessions".to_string()),
+            (
+                repo_sessions_dir.clone(),
+                "/root/.pi/agent/sessions".to_string(),
+            ),
             (workspace.to_path_buf(), workspace_target.clone()),
         ]);
 
@@ -367,8 +370,10 @@ impl Ramekin {
         // Write the system prompt where the agent will pick it up via
         // `prompt_flag`. Substitute the agent-specific workspace path so the
         // prompt tells the agent the right cwd.
-        let prompt = RAMEKIN_PROMPT
-            .replace("{{WORKSPACE_PATH}}", &self.layout.workspace_target_in_container);
+        let prompt = RAMEKIN_PROMPT.replace(
+            "{{WORKSPACE_PATH}}",
+            &self.layout.workspace_target_in_container,
+        );
         fs_err::write(&self.layout.prompt_host_path, prompt).into_diagnostic()?;
         Ok(())
     }
@@ -819,8 +824,7 @@ mod tests {
     // prompt file's path appends its contents.
     #[test]
     fn for_pi_appends_the_prompt_as_a_path() {
-        let layout =
-            AgentLayout::for_pi(&base_dirs(), "owner/repo", Path::new("/tmp/ws")).unwrap();
+        let layout = AgentLayout::for_pi(&base_dirs(), "owner/repo", Path::new("/tmp/ws")).unwrap();
         assert_eq!(layout.prompt_flag, "--append-system-prompt");
     }
 
