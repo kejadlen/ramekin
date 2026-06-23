@@ -352,7 +352,17 @@ impl Ramekin {
             Ok(cmd)
         };
 
-        let status = docker_compose(&["up", "-d", "--build"])?
+        if rebuild {
+            let status = docker_compose(&["build", "--no-cache"])?
+                .status()
+                .into_diagnostic()
+                .wrap_err("failed to run docker compose build")?;
+            if !status.success() {
+                bail!("docker compose build failed ({})", status);
+            }
+        }
+
+        let status = docker_compose(&["up", "-d"])?
             .status()
             .into_diagnostic()
             .wrap_err("failed to run docker compose up")?;
