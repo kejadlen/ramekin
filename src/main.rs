@@ -313,13 +313,24 @@ impl Ramekin {
             bail!("base image build failed ({})", status);
         }
 
-        // Determine the final dockerfile and build context
-        let (dockerfile, build_context) = match &self.custom_dockerfile {
+        // Determine the final dockerfile, build context, and image tag. A
+        // custom Dockerfile gets a repo-specific tag so it doesn't collide with
+        // the base `ramekin-agent` image it builds `FROM`; sharing the tag would
+        // make `docker compose up` reuse the base instead of the project layer.
+        let (dockerfile, build_context, image) = match &self.custom_dockerfile {
             Some(custom) => {
                 info!("building project image from .ramekin/Dockerfile");
-                (custom.clone(), self.workspace.clone())
+                (
+                    custom.clone(),
+                    self.workspace.clone(),
+                    project_image_name(&self.workspace),
+                )
             }
-            None => (base_dockerfile, self.cache_dir.clone()),
+            None => (
+                base_dockerfile,
+                self.cache_dir.clone(),
+                "ramekin-agent".to_string(),
+            ),
         };
 
         // Session-scoped: unique compose file and project name
@@ -337,8 +348,14 @@ impl Ramekin {
             .map(|sv| sv.value)
             .collect();
         let env_vars = self.config.merged_env();
-        let compose =
-            generate_compose(&dockerfile, &build_context, &all_mounts, &env_vars, pi_args);
+        let compose = generate_compose(
+            &dockerfile,
+            &build_context,
+            &all_mounts,
+            &env_vars,
+            &image,
+            pi_args,
+        );
         let compose_file = session_dir.join("compose.yml");
         fs_err::write(&compose_file, &compose).into_diagnostic()?;
 
@@ -352,8 +369,16 @@ impl Ramekin {
             Ok(cmd)
         };
 
-        if rebuild {
-            let status = docker_compose(&["build", "--no-cache"])?
+        // Build the project image when a custom Dockerfile is present. `up`
+        // alone only builds when the image is missing, which would serve a stale
+        // layer after the Dockerfile changes. Layer caching keeps this cheap
+        // unless `--rebuild` forces a clean build.
+        if self.custom_dockerfile.is_some() || rebuild {
+            let mut args = vec!["build"];
+            if rebuild {
+                args.push("--no-cache");
+            }
+            let status = docker_compose(&args)?
                 .status()
                 .into_diagnostic()
                 .wrap_err("failed to run docker compose build")?;
@@ -430,6 +455,15 @@ fn repo_slug(workspace: &Path) -> String {
     format!("{name}-{hash:08x}")
 }
 
+/// Docker image tag for a workspace's project image, built from its
+/// `.ramekin/Dockerfile`. Kept distinct from the base `ramekin-agent` tag so
+/// `docker compose up` builds the project layer instead of reusing the base
+/// image that shares the tag. Lowercased because Docker repository names must
+/// be lowercase.
+fn project_image_name(workspace: &Path) -> String {
+    format!("ramekin-{}", repo_slug(workspace)).to_lowercase()
+}
+
 #[derive(Serialize)]
 struct ComposeConfig {
     services: Services,
@@ -463,6 +497,7 @@ fn generate_compose(
     build_context: &Path,
     mounts: &[&config::ResolvedMount],
     env_vars: &[config::ScopedValue<(&str, &str)>],
+    image: &str,
     pi_args: &[String],
 ) -> String {
     let volumes: Vec<String> = mounts.iter().map(|m| m.to_volume_string()).collect();
@@ -490,7 +525,7 @@ fn generate_compose(
                     context: build_context.display().to_string(),
                     dockerfile: dockerfile.display().to_string(),
                 },
-                image: "ramekin-agent".into(),
+                image: image.to_string(),
                 stdin_open: true,
                 tty: true,
                 environment,
@@ -501,4 +536,43 @@ fn generate_compose(
     };
 
     serde_yaml::to_string(&config).expect("failed to serialize compose config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_image_name_is_repo_specific_and_distinct_from_base() {
+        let name = project_image_name(Path::new("/Users/alpha/src/lit-rs"));
+        // Must not collide with the base image tag, or `docker compose up`
+        // reuses the base instead of building the project Dockerfile.
+        assert_ne!(name, "ramekin-agent");
+        assert!(name.contains("lit-rs"), "got: {name}");
+        // Docker repository names must be lowercase.
+        assert_eq!(name, name.to_lowercase(), "got: {name}");
+    }
+
+    #[test]
+    fn project_image_name_differs_per_workspace() {
+        let a = project_image_name(Path::new("/Users/alpha/src/lit-rs"));
+        let b = project_image_name(Path::new("/Users/alpha/src/ramekin"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn generate_compose_uses_supplied_image_tag() {
+        let yaml = generate_compose(
+            Path::new("/ws/.ramekin/Dockerfile"),
+            Path::new("/ws"),
+            &[],
+            &[],
+            "ramekin-agent-lit-rs-deadbeef",
+            &[],
+        );
+        assert!(
+            yaml.contains("image: ramekin-agent-lit-rs-deadbeef"),
+            "compose did not carry the supplied image tag:\n{yaml}"
+        );
+    }
 }
