@@ -224,7 +224,7 @@ impl Config {
             .wrap_err("failed to parse config file")
     }
 
-    /// Resolve all mounts, skipping any whose source directory does not exist.
+    /// Resolve all mounts, skipping any whose source does not exist.
     fn resolve_mounts(&self) -> Vec<ResolvedMount> {
         self.mounts.iter().filter_map(|m| m.resolve()).collect()
     }
@@ -233,16 +233,18 @@ impl Config {
 impl Mount {
     /// Expand tildes and derive the container target path.
     ///
-    /// Returns `None` if the source directory does not exist on the host.
+    /// Returns `None` if the source does not exist on the host. Files and
+    /// devices (such as `/dev/null`) resolve like directories — Docker binds
+    /// them all the same way.
     pub fn resolve(&self) -> Option<ResolvedMount> {
         let expanded = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
-        if !expanded.is_dir() {
+        if !expanded.exists() {
             return None;
         }
 
         let target = match &self.target {
-            Some(t) => resolve_container_tilde(t),
-            None => resolve_container_tilde(&self.source),
+            Some(t) => resolve_container_target(t),
+            None => resolve_container_target(&self.source),
         };
 
         Some(ResolvedMount {
@@ -364,14 +366,24 @@ impl ResolvedMount {
 /// image ever switches to a non-root user, update this constant.
 const CONTAINER_HOME: &str = "/root";
 
-/// Replace a leading `~` with the container home directory.
-fn resolve_container_tilde(path: &str) -> String {
+/// Mount point for the workspace inside the agent container. Relative mount
+/// targets are resolved against this so a bare `.envrc` lands next to the
+/// project files. Keep in sync with the workspace builtin mount in `main.rs`.
+pub const CONTAINER_WORKSPACE: &str = "/workspace";
+
+/// Resolve a configured target into an absolute container path.
+///
+/// A leading `~` expands to the container home directory. A relative path is
+/// resolved against the workspace mount. Absolute paths pass through unchanged.
+fn resolve_container_target(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         format!("{CONTAINER_HOME}/{rest}")
     } else if path == "~" {
         CONTAINER_HOME.to_string()
-    } else {
+    } else if path.starts_with('/') {
         path.to_string()
+    } else {
+        format!("{CONTAINER_WORKSPACE}/{path}")
     }
 }
 
@@ -434,21 +446,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_container_tilde_with_subpath() {
+    fn resolve_container_target_with_subpath() {
         assert_eq!(
-            resolve_container_tilde("~/.config/git"),
+            resolve_container_target("~/.config/git"),
             "/root/.config/git"
         );
     }
 
     #[test]
-    fn resolve_container_tilde_bare() {
-        assert_eq!(resolve_container_tilde("~"), "/root");
+    fn resolve_container_target_bare() {
+        assert_eq!(resolve_container_target("~"), "/root");
     }
 
     #[test]
-    fn resolve_container_tilde_absolute_unchanged() {
-        assert_eq!(resolve_container_tilde("/some/path"), "/some/path");
+    fn resolve_container_target_absolute_unchanged() {
+        assert_eq!(resolve_container_target("/some/path"), "/some/path");
+    }
+
+    #[test]
+    fn resolve_container_target_relative_uses_workspace() {
+        assert_eq!(resolve_container_target(".envrc"), "/workspace/.envrc");
     }
 
     #[test]
@@ -459,6 +476,18 @@ mod tests {
             writable: false,
         };
         assert!(mount.resolve().is_none());
+    }
+
+    #[test]
+    fn resolve_with_file_source_and_relative_target() {
+        let mount = Mount {
+            source: "/dev/null".into(),
+            target: Some(".envrc".into()),
+            writable: false,
+        };
+        let resolved = mount.resolve().unwrap();
+        assert_eq!(resolved.source, PathBuf::from("/dev/null"));
+        assert_eq!(resolved.target, "/workspace/.envrc");
     }
 
     #[test]

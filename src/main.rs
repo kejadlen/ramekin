@@ -139,7 +139,7 @@ impl Ramekin {
             (&pi_data_dir, "/root/.pi"),
             (&agent_dir, "/root/.pi/agent"),
             (&repo_sessions_dir, "/root/.pi/agent/sessions"),
-            (&workspace, "/workspace"),
+            (&workspace, config::CONTAINER_WORKSPACE),
         ];
         let builtin_mounts: Vec<config::ResolvedMount> = builtin_entries
             .into_iter()
@@ -428,7 +428,7 @@ impl Ramekin {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a session ID from the current process ID.
+/// Generate a random session ID for scoping the compose project and cache dir.
 fn session_id() -> String {
     format!("{:08x}", fastrand::u32(..))
 }

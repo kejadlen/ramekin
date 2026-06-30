@@ -38,13 +38,13 @@ ramekin completions bash > ~/.local/share/bash-completion/completions/ramekin
 
 ### Persistence
 
-The agent directory (`$XDG_CONFIG_HOME/ramekin/agent/`) is mounted into the container at `/root/.pi/agent`. On each run, everything except `auth.json` is cleared and reassembled from pi config entries defined in KDL config files. The `ramekin.ts` extension is always written fresh.
+The agent directory (`$XDG_CONFIG_HOME/ramekin/agent/`) is mounted into the container at `/root/.pi/agent`. On each run, everything except `auth.json` is cleared and reassembled from pi config entries defined in KDL config files. The `ramekin-prompt.md` system prompt is always written fresh.
 
 The full pi data directory (`$XDG_DATA_HOME/ramekin/`) is mounted at `/root/.pi` for auth tokens and session history. Each workspace also gets its own sessions directory under `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`.
 
 ### Volume mounts
 
-Additional host directories can be mounted into the container via KDL config files. Mounts whose source doesn't exist on the host are silently skipped.
+Additional host paths can be mounted into the container via KDL config files. Directories, files, and devices (such as `/dev/null`) all work. Mounts whose source doesn't exist on the host are silently skipped.
 
 **User config** — `$XDG_CONFIG_HOME/ramekin/config.kdl`
 
@@ -79,14 +79,23 @@ Each `mounts` block supports:
 | Field | Required | Description |
 |---|---|---|
 | `source` | yes | Host path (`~` expands to home directory) |
-| `target` | no | Container path (derived from source if omitted) |
+| `target` | no | Container path; `~` expands to the container home, a relative path resolves against the `/workspace` mount, and omitting it derives the target from the source |
 | `writable` | no | Allow writes (read-only by default) |
+
+For example, mounting `/dev/null` over `.envrc` masks a host `.envrc` from the agent:
+
+```kdl
+mounts {
+    source "/dev/null"
+    target ".envrc"
+}
+```
 
 Mounts are merged across scopes. When both user and project configs define a mount with the same container target, the project mount wins. Builtin mounts (workspace, pi data, agent dir) cannot be overridden.
 
-### Container environment extension
+### Container environment context
 
-A built-in pi extension (`ramekin.ts`) is mounted into the agent container. It appends container environment context to the system prompt via `before_agent_start`, telling the agent about the workspace mount, ephemeral filesystem, and networking. AGENTS.md remains fully available for user customization.
+A built-in system prompt (`ramekin-prompt.md`) is written into the agent dir and passed to pi via `--append-system-prompt`. It tells the agent about the container environment — the workspace mount, ephemeral filesystem, and networking. AGENTS.md remains fully available for user customization.
 
 ### Custom Dockerfile
 
