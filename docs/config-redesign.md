@@ -12,10 +12,11 @@ from here, not a baseline to preserve.
    from any machine and any project.
 3. **Overridable everything** — any shared setting can be overridden closer
    to the point of use: per machine, per project, per run.
-4. **Safe outbound sharing** — when the agent improves a skill or memory file
-   inside the container, there's a reviewed path for that change to land back
-   in the shared source of truth. Dotfiles are never writable from inside the
-   container.
+4. **Immutable config, outbox for everything stateful** — configuration is
+   read-only inside the container; in-container edits to it are deliberately
+   impossible, not merely ephemeral. The outbox is the single reviewed path
+   for any stateful modification to shared config. Dotfiles are never
+   writable from inside the container.
 5. **Multiple sessions** — concurrent ramekin runs (same repo or different,
    same agent or different) don't interfere with each other.
 
@@ -25,9 +26,14 @@ From `main`:
 
 - Layered KDL config with per-target merge and scope-labelled `ramekin
   config` output works well; keep the shape.
-- Copy-and-clear assembly of the agent dir is the root of two problems: it
-  loses in-container edits (goal 4) and a second session's clear yanks files
-  out from under the first (goal 5). It doesn't survive this redesign.
+- Copy-and-clear assembly of the agent dir doesn't survive this redesign,
+  for two reasons. The fatal one is concurrency: a second session's clear
+  yanks files out from under the first (goal 5). The subtle one is that it
+  gets goal 4's semantics *almost* right — in-container edits to config
+  should not stick, and with copies they don't — but silently: the agent can
+  edit its config, believe it worked, and lose it on the next run. Read-only
+  mounts enforce the same intent loudly, at write time, which is what steers
+  the agent to the outbox.
 
 From `claude-code`:
 
@@ -122,8 +128,12 @@ read-only by design (goal 4); the outbox is the write path.
 
 ### Session model
 
-Everything a run touches is either *persistent agent state*, *shared config
-(read-only)*, or *session-scoped (fresh per run)*:
+The design distinguishes two kinds of mutation. **Agent runtime state**
+(auth tokens, account identity, session history) persists via direct
+writable mounts — the agent owns it and it must survive every run.
+**Configuration** (memory files, skills, settings sourced from dotfiles) is
+immutable in the container; the outbox is its only write path. Everything a
+run touches falls into one of three buckets:
 
 - **Persistent, shared across sessions:** the agent state dirs —
   `$XDG_DATA_HOME/ramekin/agents/pi/` and `agents/claude/` (+
