@@ -71,26 +71,42 @@ the active agent's tag as the build arg, so one project Dockerfile serves
 both agents. Project image tags stay repo-specific (per main) and gain an
 agent suffix.
 
-### Config layers
+### Config trees: KDL for host facts, the filesystem for content
 
-Lowest to highest precedence:
+A config layer is not a KDL file — it's a **directory**, and KDL is just one
+file in it. KDL carries only the things that genuinely need structure: which
+agent, how host paths map into the container, and what other trees to pull
+in. Everything content-shaped is expressed by *being a file in the tree*:
+
+```
+<config tree>/
+  config.kdl    # agent, mounts, include — nothing else
+  env           # dotenv format, merged by name across layers
+  pi/           # contents land in /root/.pi/agent/, read-only
+  claude/       # contents land in /root/.claude/, read-only
+  Dockerfile    # project image layer (project tree only)
+```
+
+Adding a skill is dropping a directory into `claude/skills/` — no KDL entry
+to write. Symlinks inside a tree work (`claude/CLAUDE.md → ../ai/CLAUDE.md`),
+so agent trees can share sources without duplication; ramekin canonicalizes
+per entry when generating mounts. The old `pi {}` / `claude {}` KDL blocks
+disappear entirely.
+
+The trees, lowest to highest precedence:
 
 1. **builtin defaults** (agent = pi; builtin mounts stay non-overridable)
-2. **included files**, in include order
-3. **user** `~/.config/ramekin/config.kdl`
-4. **project** `<workspace>/.ramekin/config.kdl`
-5. **project-local** `<workspace>/.ramekin/config.local.kdl` (gitignored)
+2. **included trees**, in include order — this is the dotfiles sharing
+   mechanism
+3. **user** `~/.config/ramekin/`
+4. **project** `<workspace>/.ramekin/`
+5. **project-local** `<workspace>/.ramekin/local/` (gitignored; a full
+   nested tree, so it can override content as well as KDL)
 6. **CLI** — `--agent`; `--mount`/`--env` when they earn their keep
-
-Merge semantics as today: mounts and config entries dedupe by resolved
-target, env by name, scalars last-writer-wins, `/dev/null` masking removes
-an inherited mount.
-
-`include` is the sharing mechanism:
 
 ```kdl
 // ~/.config/ramekin/config.kdl — machine-specific, tiny
-include "~/.dotfiles/ramekin/config.kdl"   // the shared base
+include "~/.dotfiles/ramekin"   // the shared tree
 
 // machine-only overrides below
 mounts {
@@ -99,32 +115,20 @@ mounts {
 }
 ```
 
-Included files load at *lower* precedence than the includer; includes nest;
-cycles and missing files are errors (unlike mount sources, a dangling include
-means the config is wrong, not that a host lacks a directory). `include`
-accepts a file or a directory (`*.kdl`, sorted).
+Includes point at trees, nest, and load at *lower* precedence than the
+includer. Cycles and missing trees are errors — unlike mount sources, where
+absence is a host fact, a dangling include means the config is wrong.
 
-### Agent config entries: read-only bind mounts for both agents
+Merging: agent-tree contents dedupe by top-level entry name (`CLAUDE.md`,
+`skills/`, `settings.json`) with the higher-precedence tree winning the whole
+entry — coarse, but predictable and cheap to reason about. `env` files merge
+per variable name. KDL mounts dedupe by resolved target as today; scalars
+last-writer-wins; `/dev/null` masking still removes an inherited mount.
 
-One vocabulary, symmetric across agents:
-
-```kdl
-pi {
-    source "~/.dotfiles/ai/AGENTS.md"
-}
-claude {
-    source "~/.dotfiles/ai/CLAUDE.md"
-}
-claude {
-    source "~/.dotfiles/ai/skills"
-    target "skills"
-}
-```
-
-An entry expands to a **read-only** bind mount at `<config-dir>/<target>`
-(target defaults to the source basename). Only the block matching the active
-agent applies; the other is inert. No `writable` field — shared config is
-read-only by design (goal 4); the outbox is the write path.
+At run time each winning agent-tree entry becomes a **read-only** bind mount
+at the agent's config dir. Only the tree subdir matching the active agent
+applies; the other is inert. There is no writable variant — shared config is
+immutable by design (goal 4); the outbox is the write path.
 
 ### Session model
 
@@ -172,7 +176,8 @@ The only outbound channel, same for both agents:
 - Host side, `ramekin outbox`:
   - `list` — pending proposals across sessions
   - `diff` — difftastic against the source each entry was mounted from
-    (ramekin knows the target → source mapping)
+    (a proposal's relative path maps straight back to the winning config
+    tree)
   - `apply` — copy over the source after confirmation, drop the proposal
   - `discard`
 - After `apply`, the change is an ordinary working-copy edit in dotfiles;
@@ -191,12 +196,12 @@ don't survive the redesign, but the claude Dockerfile, managed settings,
 per-slug workspace, compose long-form binds, BuildKit secret, and
 side-effect-free `config` all do):
 
-1. Session model refactor on pi only: per-session agent dir, entries become
-   read-only bind mounts, `pi {}` loses copy semantics. Multi-session works
-   from here on.
+1. Session model refactor on pi only: per-session agent dir, config trees
+   replace the `pi {}` block, tree entries become read-only bind mounts.
+   Multi-session works from here on.
 2. Claude support: profile, `Dockerfile.claude` (harvested), per-agent tags +
    `ARG BASE` project builds, `--agent` flag + `agent` scalar.
-3. `include` + project-local layer.
+3. `include` + project-local tree + `env` files.
 4. Outbox: mount + prompt section, then the `ramekin outbox` subcommand.
 
 ## Open questions
@@ -205,6 +210,10 @@ side-effect-free `config` all do):
   does it write scratch files there at runtime? The fresh writable session
   dir underneath the read-only binds should absorb anything, but verify
   before committing to step 1.
+- Merge granularity for agent trees: top-level entry (proposed) means a
+  project overriding one skill must shadow the whole `skills/` dir. Per-file
+  merging fixes that at the cost of many more mounts and hazier semantics.
+  Start coarse; revisit if it bites.
 - `--mount`/`--env` CLI flags: deferred until a real need shows up.
 - Firewall sidecar (long-planned) intersects with the session model — each
   session's compose stack is where it would attach. Out of scope here.
