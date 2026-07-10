@@ -1,6 +1,7 @@
 # Config redesign
 
-Status: proposal (2026-07), revised against the `claude-code` branch
+Status: proposal (2026-07). The `claude-code` branch is a prototype to learn
+from here, not a baseline to preserve.
 
 ## Goals
 
@@ -12,149 +13,188 @@ Status: proposal (2026-07), revised against the `claude-code` branch
 3. **Overridable everything** — any shared setting can be overridden closer
    to the point of use: per machine, per project, per run.
 4. **Safe outbound sharing** — when the agent improves a skill or memory file
-   inside the container, there's a safe path for that change to land back in
-   the shared source of truth.
+   inside the container, there's a reviewed path for that change to land back
+   in the shared source of truth. Dotfiles are never writable from inside the
+   container.
+5. **Multiple sessions** — concurrent ramekin runs (same repo or different,
+   same agent or different) don't interfere with each other.
 
-## Baseline: what `claude-code` already delivers
+## Lessons from the prototypes
 
-The `claude-code` branch covers goal 1 end to end, and its choices supersede
-an earlier draft of this doc:
+From `main`:
 
-- `agent "pi" | "claude"` as a top-level KDL scalar; highest-precedence layer
-  wins, defaulting to pi. `AgentLayout` in `main.rs` carries each agent's
-  paths, builtin mounts, embedded Dockerfile, and prompt plumbing.
-- **Bind mounts, not copies, for claude.** `claude { ... }` entries expand to
-  read-only-by-default bind mounts at `/root/.claude/<target>`. Host edits
-  are live in the container; auth and runtime state in the surrounding
-  `~/.claude` mount are untouched; no clear-and-reassemble ceremony. The
-  `pi { ... }` copy-assembly model stays as-is — the asymmetry is deliberate,
-  matching how each agent treats its config dir.
-- **Per-slug workspace instead of a sessions mount.** Claude keys its
-  `projects` map and transcripts by cwd, so mounting each workspace at
-  `/workspace/<slug>` isolates repos while `~/.claude` and `~/.claude.json`
-  stay global (auth, identity, onboarding survive repo switches).
-- Yolo mode via managed settings baked into the image
-  (`bypassPermissions` + skip dialog + `IS_SANDBOX=1`), not CLI flags.
-- Separate `Dockerfile.claude`, GitHub token forwarded as a BuildKit secret,
-  side-effect-free `ramekin config`, deterministic parent-before-child mount
-  ordering.
+- Layered KDL config with per-target merge and scope-labelled `ramekin
+  config` output works well; keep the shape.
+- Copy-and-clear assembly of the agent dir is the root of two problems: it
+  loses in-container edits (goal 4) and a second session's clear yanks files
+  out from under the first (goal 5). It doesn't survive this redesign.
 
-### Loose ends on the branch itself
+From `claude-code`:
 
-- **Rebase onto main.** `claude-code` forked before the last five main
-  commits (project image tags, `--rebuild` semantics, file-source mounts,
-  justfile CI). README.md and src/main.rs conflict; the project-image-tag
-  work on main overlaps with the shared `ramekin-agent` tag assumption below.
-- **Shared base tag across agents.** Both Dockerfiles build to
-  `ramekin-agent`, and project Dockerfiles say `FROM ramekin-agent`.
-  Switching agents silently swaps what that tag means and busts every
-  project layer built on the other agent. Per-agent tags
-  (`ramekin-agent-pi`, `ramekin-agent-claude`) with the project `FROM`
-  rewritten or parametrized via build arg would fix the churn.
-- **README drift.** The branch README says claude gets the prompt via
-  `--append-system-prompt`, but the code passes `--append-system-prompt-file`;
-  the pi section describes a `ramekin.ts` extension while the code writes
-  `ramekin-prompt.md` and passes a flag. Reconcile during the rebase.
+- **Read-only bind mounts beat copies** for exposing shared config: host
+  edits stay live, nothing to reassemble, nothing to clear. (`claude { ... }`
+  proved this; the redesign extends it to pi.)
+- **Per-slug workspace mounts** (`/workspace/<slug>`) isolate cwd-keyed agent
+  state (Claude's `projects` map, transcripts) while auth and identity stay
+  global. Cheaper and more robust than splitting agent state files.
+- Yolo mode belongs in the image (managed settings + `IS_SANDBOX=1`), not in
+  CLI flags.
+- Keep: side-effect-free `ramekin config`, deterministic parent-before-child
+  mount ordering, long-form compose bind syntax, GitHub token as BuildKit
+  secret.
+- Anti-lesson: both agents building to one `ramekin-agent` tag means
+  switching agents silently redefines the tag and busts project layers built
+  on the other agent. Images must be per-agent.
 
-## Remaining work
+## Design
 
-### 1. Sharing in: `include`
+### Agents
 
-Any config file may include others:
+`agent "pi" | "claude"` is a top-level KDL scalar; the highest-precedence
+layer that sets it wins, and `ramekin run --agent <a>` beats them all.
+Default: pi.
+
+Agent definitions live in Rust (builtin profiles), covering: base Dockerfile,
+image tag, entrypoint, state dir layout, config-dir path in the container,
+prompt injection flag, auth file names. Config never defines an agent, only
+selects one.
+
+Base images are tagged per agent: `ramekin-pi`, `ramekin-claude`. A project
+`.ramekin/Dockerfile` declares `ARG BASE` / `FROM ${BASE}` and ramekin passes
+the active agent's tag as the build arg, so one project Dockerfile serves
+both agents. Project image tags stay repo-specific (per main) and gain an
+agent suffix.
+
+### Config layers
+
+Lowest to highest precedence:
+
+1. **builtin defaults** (agent = pi; builtin mounts stay non-overridable)
+2. **included files**, in include order
+3. **user** `~/.config/ramekin/config.kdl`
+4. **project** `<workspace>/.ramekin/config.kdl`
+5. **project-local** `<workspace>/.ramekin/config.local.kdl` (gitignored)
+6. **CLI** — `--agent`; `--mount`/`--env` when they earn their keep
+
+Merge semantics as today: mounts and config entries dedupe by resolved
+target, env by name, scalars last-writer-wins, `/dev/null` masking removes
+an inherited mount.
+
+`include` is the sharing mechanism:
 
 ```kdl
 // ~/.config/ramekin/config.kdl — machine-specific, tiny
 include "~/.dotfiles/ramekin/config.kdl"   // the shared base
 
-// machine-only additions/overrides below
+// machine-only overrides below
 mounts {
     source "~/.local/share/ranger"
     writable
 }
 ```
 
-Rules:
+Included files load at *lower* precedence than the includer; includes nest;
+cycles and missing files are errors (unlike mount sources, a dangling include
+means the config is wrong, not that a host lacks a directory). `include`
+accepts a file or a directory (`*.kdl`, sorted).
 
-- Included files load as their own layer at *lower* precedence than the
-  includer — the machine file overrides the shared base.
-- Includes may nest; cycles are an error. A missing include is an error too:
-  unlike mount sources (where absence is a host fact), a dangling include
-  means the config is wrong.
-- `include` accepts a file or a directory (loads `*.kdl` sorted by name).
+### Agent config entries: read-only bind mounts for both agents
 
-The shared config becomes a plain directory in dotfiles, versioned with jj.
-New machine setup is one line of user config. This composes with the
-`claude {}` / `pi {}` blocks already on the branch — the shared file declares
-the dotfiles-sourced entries once, for both agents.
+One vocabulary, symmetric across agents:
 
-### 2. Overriding: two more layers
+```kdl
+pi {
+    source "~/.dotfiles/ai/AGENTS.md"
+}
+claude {
+    source "~/.dotfiles/ai/CLAUDE.md"
+}
+claude {
+    source "~/.dotfiles/ai/skills"
+    target "skills"
+}
+```
 
-Layer order, lowest to highest precedence:
+An entry expands to a **read-only** bind mount at `<config-dir>/<target>`
+(target defaults to the source basename). Only the block matching the active
+agent applies; the other is inert. No `writable` field — shared config is
+read-only by design (goal 4); the outbox is the write path.
 
-1. **builtin defaults** (agent = pi; builtin mounts stay non-overridable)
-2. **included files**, in include order
-3. **user** `~/.config/ramekin/config.kdl`
-4. **project** `<workspace>/.ramekin/config.kdl`
-5. **project-local** `<workspace>/.ramekin/config.local.kdl` — gitignored,
-   for things true of this checkout on this machine only
-6. **CLI** — at minimum `--agent`; `--mount` and `--env` when needed
+### Session model
 
-Merge semantics stay exactly what the branch has: dedupe by resolved target
-or name, scalars last-writer-wins, `/dev/null` masking to remove an inherited
-mount. `ramekin config` already labels scopes; it grows the new ones.
+Everything a run touches is either *persistent agent state*, *shared config
+(read-only)*, or *session-scoped (fresh per run)*:
 
-`--agent` is the piece with real pull: today comparing pi and claude on the
-same repo means editing a config file back and forth. (It also interacts
-with the shared-base-tag loose end above — per-run agent switching makes the
-tag churn much more visible.)
+- **Persistent, shared across sessions:** the agent state dirs —
+  `$XDG_DATA_HOME/ramekin/agents/pi/` and `agents/claude/` (+
+  `agents/claude.json`), mounted writable at `/root/.pi` / `/root/.claude`
+  (+ `/root/.claude.json`). Concurrent access here is the agent's own
+  problem, and both agents already handle multiple simultaneous sessions on
+  a normal host. Auth, identity, and history live here and survive
+  everything.
+- **Shared config, read-only:** the bind-mounted entries above. Immutable
+  from the container, so concurrent sessions can't fight over them.
+- **Session-scoped:** a per-session dir (as today: random id) holding the
+  compose file, the rendered `ramekin-prompt.md` (mounted read-only at the
+  agent's prompt path), and the **outbox**. Pi's config dir stops being a
+  shared host dir that gets cleared: each session mounts a fresh, empty
+  writable session dir at `/root/.pi/agent`, with the config entries,
+  `auth.json` (file mount from persistent state), and `sessions/` (per-repo
+  persistent dir) bind-mounted on top. Nothing is ever cleared; the dir is
+  simply new each time and discarded on teardown.
 
-### 3. Sharing out: jj-backed writable mounts now, outbox if needed
+Workspaces mount at `/workspace/<slug>` for both agents (uniformity; Claude
+requires it, pi doesn't care). Compose project names keep the session id.
+Concurrent image builds of the same tag are idempotent in Docker; per-agent
+tags remove the pi/claude race.
 
-The branch already contains most of the answer. A `claude {}` entry with
-`writable` bind-mounts a file or directory out of the dotfiles *working
-copy* — and crucially, only that path, never the repo metadata. That gives:
+### Outbox
 
-- The agent can write improvements directly (skills, CLAUDE.md).
-- The agent cannot touch `.jj`/`.git`, other dotfiles, or history.
-- Every change lands as an ordinary working-copy diff on the host: `jj st`
-  shows it, `jj diff` reviews it, `jj restore` rejects it. Nothing is
-  irreversible.
+The only outbound channel, same for both agents:
 
-So the safety model is *review-after with guaranteed rollback*, which for a
-single user is probably the right cost/benefit. Two cheap hardening steps
-make it trustworthy enough to leave on:
+- Every session mounts its fresh, empty outbox dir (host:
+  `$XDG_DATA_HOME/ramekin/repos/<slug>/outbox/<session-id>/`) at
+  `/root/.ramekin/outbox`, writable — the only agent-writable path outside
+  the workspace and the agent state mounts.
+- `ramekin-prompt.md` tells the agent: shared config is read-only by design;
+  to propose a change, write the changed file into the outbox mirroring the
+  config-dir layout and tell the user.
+- Host side, `ramekin outbox`:
+  - `list` — pending proposals across sessions
+  - `diff` — difftastic against the source each entry was mounted from
+    (ramekin knows the target → source mapping)
+  - `apply` — copy over the source after confirmation, drop the proposal
+  - `discard`
+- After `apply`, the change is an ordinary working-copy edit in dotfiles;
+  jj takes it from there.
 
-- A `ramekin-prompt.md` section telling the agent which paths are shared
-  config and that edits there propagate to the host — so changes are
-  deliberate, not incidental.
-- `ramekin run` warns at startup when a writable mount's source sits in a
-  dirty jj working copy, so agent edits don't get tangled with unrelated
-  uncommitted changes.
-
-If review-*before* ever becomes necessary (or for the pi side, where config
-is copied and in-container edits currently evaporate), the fallback design is
-an **outbox**: a fresh per-session writable mount at `/root/.ramekin/outbox`,
-a prompt instruction to drop proposed config changes there mirroring the
-config-dir layout, and a `ramekin outbox list|diff|apply|discard` subcommand
-that diffs proposals against their known sources and copies them over only on
-explicit apply. Nothing reaches dotfiles without confirmation. The outbox is
-strictly additive — same mount plumbing, no changes to the models above — so
-deferring it costs nothing.
+Safety: the container writes only to a session-scoped empty dir; nothing
+reaches dotfiles without explicit `apply`; diffs run against known sources so
+a confused or malicious proposal is visible before it lands; proposals that
+don't map back to a configured source need an explicit destination to apply.
 
 ## Sequencing
 
-1. Rebase `claude-code` onto main, fixing the README drift and deciding the
-   base-tag question in the same pass. Merge it — it's the foundation.
-2. `include` + project-local layer (config.rs only, mechanical).
-3. `--agent` CLI override; `--mount`/`--env` if they earn their keep.
-4. Prompt section + dirty-working-copy warning for writable shared mounts.
-5. Outbox, only if review-before turns out to matter in practice.
+Build on main; harvest `claude-code` commits where they fit rather than
+rebasing the branch wholesale (its copy-vs-mount asymmetry and shared tag
+don't survive the redesign, but the claude Dockerfile, managed settings,
+per-slug workspace, compose long-form binds, BuildKit secret, and
+side-effect-free `config` all do):
+
+1. Session model refactor on pi only: per-session agent dir, entries become
+   read-only bind mounts, `pi {}` loses copy semantics. Multi-session works
+   from here on.
+2. Claude support: profile, `Dockerfile.claude` (harvested), per-agent tags +
+   `ARG BASE` project builds, `--agent` flag + `agent` scalar.
+3. `include` + project-local layer.
+4. Outbox: mount + prompt section, then the `ramekin outbox` subcommand.
 
 ## Open questions
 
-- Per-agent base image tags vs. one shared tag (see loose ends). Leaning
-  per-agent tags with the project Dockerfile `FROM` parametrized by build arg.
-- Should pi eventually move to the bind-mount model (a `writable` field on
-  `pi {}` entries) so both agents share outbound semantics? Today pi's
-  copy-assembly means in-container edits are always lost, which makes the
-  outbox more interesting for pi than for claude.
+- Does pi tolerate a read-only `AGENTS.md`/`skills/` in its agent dir, and
+  does it write scratch files there at runtime? The fresh writable session
+  dir underneath the read-only binds should absorb anything, but verify
+  before committing to step 1.
+- `--mount`/`--env` CLI flags: deferred until a real need shows up.
+- Firewall sidecar (long-planned) intersects with the session model — each
+  session's compose stack is where it would attach. Out of scope here.
