@@ -26,16 +26,16 @@ to preserve.
 Three tiers, by rate of change:
 
 - **The binary** holds globals — anything stable across machines and
-  projects. Agent plumbing, provider profiles, staple mounts, tree layout,
-  session model. Changing these is an edit + `just install`, which is the
-  loop this repo already lives in. Config files never restate facts about
-  the tool or its one user.
+  projects that's a fact about the tools or their one user: agent plumbing,
+  staple mounts, tree layout, session model. Changing these is an edit +
+  `just install`, which is the loop this repo already lives in. Config files
+  never restate them.
 - **The filesystem** holds content — memory files, skills, settings, env
   files — as real files in conventional locations. Sharing across machines
   is a dotfiles symlink, not a ramekin feature.
-- **KDL** holds the remainder — the genuinely irregular, mostly per-project:
-  extra mounts, masks, a profile override. Small, optional, and usually
-  absent.
+- **KDL** holds the remainder — profile definitions and the genuinely
+  irregular, mostly per-project: extra mounts, masks, a profile override.
+  Small, optional, and mostly living in the shared user tree.
 
 ## Lessons from the prototypes
 
@@ -57,20 +57,35 @@ per-agent.
 
 ## Design
 
-### Profiles: hardcoded bundles of agent + provider
+### Profiles: KDL bundles of agent + provider
 
-A profile is a named bundle in the binary: agent, env vars, extra mounts.
+A profile is a named bundle: agent, env vars, extra mounts. The binary
+ships only the two trivial ones — `pi` and `claude`, bare agent with no
+provider plumbing — so ramekin runs with zero config. Everything richer is
+defined in KDL, normally in the user tree so it shares via dotfiles:
 
-| profile | agent | provider plumbing |
-|---|---|---|
-| `pi` | pi | anthropic (keys in pi's own auth state) |
-| `pi-glm` | pi | GLM endpoint + `ZHIPU_API_KEY` passthrough |
-| `claude` | claude | anthropic (OAuth in persistent `~/.claude`) |
-| `claude-bedrock` | claude | `CLAUDE_CODE_USE_BEDROCK=1`, `~/.aws` mount, `AWS_PROFILE` passthrough |
+```kdl
+// ~/.config/ramekin/config.kdl
+profile "claude-bedrock" {
+    agent "claude"
+    env CLAUDE_CODE_USE_BEDROCK="1"
+    env AWS_PROFILE            // bare = pass through the host value
+    mounts { source "~/.aws" }
+}
 
-Profile definitions are code: they change rarely, they're facts about the
-tools, and recompiling is cheap. There is no claude-GLM profile because that
-combination isn't wanted; adding one later is a table row.
+profile "pi-glm" {
+    agent "pi"
+    env ANTHROPIC_BASE_URL="https://open.bigmodel.cn/api/anthropic"
+    env ZHIPU_API_KEY
+}
+```
+
+Profiles merge by name across layers, last writer takes the whole
+definition — a project can redefine `claude-bedrock` wholesale, but
+fine-grained tweaks (one env var) go through the ordinary layered `env`
+instead, which overlays whatever profile is active. There is no claude-GLM
+profile because that combination isn't wanted; adding one later is four
+lines of KDL, not a release.
 
 Selection, lowest to highest precedence:
 
@@ -107,7 +122,7 @@ Two trees, at hardcoded locations. A tree is a directory:
 
 ```
 <tree>/
-  config.kdl    # profile, mounts — nothing else, usually absent
+  config.kdl    # profile definitions/selection, mounts — nothing else
   env           # KEY=value, or bare KEY to pass through the host value
   pi/           # contents land in /root/.pi/agent/, read-only
   claude/       # contents land in /root/.claude/, read-only
@@ -127,12 +142,12 @@ Symlinks inside a tree work (`claude/CLAUDE.md → ../ai/CLAUDE.md`), so agent
 subtrees share sources without duplication; ramekin canonicalizes per entry
 when generating mounts.
 
-Precedence, lowest to highest: binary (staples, profile defaults) → user →
+Precedence, lowest to highest: binary (staples, trivial profiles) → user →
 project → project-local → CLI. Merging: agent-tree contents dedupe by
 top-level entry name (`CLAUDE.md`, `skills/`, `settings.json`), higher tree
-wins the whole entry; `env` merges per variable (profile env sits at the
-binary layer, so any tree can adjust it); KDL mounts dedupe by resolved
-target; scalars last-writer-wins.
+wins the whole entry; `env` merges per variable, overlaying the active
+profile's env, so any tree can adjust one variable without redefining the
+profile; KDL mounts dedupe by resolved target; scalars last-writer-wins.
 
 At run time each winning agent-tree entry becomes a **read-only** bind mount
 in the active agent's config dir. Only the subtree matching the active
@@ -206,8 +221,8 @@ secret, side-effect-free `config`) rather than rebasing the branch:
    staples move into the binary. Multi-session works from here on.
 2. Claude support: agent plumbing, `Dockerfile.claude` (harvested),
    per-agent tags + `ARG BASE` project builds.
-3. Profiles: the bundle table, `RAMEKIN_PROFILE`, project `profile` scalar,
-   `-p`, env passthrough.
+3. Profiles: KDL `profile` blocks + builtin trivial profiles,
+   `RAMEKIN_PROFILE`, project `profile` scalar, `-p`, env passthrough.
 4. Outbox: mount + prompt section, then the `ramekin outbox` subcommand.
 
 ## Open questions
@@ -219,8 +234,5 @@ secret, side-effect-free `config`) rather than rebasing the branch:
 - Merge granularity for agent trees: top-level entry (proposed) means a
   project overriding one skill shadows the whole `skills/` dir. Per-file
   merging fixes that at the cost of many more mounts. Start coarse.
-- Should KDL be able to define ad-hoc profiles (not just select one)?
-  Deferred — the hardcoded table plus layered env covers the known matrix;
-  revisit if a real one-off appears.
 - Firewall sidecar (long-planned) intersects with the session model — each
   session's compose stack is where it would attach. Out of scope here.
