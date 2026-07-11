@@ -1,6 +1,7 @@
 # Config redesign
 
-Status: proposal (2026-07). Ramekin is single-user; this design leans on that
+Status: in progress (2026-07) — step 1 of the sequencing (session model on
+pi) is implemented. Ramekin is single-user; this design leans on that
 hard. The `claude-code` branch is a prototype to learn from, not a baseline
 to preserve.
 

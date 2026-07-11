@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -10,15 +10,7 @@ pub struct Config {
     #[serde(default)]
     pub mounts: Vec<Mount>,
     #[serde(default)]
-    pub pi: Vec<PiEntry>,
-    #[serde(default)]
     pub env: HashMap<String, String>,
-}
-
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct PiEntry {
-    pub source: String,
-    pub target: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -35,20 +27,20 @@ pub struct Mount {
 /// Configuration scope, ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
+    /// Compiled into the binary: staples and host agent-config mounts.
+    Binary,
     /// User-level `~/.config/ramekin/config.kdl`.
     User,
     /// Project-level `<workspace>/.ramekin/config.kdl`.
     Project,
-    /// Internal mounts managed by ramekin (highest precedence).
-    Builtin,
 }
 
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Binary => write!(f, "binary"),
             Self::User => write!(f, "user"),
             Self::Project => write!(f, "project"),
-            Self::Builtin => write!(f, "builtin"),
         }
     }
 }
@@ -57,10 +49,9 @@ impl fmt::Display for Scope {
 #[derive(Debug)]
 pub struct ConfigLayer {
     pub scope: Scope,
-    /// `None` for the default scope; `Some(path)` for file-backed scopes.
+    /// `None` for the binary scope; `Some(path)` for file-backed scopes.
     pub path: Option<PathBuf>,
     pub mounts: Vec<ResolvedMount>,
-    pub pi: Vec<PiEntry>,
     pub env: HashMap<String, String>,
 }
 
@@ -80,71 +71,64 @@ pub struct ScopedConfig {
     pub layers: Vec<ConfigLayer>,
 }
 
+/// Mask source: a mount whose source is `/dev/null` *removes* an inherited
+/// mount at the same target instead of binding anything. With no inherited
+/// mount to remove, it stays a real `/dev/null` bind, which blanks a file
+/// that exists in the image or workspace.
+const MASK_SOURCE: &str = "/dev/null";
+
 impl ScopedConfig {
     /// Return merged mounts from all layers, de-duplicated by container target.
     ///
-    /// Higher-precedence layers override mounts with the same target.
+    /// Higher-precedence layers override mounts with the same target, and a
+    /// `/dev/null` source masks (removes) a mount inherited from a lower
+    /// layer. Output order is lexicographic by target, which puts parent
+    /// paths before any child path (`/root/.pi/agent` precedes
+    /// `/root/.pi/agent/AGENTS.md`). Docker processes mount declarations in
+    /// order; a parent declared after its child would shadow the child. The
+    /// deterministic ordering also keeps repeat runs identical.
     pub fn merged_mounts(&self) -> Vec<ScopedValue<&ResolvedMount>> {
-        self.layers
-            .iter()
-            .flat_map(|layer| {
-                layer.mounts.iter().map(move |mount| {
+        let mut by_target: BTreeMap<&str, (ScopedValue<&ResolvedMount>, bool)> = BTreeMap::new();
+        for layer in &self.layers {
+            for mount in &layer.mounts {
+                let inherited = by_target.contains_key(mount.target.as_str());
+                by_target.insert(
+                    mount.target.as_str(),
                     (
-                        &mount.target,
                         ScopedValue {
                             scope: layer.scope,
                             value: mount,
                         },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>()
+                        inherited,
+                    ),
+                );
+            }
+        }
+        by_target
             .into_values()
-            .collect()
-    }
-
-    /// Merge pi entries from all layers, de-duplicated by resolved target.
-    ///
-    /// Higher-precedence layers override entries with the same target.
-    pub fn merged_pi(&self) -> Vec<ScopedValue<&PiEntry>> {
-        self.layers
-            .iter()
-            .flat_map(|layer| {
-                layer.pi.iter().map(move |entry| {
-                    (
-                        entry.resolve().target,
-                        ScopedValue {
-                            scope: layer.scope,
-                            value: entry,
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>()
-            .into_values()
+            .filter(|(sv, inherited)| !(*inherited && sv.value.source == Path::new(MASK_SOURCE)))
+            .map(|(sv, _)| sv)
             .collect()
     }
 
     /// Merge environment variables from all layers, de-duplicated by name.
     ///
     /// Higher-precedence layers override variables with the same name.
+    /// Output order is lexicographic by name for reproducibility.
     pub fn merged_env(&self) -> Vec<ScopedValue<(&str, &str)>> {
-        self.layers
-            .iter()
-            .flat_map(|layer| {
-                layer.env.iter().map(move |(name, value)| {
-                    (
-                        name.as_str(),
-                        ScopedValue {
-                            scope: layer.scope,
-                            value: (name.as_str(), value.as_str()),
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>()
-            .into_values()
-            .collect()
+        let mut by_name: BTreeMap<&str, ScopedValue<(&str, &str)>> = BTreeMap::new();
+        for layer in &self.layers {
+            for (name, value) in &layer.env {
+                by_name.insert(
+                    name.as_str(),
+                    ScopedValue {
+                        scope: layer.scope,
+                        value: (name.as_str(), value.as_str()),
+                    },
+                );
+            }
+        }
+        by_name.into_values().collect()
     }
 }
 
@@ -156,17 +140,82 @@ pub struct ResolvedMount {
     pub writable: bool,
 }
 
+impl ResolvedMount {
+    /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
+    pub fn display_target(&self) -> String {
+        if self.writable {
+            self.target.clone()
+        } else {
+            format!("{} (ro)", self.target)
+        }
+    }
+}
+
+/// Staple mounts every machine gets: read-only, skipped when missing on the
+/// host, overridable (or maskable) by any config layer. The bar for a staple
+/// is "true on every machine".
+const STAPLES: &[&str] = &["~/.config/git", "~/.config/jj"];
+
+/// Host directory where pi keeps its agent config and state.
+const HOST_PI_AGENT_DIR: &str = "~/.pi/agent";
+
+/// The config-shaped entries of the host's pi agent dir. Only these mount
+/// into the container (read-only); the rest of the dir is runtime state —
+/// credentials, session history — which must not leak in.
+pub const PI_AGENT_CONFIG: &[&str] = &["AGENTS.md", "skills"];
+
+/// Pi's agent dir inside the container.
+pub const PI_AGENT_DIR: &str = "/root/.pi/agent";
+
+/// Mounts compiled into the binary: staples plus the host's pi agent config.
+///
+/// Sources are canonicalized because agent dirs and staples commonly symlink
+/// into dotfiles, and bind sources need real paths. Missing entries are
+/// skipped.
+fn binary_mounts() -> Vec<ResolvedMount> {
+    let staples = STAPLES
+        .iter()
+        .map(|source| ((*source).to_string(), resolve_container_target(source, "")));
+    let agent_config = PI_AGENT_CONFIG.iter().map(|entry| {
+        (
+            format!("{HOST_PI_AGENT_DIR}/{entry}"),
+            format!("{PI_AGENT_DIR}/{entry}"),
+        )
+    });
+
+    staples
+        .chain(agent_config)
+        .filter_map(|(source, target)| {
+            let expanded = PathBuf::from(shellexpand::tilde(&source).as_ref());
+            let canonical = expanded.canonicalize().ok()?;
+            Some(ResolvedMount {
+                source: canonical,
+                target,
+                writable: false,
+            })
+        })
+        .collect()
+}
+
 impl Config {
     /// Load all configuration layers for the given workspace.
     ///
+    /// `workspace_target` is the container path of the workspace mount;
+    /// relative mount targets resolve against it.
+    ///
     /// Layers are returned in precedence order (lowest first):
-    /// 1. User (`~/.config/ramekin/config.kdl`) — only if the file exists
-    /// 2. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
-    /// 3. Builtin (internal mounts passed by the caller)
+    /// 1. Binary (staples and host agent-config mounts)
+    /// 2. User (`~/.config/ramekin/config.kdl`) — only if the file exists
+    /// 3. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
     ///
     /// Returns an error if a config file exists but can't be parsed.
-    pub fn load(workspace: &Path, builtin_mounts: Vec<ResolvedMount>) -> Result<ScopedConfig> {
-        let mut layers = Vec::new();
+    pub fn load(workspace: &Path, workspace_target: &str) -> Result<ScopedConfig> {
+        let mut layers = vec![ConfigLayer {
+            scope: Scope::Binary,
+            path: None,
+            mounts: binary_mounts(),
+            env: HashMap::new(),
+        }];
 
         // User layer
         let xdg = xdg::BaseDirectories::with_prefix("ramekin");
@@ -181,8 +230,7 @@ impl Config {
             layers.push(ConfigLayer {
                 scope: Scope::User,
                 path: Some(user_path),
-                mounts: config.resolve_mounts(),
-                pi: config.pi,
+                mounts: config.resolve_mounts(workspace_target),
                 env: config.env,
             });
         }
@@ -196,20 +244,10 @@ impl Config {
             layers.push(ConfigLayer {
                 scope: Scope::Project,
                 path: Some(project_path),
-                mounts: config.resolve_mounts(),
-                pi: config.pi,
+                mounts: config.resolve_mounts(workspace_target),
                 env: config.env,
             });
         }
-
-        // Builtin layer (always present, highest precedence)
-        layers.push(ConfigLayer {
-            scope: Scope::Builtin,
-            path: None,
-            mounts: builtin_mounts,
-            pi: vec![],
-            env: HashMap::new(),
-        });
 
         Ok(ScopedConfig { layers })
     }
@@ -225,8 +263,11 @@ impl Config {
     }
 
     /// Resolve all mounts, skipping any whose source does not exist.
-    fn resolve_mounts(&self) -> Vec<ResolvedMount> {
-        self.mounts.iter().filter_map(|m| m.resolve()).collect()
+    fn resolve_mounts(&self, workspace_target: &str) -> Vec<ResolvedMount> {
+        self.mounts
+            .iter()
+            .filter_map(|m| m.resolve(workspace_target))
+            .collect()
     }
 }
 
@@ -236,15 +277,15 @@ impl Mount {
     /// Returns `None` if the source does not exist on the host. Files and
     /// devices (such as `/dev/null`) resolve like directories — Docker binds
     /// them all the same way.
-    pub fn resolve(&self) -> Option<ResolvedMount> {
+    pub fn resolve(&self, workspace_target: &str) -> Option<ResolvedMount> {
         let expanded = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
         if !expanded.exists() {
             return None;
         }
 
         let target = match &self.target {
-            Some(t) => resolve_container_target(t),
-            None => resolve_container_target(&self.source),
+            Some(t) => resolve_container_target(t, workspace_target),
+            None => resolve_container_target(&self.source, workspace_target),
         };
 
         Some(ResolvedMount {
@@ -255,127 +296,16 @@ impl Mount {
     }
 }
 
-/// A pi entry with its source path expanded and target resolved.
-#[derive(Debug)]
-pub struct ResolvedPiEntry {
-    pub source: PathBuf,
-    /// Target path relative to the agent dir.
-    pub target: String,
-}
-
-impl PiEntry {
-    /// Expand tildes and resolve the target.
-    ///
-    /// Uses the explicit target when set, otherwise falls back to
-    /// the source's basename.
-    pub fn resolve(&self) -> ResolvedPiEntry {
-        let source = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
-        let target = self.target.clone().unwrap_or_else(|| {
-            source
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
-        ResolvedPiEntry { source, target }
-    }
-}
-
-/// Clear the agent directory, preserving only `auth.json`.
-pub fn clear_agent_dir(agent_dir: &Path) -> Result<()> {
-    if !agent_dir.exists() {
-        return Ok(());
-    }
-    for entry in fs_err::read_dir(agent_dir).into_diagnostic()? {
-        let entry = entry.into_diagnostic()?;
-        if entry.file_name() == "auth.json" {
-            continue;
-        }
-        if entry.file_type().into_diagnostic()?.is_dir() {
-            fs_err::remove_dir_all(entry.path()).into_diagnostic()?;
-        } else {
-            fs_err::remove_file(entry.path()).into_diagnostic()?;
-        }
-    }
-    Ok(())
-}
-
-/// Copy pi config entries into the agent directory.
-///
-/// Auto-detects file vs directory from the source. Warns and skips
-/// sources that don't exist on the host.
-pub fn assemble_pi(agent_dir: &Path, entries: &[ResolvedPiEntry]) -> Result<()> {
-    for entry in entries {
-        if !entry.source.exists() {
-            tracing::warn!(
-                source = %entry.source.display(),
-                target = %entry.target,
-                "pi source does not exist, skipping"
-            );
-            continue;
-        }
-
-        let target = agent_dir.join(&entry.target);
-
-        if entry.source.is_dir() {
-            copy_dir(&entry.source, &target)?;
-        } else {
-            fs_err::copy(&entry.source, &target).into_diagnostic()?;
-        }
-    }
-    Ok(())
-}
-
-/// Recursively copy a directory tree.
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    fs_err::create_dir_all(dst).into_diagnostic()?;
-    for entry in fs_err::read_dir(src).into_diagnostic()? {
-        let entry = entry.into_diagnostic()?;
-        let file_type = entry.file_type().into_diagnostic()?;
-        let target = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir(&entry.path(), &target)?;
-        } else {
-            fs_err::copy(entry.path(), &target).into_diagnostic()?;
-        }
-    }
-    Ok(())
-}
-
-impl ResolvedMount {
-    /// Format as a Docker volume mount string (`source:target` or `source:target:ro`).
-    pub fn to_volume_string(&self) -> String {
-        if self.writable {
-            format!("{}:{}", self.source.display(), self.target)
-        } else {
-            format!("{}:{}:ro", self.source.display(), self.target)
-        }
-    }
-
-    /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
-    pub fn display_target(&self) -> String {
-        if self.writable {
-            self.target.clone()
-        } else {
-            format!("{} (ro)", self.target)
-        }
-    }
-}
-
 /// Home directory inside the agent container. The ramekin Dockerfile runs
 /// everything as root, so `~` in container target paths maps here. If the
 /// image ever switches to a non-root user, update this constant.
 const CONTAINER_HOME: &str = "/root";
 
-/// Mount point for the workspace inside the agent container. Relative mount
-/// targets are resolved against this so a bare `.envrc` lands next to the
-/// project files. Keep in sync with the workspace builtin mount in `main.rs`.
-pub const CONTAINER_WORKSPACE: &str = "/workspace";
-
 /// Resolve a configured target into an absolute container path.
 ///
 /// A leading `~` expands to the container home directory. A relative path is
 /// resolved against the workspace mount. Absolute paths pass through unchanged.
-fn resolve_container_target(path: &str) -> String {
+fn resolve_container_target(path: &str, workspace_target: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         format!("{CONTAINER_HOME}/{rest}")
     } else if path == "~" {
@@ -383,13 +313,15 @@ fn resolve_container_target(path: &str) -> String {
     } else if path.starts_with('/') {
         path.to_string()
     } else {
-        format!("{CONTAINER_WORKSPACE}/{path}")
+        format!("{workspace_target}/{path}")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WS: &str = "/workspace/test-slug";
 
     #[test]
     fn kdl_deserialization_works() {
@@ -398,7 +330,7 @@ mod tests {
             source "~/.config/git"
             }
             mounts{
-            source "~/.config/jj"  
+            source "~/.config/jj"
             }
             mounts{
             source "~/.local/share/ranger"
@@ -446,26 +378,41 @@ mod tests {
     }
 
     #[test]
+    fn kdl_dash_notation_mounts_writable() {
+        let kdl = r#"
+            mounts {
+                - { source "~/.local/share/ranger"; writable }
+            }
+        "#;
+        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
+        assert_eq!(parsed.mounts.len(), 1);
+        assert!(parsed.mounts[0].writable);
+    }
+
+    #[test]
     fn resolve_container_target_with_subpath() {
         assert_eq!(
-            resolve_container_target("~/.config/git"),
+            resolve_container_target("~/.config/git", WS),
             "/root/.config/git"
         );
     }
 
     #[test]
     fn resolve_container_target_bare() {
-        assert_eq!(resolve_container_target("~"), "/root");
+        assert_eq!(resolve_container_target("~", WS), "/root");
     }
 
     #[test]
     fn resolve_container_target_absolute_unchanged() {
-        assert_eq!(resolve_container_target("/some/path"), "/some/path");
+        assert_eq!(resolve_container_target("/some/path", WS), "/some/path");
     }
 
     #[test]
     fn resolve_container_target_relative_uses_workspace() {
-        assert_eq!(resolve_container_target(".envrc"), "/workspace/.envrc");
+        assert_eq!(
+            resolve_container_target(".envrc", WS),
+            "/workspace/test-slug/.envrc"
+        );
     }
 
     #[test]
@@ -475,7 +422,7 @@ mod tests {
             target: None,
             writable: false,
         };
-        assert!(mount.resolve().is_none());
+        assert!(mount.resolve(WS).is_none());
     }
 
     #[test]
@@ -485,9 +432,9 @@ mod tests {
             target: Some(".envrc".into()),
             writable: false,
         };
-        let resolved = mount.resolve().unwrap();
+        let resolved = mount.resolve(WS).unwrap();
         assert_eq!(resolved.source, PathBuf::from("/dev/null"));
-        assert_eq!(resolved.target, "/workspace/.envrc");
+        assert_eq!(resolved.target, "/workspace/test-slug/.envrc");
     }
 
     #[test]
@@ -497,7 +444,7 @@ mod tests {
             target: Some("/container/tmp".into()),
             writable: false,
         };
-        let resolved = mount.resolve().unwrap();
+        let resolved = mount.resolve(WS).unwrap();
         assert_eq!(resolved.source, PathBuf::from("/tmp"));
         assert_eq!(resolved.target, "/container/tmp");
         assert!(!resolved.writable);
@@ -510,7 +457,7 @@ mod tests {
             target: Some("~/downloads".into()),
             writable: true,
         };
-        let resolved = mount.resolve().unwrap();
+        let resolved = mount.resolve(WS).unwrap();
         assert_eq!(resolved.target, "/root/downloads");
     }
 
@@ -521,54 +468,8 @@ mod tests {
             target: None,
             writable: true,
         };
-        let resolved = mount.resolve().unwrap();
+        let resolved = mount.resolve(WS).unwrap();
         assert_eq!(resolved.target, "/tmp");
-    }
-
-    #[test]
-    fn volume_string_read_only() {
-        let m = ResolvedMount {
-            source: PathBuf::from("/home/user/.config/git"),
-            target: "/root/.config/git".into(),
-            writable: false,
-        };
-        assert_eq!(
-            m.to_volume_string(),
-            "/home/user/.config/git:/root/.config/git:ro"
-        );
-    }
-
-    #[test]
-    fn volume_string_read_write() {
-        let m = ResolvedMount {
-            source: PathBuf::from("/home/user/.local/share/ranger"),
-            target: "/root/.local/share/ranger".into(),
-            writable: true,
-        };
-        assert_eq!(
-            m.to_volume_string(),
-            "/home/user/.local/share/ranger:/root/.local/share/ranger"
-        );
-    }
-
-    #[test]
-    fn display_target_read_only() {
-        let m = ResolvedMount {
-            source: PathBuf::from("/x"),
-            target: "/root/.config/git".into(),
-            writable: false,
-        };
-        assert_eq!(m.display_target(), "/root/.config/git (ro)");
-    }
-
-    #[test]
-    fn display_target_read_write() {
-        let m = ResolvedMount {
-            source: PathBuf::from("/x"),
-            target: "/root/.local/share/ranger".into(),
-            writable: true,
-        };
-        assert_eq!(m.display_target(), "/root/.local/share/ranger");
     }
 
     #[test]
@@ -586,160 +487,72 @@ mod tests {
                     writable: false,
                 },
             ],
-            pi: vec![],
             env: HashMap::new(),
         };
-        let resolved = config.resolve_mounts();
+        let resolved = config.resolve_mounts(WS);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].target, "/container/tmp");
     }
 
     #[test]
     fn scope_display() {
+        assert_eq!(Scope::Binary.to_string(), "binary");
         assert_eq!(Scope::User.to_string(), "user");
         assert_eq!(Scope::Project.to_string(), "project");
-        assert_eq!(Scope::Builtin.to_string(), "builtin");
+    }
+
+    fn layer(scope: Scope, mounts: Vec<ResolvedMount>) -> ConfigLayer {
+        ConfigLayer {
+            scope,
+            path: None,
+            mounts,
+            env: HashMap::new(),
+        }
+    }
+
+    fn mount(source: &str, target: &str, writable: bool) -> ResolvedMount {
+        ResolvedMount {
+            source: PathBuf::from(source),
+            target: target.into(),
+            writable,
+        }
     }
 
     #[test]
     fn merged_mounts_accumulates_across_layers() {
         let config = ScopedConfig {
             layers: vec![
-                ConfigLayer {
-                    scope: Scope::User,
-                    path: Some(PathBuf::from("/user/config.kdl")),
-                    mounts: vec![ResolvedMount {
-                        source: PathBuf::from("/a"),
-                        target: "/a".into(),
-                        writable: false,
-                    }],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Project,
-                    path: Some(PathBuf::from("/project/config.kdl")),
-                    mounts: vec![ResolvedMount {
-                        source: PathBuf::from("/b"),
-                        target: "/b".into(),
-                        writable: true,
-                    }],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
-            ],
-        };
-        let merged = config.merged_mounts();
-        assert_eq!(merged.len(), 2);
-        let a = merged.iter().find(|sv| sv.value.target == "/a").unwrap();
-        assert_eq!(a.scope, Scope::User);
-        let b = merged.iter().find(|sv| sv.value.target == "/b").unwrap();
-        assert_eq!(b.scope, Scope::Project);
-    }
-
-    #[test]
-    fn merged_mounts_single_layer() {
-        let config = ScopedConfig {
-            layers: vec![ConfigLayer {
-                scope: Scope::User,
-                path: Some(PathBuf::from("/user/config.kdl")),
-                mounts: vec![ResolvedMount {
-                    source: PathBuf::from("/a"),
-                    target: "/a".into(),
-                    writable: false,
-                }],
-                pi: vec![],
-                env: HashMap::new(),
-            }],
-        };
-        let merged = config.merged_mounts();
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].value.target, "/a");
-    }
-
-    #[test]
-    fn merged_mounts_all_three_layers() {
-        let config = ScopedConfig {
-            layers: vec![
-                ConfigLayer {
-                    scope: Scope::User,
-                    path: Some(PathBuf::from("/user/config.kdl")),
-                    mounts: vec![ResolvedMount {
-                        source: PathBuf::from("/a"),
-                        target: "/a".into(),
-                        writable: false,
-                    }],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Project,
-                    path: Some(PathBuf::from("/project/config.kdl")),
-                    mounts: vec![ResolvedMount {
-                        source: PathBuf::from("/b"),
-                        target: "/b".into(),
-                        writable: true,
-                    }],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Builtin,
-                    path: None,
-                    mounts: vec![ResolvedMount {
-                        source: PathBuf::from("/c"),
-                        target: "/c".into(),
-                        writable: true,
-                    }],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
+                layer(Scope::Binary, vec![mount("/a", "/a", false)]),
+                layer(Scope::User, vec![mount("/b", "/b", true)]),
+                layer(Scope::Project, vec![mount("/c", "/c", true)]),
             ],
         };
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 3);
         let a = merged.iter().find(|sv| sv.value.target == "/a").unwrap();
-        assert_eq!(a.scope, Scope::User);
+        assert_eq!(a.scope, Scope::Binary);
         let b = merged.iter().find(|sv| sv.value.target == "/b").unwrap();
-        assert_eq!(b.scope, Scope::Project);
+        assert_eq!(b.scope, Scope::User);
         let c = merged.iter().find(|sv| sv.value.target == "/c").unwrap();
-        assert_eq!(c.scope, Scope::Builtin);
+        assert_eq!(c.scope, Scope::Project);
     }
 
     #[test]
     fn merged_mounts_deduplicates_by_target() {
         let config = ScopedConfig {
             layers: vec![
-                ConfigLayer {
-                    scope: Scope::User,
-                    path: Some(PathBuf::from("/user/config.kdl")),
-                    mounts: vec![
-                        ResolvedMount {
-                            source: PathBuf::from("/user/git"),
-                            target: "/root/.config/git".into(),
-                            writable: false,
-                        },
-                        ResolvedMount {
-                            source: PathBuf::from("/user/jj"),
-                            target: "/root/.config/jj".into(),
-                            writable: false,
-                        },
+                layer(
+                    Scope::User,
+                    vec![
+                        mount("/user/git", "/root/.config/git", false),
+                        mount("/user/jj", "/root/.config/jj", false),
                     ],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Project,
-                    path: Some(PathBuf::from("/project/config.kdl")),
-                    mounts: vec![ResolvedMount {
-                        // Override the user git mount with a different source
-                        source: PathBuf::from("/project/git"),
-                        target: "/root/.config/git".into(),
-                        writable: true,
-                    }],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
+                ),
+                layer(
+                    Scope::Project,
+                    // Override the user git mount with a different source
+                    vec![mount("/project/git", "/root/.config/git", true)],
+                ),
             ],
         };
         let merged = config.merged_mounts();
@@ -760,11 +573,79 @@ mod tests {
     }
 
     #[test]
+    fn merged_mounts_orders_parents_before_children() {
+        let config = ScopedConfig {
+            layers: vec![
+                layer(
+                    Scope::Binary,
+                    vec![mount("/host/agents-md", "/root/.pi/agent/AGENTS.md", false)],
+                ),
+                layer(
+                    Scope::User,
+                    vec![mount("/host/agent-dir", "/root/.pi/agent", true)],
+                ),
+            ],
+        };
+        let merged = config.merged_mounts();
+        let targets: Vec<&str> = merged.iter().map(|sv| sv.value.target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["/root/.pi/agent", "/root/.pi/agent/AGENTS.md"]
+        );
+    }
+
+    #[test]
+    fn dev_null_mask_removes_inherited_mount() {
+        let config = ScopedConfig {
+            layers: vec![
+                layer(
+                    Scope::Binary,
+                    vec![mount("/host/skills", "/root/.pi/agent/skills", false)],
+                ),
+                layer(
+                    Scope::Project,
+                    vec![mount("/dev/null", "/root/.pi/agent/skills", false)],
+                ),
+            ],
+        };
+        let merged = config.merged_mounts();
+        assert!(merged.is_empty(), "mask should remove the inherited mount");
+    }
+
+    #[test]
+    fn dev_null_without_inherited_mount_stays_a_bind() {
+        let config = ScopedConfig {
+            layers: vec![layer(
+                Scope::Project,
+                vec![mount("/dev/null", "/workspace/test-slug/.envrc", false)],
+            )],
+        };
+        let merged = config.merged_mounts();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].value.source, PathBuf::from("/dev/null"));
+    }
+
+    #[test]
+    fn mount_overriding_mask_survives() {
+        let config = ScopedConfig {
+            layers: vec![
+                layer(Scope::Binary, vec![mount("/host/skills", "/s", false)]),
+                layer(Scope::User, vec![mount("/dev/null", "/s", false)]),
+                layer(Scope::Project, vec![mount("/project/skills", "/s", false)]),
+            ],
+        };
+        let merged = config.merged_mounts();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].value.source, PathBuf::from("/project/skills"));
+        assert_eq!(merged[0].scope, Scope::Project);
+    }
+
+    #[test]
     fn load_with_no_project_config() {
         // Use a workspace with no .ramekin/config.kdl
-        let config = Config::load(Path::new("/tmp"), vec![]).unwrap();
-        // Builtin layer is always last
-        assert_eq!(config.layers.last().unwrap().scope, Scope::Builtin);
+        let config = Config::load(Path::new("/tmp"), WS).unwrap();
+        // Binary layer is always first (lowest precedence)
+        assert_eq!(config.layers.first().unwrap().scope, Scope::Binary);
         // No project layer
         assert!(!config.layers.iter().any(|l| l.scope == Scope::Project));
     }
@@ -782,9 +663,9 @@ mod tests {
         )
         .unwrap();
 
-        let config = Config::load(dir.path(), vec![]).unwrap();
+        let config = Config::load(dir.path(), WS).unwrap();
 
-        // Should have project + builtin layers
+        // Should have binary + project layers
         assert!(config.layers.len() >= 2);
         let project_layer = config
             .layers
@@ -793,381 +674,8 @@ mod tests {
             .expect("project layer missing");
         assert_eq!(project_layer.mounts.len(), 2);
         assert_eq!(project_layer.mounts[0].target, "/container/tmp");
-        // Builtin is always last (highest precedence)
-        assert_eq!(config.layers.last().unwrap().scope, Scope::Builtin);
-    }
-
-    #[test]
-    fn kdl_pi_entries() {
-        let kdl = r#"
-            pi {
-                source "~/.dotfiles/ai/AGENTS.md"
-            }
-            pi {
-                source "~/.dotfiles/ai/skills"
-            }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert!(parsed.mounts.is_empty());
-        assert_eq!(parsed.pi.len(), 2);
-        assert_eq!(parsed.pi[0].source, "~/.dotfiles/ai/AGENTS.md");
-        assert_eq!(parsed.pi[0].target, None);
-        assert_eq!(parsed.pi[1].source, "~/.dotfiles/ai/skills");
-    }
-
-    #[test]
-    fn kdl_pi_with_explicit_target() {
-        let kdl = r#"
-            pi {
-                source "~/.dotfiles/ai/my-project-skills"
-                target "skills"
-            }
-            pi {
-                source "~/.dotfiles/ai/AGENTS.md"
-            }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert_eq!(parsed.pi.len(), 2);
-        assert_eq!(parsed.pi[0].target, Some("skills".into()));
-        assert_eq!(parsed.pi[1].target, None);
-    }
-
-    #[test]
-    fn kdl_dash_notation_pi() {
-        let kdl = r#"
-            pi {
-                - { source "~/.dotfiles/ai/_AGENTS.md"; target "AGENTS.md" }
-                - { source "~/.dotfiles/ai/skills" }
-            }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert_eq!(parsed.pi.len(), 2);
-        assert_eq!(parsed.pi[0].source, "~/.dotfiles/ai/_AGENTS.md");
-        assert_eq!(parsed.pi[0].target, Some("AGENTS.md".into()));
-        assert_eq!(parsed.pi[1].source, "~/.dotfiles/ai/skills");
-        assert_eq!(parsed.pi[1].target, None);
-    }
-
-    #[test]
-    fn kdl_dash_notation_mounts_writable() {
-        let kdl = r#"
-            mounts {
-                - { source "~/.local/share/ranger"; writable }
-            }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert_eq!(parsed.mounts.len(), 1);
-        assert!(parsed.mounts[0].writable);
-    }
-
-    #[test]
-    fn kdl_no_pi_section() {
-        let kdl = r#"
-            mounts {
-                source "/tmp"
-                target "/container/tmp"
-            }
-            mounts {
-                source "/tmp"
-                target "/container/tmp2"
-            }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert!(parsed.pi.is_empty());
-        assert_eq!(parsed.mounts.len(), 2);
-    }
-
-    #[test]
-    fn kdl_pi_and_mounts_together() {
-        let kdl = r#"
-            mounts {
-                source "~/.config/git"
-            }
-            mounts {
-                source "~/.config/jj"
-            }
-            pi {
-                source "~/.dotfiles/ai/AGENTS.md"
-            }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert_eq!(parsed.mounts.len(), 2);
-        assert_eq!(parsed.pi.len(), 1);
-        assert_eq!(parsed.pi[0].source, "~/.dotfiles/ai/AGENTS.md");
-    }
-
-    #[test]
-    fn clear_agent_dir_preserves_auth_json() {
-        let agent_dir = tempfile::tempdir().unwrap();
-
-        fs_err::write(agent_dir.path().join("auth.json"), "secret").unwrap();
-        fs_err::write(agent_dir.path().join("AGENTS.md"), "old").unwrap();
-        fs_err::write(agent_dir.path().join("settings.json"), "{}").unwrap();
-        fs_err::create_dir_all(agent_dir.path().join("skills")).unwrap();
-        fs_err::write(agent_dir.path().join("skills/x.md"), "x").unwrap();
-
-        clear_agent_dir(agent_dir.path()).unwrap();
-
-        assert!(agent_dir.path().join("auth.json").exists());
-        assert_eq!(
-            fs_err::read_to_string(agent_dir.path().join("auth.json")).unwrap(),
-            "secret"
-        );
-        assert!(!agent_dir.path().join("AGENTS.md").exists());
-        assert!(!agent_dir.path().join("settings.json").exists());
-        assert!(!agent_dir.path().join("skills").exists());
-    }
-
-    #[test]
-    fn clear_agent_dir_handles_empty_dir() {
-        let agent_dir = tempfile::tempdir().unwrap();
-        clear_agent_dir(agent_dir.path()).unwrap();
-    }
-
-    #[test]
-    fn clear_agent_dir_handles_nonexistent_dir() {
-        clear_agent_dir(Path::new("/nonexistent/path")).unwrap();
-    }
-
-    #[test]
-    fn assemble_pi_copies_file() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let agent_dir = tempfile::tempdir().unwrap();
-
-        let prompt = src_dir.path().join("AGENTS.md");
-        fs_err::write(&prompt, "# my prompt").unwrap();
-
-        let entries = vec![ResolvedPiEntry {
-            source: prompt,
-            target: "AGENTS.md".into(),
-        }];
-
-        assemble_pi(agent_dir.path(), &entries).unwrap();
-
-        assert_eq!(
-            fs_err::read_to_string(agent_dir.path().join("AGENTS.md")).unwrap(),
-            "# my prompt"
-        );
-    }
-
-    #[test]
-    fn assemble_pi_copies_directory() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let agent_dir = tempfile::tempdir().unwrap();
-
-        let skills = src_dir.path().join("skills");
-        fs_err::create_dir_all(skills.join("my-skill")).unwrap();
-        fs_err::write(skills.join("my-skill/SKILL.md"), "# skill").unwrap();
-
-        let entries = vec![ResolvedPiEntry {
-            source: skills,
-            target: "skills".into(),
-        }];
-
-        assemble_pi(agent_dir.path(), &entries).unwrap();
-
-        assert_eq!(
-            fs_err::read_to_string(agent_dir.path().join("skills/my-skill/SKILL.md")).unwrap(),
-            "# skill"
-        );
-    }
-
-    #[test]
-    fn assemble_pi_skips_missing_source() {
-        let agent_dir = tempfile::tempdir().unwrap();
-
-        let entries = vec![ResolvedPiEntry {
-            source: PathBuf::from("/nonexistent/file"),
-            target: "file".into(),
-        }];
-
-        assemble_pi(agent_dir.path(), &entries).unwrap();
-        assert!(!agent_dir.path().join("file").exists());
-    }
-
-    #[test]
-    fn pi_resolve_defaults_target_to_basename() {
-        let entry = PiEntry {
-            source: "~/.dotfiles/ai/AGENTS.md".into(),
-            target: None,
-        };
-        let resolved = entry.resolve();
-        assert_eq!(resolved.target, "AGENTS.md");
-    }
-
-    #[test]
-    fn pi_resolve_defaults_target_to_directory_basename() {
-        let entry = PiEntry {
-            source: "~/.dotfiles/ai/skills".into(),
-            target: None,
-        };
-        let resolved = entry.resolve();
-        assert_eq!(resolved.target, "skills");
-    }
-
-    #[test]
-    fn pi_resolve_uses_explicit_target() {
-        let entry = PiEntry {
-            source: "~/.dotfiles/ai/my-project-skills".into(),
-            target: Some("skills".into()),
-        };
-        let resolved = entry.resolve();
-        assert_eq!(resolved.target, "skills");
-    }
-
-    #[test]
-    fn clear_then_assemble_full_cycle() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let agent_dir = tempfile::tempdir().unwrap();
-
-        // Simulate previous run state.
-        fs_err::write(agent_dir.path().join("auth.json"), "secret").unwrap();
-        fs_err::write(agent_dir.path().join("AGENTS.md"), "old prompt").unwrap();
-        fs_err::create_dir_all(agent_dir.path().join("old-skills")).unwrap();
-
-        // New config only has a prompt.
-        let prompt = src_dir.path().join("AGENTS.md");
-        fs_err::write(&prompt, "new prompt").unwrap();
-
-        clear_agent_dir(agent_dir.path()).unwrap();
-
-        let entries = vec![ResolvedPiEntry {
-            source: prompt,
-            target: "AGENTS.md".into(),
-        }];
-        assemble_pi(agent_dir.path(), &entries).unwrap();
-
-        // auth.json preserved.
-        assert_eq!(
-            fs_err::read_to_string(agent_dir.path().join("auth.json")).unwrap(),
-            "secret"
-        );
-        // New prompt copied.
-        assert_eq!(
-            fs_err::read_to_string(agent_dir.path().join("AGENTS.md")).unwrap(),
-            "new prompt"
-        );
-        // Old stale dir gone.
-        assert!(!agent_dir.path().join("old-skills").exists());
-    }
-
-    #[test]
-    fn merged_pi_accumulates() {
-        let config = ScopedConfig {
-            layers: vec![
-                ConfigLayer {
-                    scope: Scope::User,
-                    path: None,
-                    mounts: vec![],
-                    pi: vec![PiEntry {
-                        source: "~/.dotfiles/AGENTS.md".into(),
-                        target: None,
-                    }],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Project,
-                    path: None,
-                    mounts: vec![],
-                    pi: vec![PiEntry {
-                        source: "/project/skills".into(),
-                        target: None,
-                    }],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Builtin,
-                    path: None,
-                    mounts: vec![],
-                    pi: vec![],
-                    env: HashMap::new(),
-                },
-            ],
-        };
-        let merged = config.merged_pi();
-        assert_eq!(merged.len(), 2);
-        let agents = merged
-            .iter()
-            .find(|sv| sv.value.source == "~/.dotfiles/AGENTS.md")
-            .unwrap();
-        assert_eq!(agents.scope, Scope::User);
-        let skills = merged
-            .iter()
-            .find(|sv| sv.value.source == "/project/skills")
-            .unwrap();
-        assert_eq!(skills.scope, Scope::Project);
-    }
-
-    #[test]
-    fn merged_pi_deduplicates_by_resolved_target() {
-        let config = ScopedConfig {
-            layers: vec![
-                ConfigLayer {
-                    scope: Scope::User,
-                    path: None,
-                    mounts: vec![],
-                    pi: vec![PiEntry {
-                        source: "~/.dotfiles/AGENTS.md".into(),
-                        target: None,
-                    }],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Project,
-                    path: None,
-                    mounts: vec![],
-                    pi: vec![PiEntry {
-                        source: "/project/AGENTS.md".into(),
-                        target: None,
-                    }],
-                    env: HashMap::new(),
-                },
-            ],
-        };
-        let merged = config.merged_pi();
-        assert_eq!(merged.len(), 1);
-        // Project wins.
-        let entry = merged
-            .iter()
-            .find(|sv| sv.value.source == "/project/AGENTS.md")
-            .unwrap();
-        assert_eq!(entry.scope, Scope::Project);
-    }
-
-    #[test]
-    fn merged_pi_explicit_target_deduplicates_with_basename() {
-        let config = ScopedConfig {
-            layers: vec![
-                ConfigLayer {
-                    scope: Scope::User,
-                    path: None,
-                    mounts: vec![],
-                    pi: vec![PiEntry {
-                        source: "~/.dotfiles/ai/skills".into(),
-                        target: None,
-                    }],
-                    env: HashMap::new(),
-                },
-                ConfigLayer {
-                    scope: Scope::Project,
-                    path: None,
-                    mounts: vec![],
-                    pi: vec![PiEntry {
-                        source: "/project/my-custom-skills".into(),
-                        target: Some("skills".into()),
-                    }],
-                    env: HashMap::new(),
-                },
-            ],
-        };
-        let merged = config.merged_pi();
-        assert_eq!(merged.len(), 1);
-        // Project wins — explicit target "skills" matches user's basename "skills".
-        let entry = merged
-            .iter()
-            .find(|sv| sv.value.source == "/project/my-custom-skills")
-            .unwrap();
-        assert_eq!(entry.scope, Scope::Project);
+        // Binary is always first (lowest precedence)
+        assert_eq!(config.layers.first().unwrap().scope, Scope::Binary);
     }
 
     #[test]
@@ -1208,14 +716,12 @@ mod tests {
                     scope: Scope::User,
                     path: None,
                     mounts: vec![],
-                    pi: vec![],
                     env: user_env,
                 },
                 ConfigLayer {
                     scope: Scope::Project,
                     path: None,
                     mounts: vec![],
-                    pi: vec![],
                     env: project_env,
                 },
             ],
