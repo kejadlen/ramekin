@@ -27,15 +27,16 @@ Three tiers, by rate of change:
 
 - **The binary** holds globals — anything stable across machines and
   projects that's a fact about the tools or their one user: agent plumbing,
-  staple mounts, tree layout, session model. Changing these is an edit +
-  `just install`, which is the loop this repo already lives in. Config files
-  never restate them.
-- **The filesystem** holds content — memory files, skills, settings — as
-  real files in conventional locations. Sharing across machines is a
-  dotfiles symlink, not a ramekin feature.
+  which agent files are config vs state, staple mounts, session model.
+  Changing these is an edit + `just install`, which is the loop this repo
+  already lives in. Config files never restate them.
+- **The host's existing files** hold content. Agent config (memory files,
+  skills, settings) lives where the agents already look for it locally —
+  `~/.claude/`, `~/.pi/agent/` — managed by dotfiles like everything else.
+  Ramekin maintains no parallel copy of any of it.
 - **KDL** holds the remainder — profile definitions, env, and the genuinely
   irregular, mostly per-project: extra mounts, masks, a profile override.
-  Small, optional, and mostly living in the shared user tree.
+  Small, optional.
 
 ## Lessons from the prototypes
 
@@ -57,15 +58,46 @@ per-agent.
 
 ## Design
 
+### Agent config: the host's own, mounted read-only
+
+The agents are also used locally, so their config already exists on the host
+in the dirs they define — no ramekin-owned tree duplicates it. The binary
+carries an allowlist per agent of the *config-shaped* entries in those dirs:
+
+- claude: `~/.claude/CLAUDE.md`, `settings.json`, `skills/`, `agents/`,
+  `commands/` (exact list to finalize)
+- pi: `~/.pi/agent/AGENTS.md`, `skills/` (exact list to finalize)
+
+Each entry that exists on the host mounts **read-only** at its normal path
+inside the container, layered over the container's own persistent agent
+state. Missing entries are skipped, like staples. The allowlist matters
+because the same host dirs also hold runtime state — host credentials,
+transcripts, caches — which must *not* leak into the container; the
+container has its own persistent state (below).
+
+Project-level agent config costs ramekin nothing: it rides the workspace
+mount, and both agents natively layer their own project config (`.claude/`,
+`CLAUDE.md` / `AGENTS.md` in the repo). Ramekin adds no merge machinery on
+top of layering the agents already implement.
+
+When some host config shouldn't apply in the container (say, host
+`settings.json` hooks that invoke host-only tools), ordinary KDL mounts
+override or mask it: mount a different source at that target, or `/dev/null`
+it. In-container edits to any of this fail loudly — the outbox is the write
+path.
+
+Host agent dirs commonly symlink into dotfiles; ramekin canonicalizes each
+entry when generating mounts, since bind sources need real paths.
+
 ### Profiles: KDL bundles of agent + provider
 
 A profile is a named bundle: agent, env vars, extra mounts. The binary
 ships only the two trivial ones — `pi` and `claude`, bare agent with no
 provider plumbing — so ramekin runs with zero config. Everything richer is
-defined in KDL, normally in the user tree so it shares via dotfiles:
+defined in KDL:
 
 ```kdl
-// ~/.config/ramekin/config.kdl
+// ~/.config/ramekin/profiles.kdl — symlinked from dotfiles, shared
 profile "claude-bedrock" {
     agent "claude"
     env CLAUDE_CODE_USE_BEDROCK="1"
@@ -90,18 +122,9 @@ lines of KDL, not a release.
 Selection, lowest to highest precedence:
 
 1. binary default (`pi`)
-2. `profile "claude-bedrock"` in user KDL — the per-machine default. The
-   work machine's user config names `claude-bedrock`; home names `claude`
-   or `pi-glm`.
+2. `profile "claude-bedrock"` in user KDL — the per-machine default
 3. `profile "pi"` in project KDL — this repo wants this profile
 4. `ramekin -p pi-glm` — this run wants this profile
-
-The machine default living in the user tree means that tree is *not*
-symlinked wholesale into dotfiles: profile definitions and content entries
-are shared (symlinked per entry, or via whatever host-specific mechanism
-the dotfiles already use), while the `profile` selection line stays
-machine-local. Symlink granularity is a dotfiles decision, not a ramekin
-one.
 
 Profile selection subsumes agent selection; there is no separate `--agent`.
 Model choice *within* a provider stays out of profiles — that's per-run
@@ -109,79 +132,41 @@ agent args after `--`.
 
 Provider credentials never appear in config: passthrough env forwards host
 values at run time, the AWS mount carries its own files, and OAuth lives in
-persistent agent state. Layered `env` (below) can adjust a profile's
-variables (e.g. a different `AWS_PROFILE` for one project) without defining
-new profiles.
+the container's persistent agent state.
 
-### Staple mounts: hardcoded, overridable
+### Config files: three KDL layers
 
-The mounts every machine wants — `~/.config/git` and `~/.config/jj`,
-read-only — move into the binary as a builtin layer. Mount resolution
-already skips missing sources, so machines lacking one pay nothing. Unlike
-the workspace/state/outbox mounts (still non-overridable), staples sit at
-the *bottom* of the precedence order: any tree can override one by target or
-mask it with `/dev/null`.
+KDL carries profiles (definition and selection), `env`, and `mounts` —
+nothing content-shaped. Layers, lowest to highest precedence:
 
-The bar for a staple is "true on every machine". Ranger, for example, isn't
-— it stays a user-KDL mount on the machines that have it:
+1. **binary** — staples (`~/.config/git`, `~/.config/jj`, read-only,
+   skip-if-missing, overridable by any layer; the bar for a staple is
+   "true on every machine" — ranger isn't, so it stays user KDL), trivial
+   profiles, the agent-config allowlist
+2. **user** — every `*.kdl` in `~/.config/ramekin/`, merged as one layer;
+   defining the same key twice within the layer is an error. Sharing is
+   per-file symlinks into dotfiles: `profiles.kdl` is shared, while
+   `config.kdl` stays machine-local and holds the machine's default
+   `profile` selection and machine-only mounts (ranger). Symlink
+   granularity is a dotfiles decision, not a ramekin one.
+3. **project** — `<workspace>/.ramekin/config.kdl`, committed
+4. **project-local** — `<workspace>/.ramekin/config.local.kdl`, gitignored
+5. **CLI** — `-p`; `--mount`/`--env` when they earn their keep
 
-```kdl
-mounts {
-    source "~/.local/share/ranger"
-    writable
-}
-```
-
-### Config trees: content by convention
-
-Two trees, at hardcoded locations. A tree is a directory:
-
-```
-<tree>/
-  config.kdl    # profile definitions/selection, mounts, env
-  pi/           # contents land in /root/.pi/agent/, read-only
-  claude/       # contents land in /root/.claude/, read-only
-  Dockerfile    # project image layer (project tree only)
-```
-
-Env stays in KDL rather than a dotenv file: profile env is already KDL, so
-a separate file would split one concern across two syntaxes, and the
-bare-name passthrough form (`env AWS_PROFILE`) isn't standard dotenv anyway.
-The line between KDL and filesystem is *file-shaped content* (memory files,
-skills, settings) versus *key-value facts* — env is the latter.
-
-- **user** `~/.config/ramekin/` — shared across machines by symlinking it
-  (or entries within it) into dotfiles. No `include` keyword: the symlink is
-  the include, managed by the same mechanism as every other dotfile.
-- **project** `<workspace>/.ramekin/` — committed to the repo.
-- **project-local** `<workspace>/.ramekin/local/` — gitignored nested tree
-  for facts about this checkout on this machine; can override content as
-  well as KDL.
-
-Adding a skill is dropping a directory into `claude/skills/` — no KDL.
-Symlinks inside a tree work (`claude/CLAUDE.md → ../ai/CLAUDE.md`), so agent
-subtrees share sources without duplication; ramekin canonicalizes per entry
-when generating mounts.
-
-Precedence, lowest to highest: binary (staples, trivial profiles) → user →
-project → project-local → CLI. Merging: agent-tree contents dedupe by
-top-level entry name (`CLAUDE.md`, `skills/`, `settings.json`), higher tree
-wins the whole entry; `env` merges per variable, overlaying the active
-profile's env, so any tree can adjust one variable without redefining the
-profile; KDL mounts dedupe by resolved target; scalars last-writer-wins.
-
-At run time each winning agent-tree entry becomes a **read-only** bind mount
-in the active agent's config dir. Only the subtree matching the active
-profile's agent applies; the other is inert. There is no writable variant —
-the outbox is the write path.
+Merging: `env` merges per variable, overlaying the active profile's env, so
+any layer can adjust one variable without redefining the profile; mounts
+dedupe by resolved target; profiles by name; scalars last-writer-wins;
+`/dev/null` masking removes an inherited mount. A project `Dockerfile`
+stays at `.ramekin/Dockerfile`, beside the KDL.
 
 ### Session model
 
 Every path a run touches is either read-only **config** (staple mounts and
-agent-tree entries — immutable from the container, so sessions can't fight
-over it), **session plumbing** (the compose file and project name under a
-random session id, the rendered `ramekin-prompt.md` mounted read-only, the
-outbox), or **agent runtime state** — which is not one bucket but three:
+host agent-config mounts — immutable from the container, so sessions can't
+fight over it), **session plumbing** (the compose file and project name
+under a random session id, the rendered `ramekin-prompt.md` mounted
+read-only, the outbox), or **agent runtime state** — which is not one
+bucket but three:
 
 | scope | claude | pi |
 |---|---|---|
@@ -189,28 +174,33 @@ outbox), or **agent runtime state** — which is not one bucket but three:
 | per-project | `projects/<cwd>/` transcripts; the `projects` map entries inside `~/.claude.json` | `sessions/` (already split per-repo) |
 | ephemeral | `statsig/`, `todos/`, `shell-snapshots/`, `debug/` — caches and scratch | anything else it writes in its agent dir |
 
-State is per-agent, not per-profile: pi's auth file holds multiple providers
-by design, and claude's OAuth coexists with bedrock env. Concurrent access
-to the global bucket is the agent's own problem, which both agents already
-handle on a normal host.
+Container runtime state is the container's own, persisted under
+`$XDG_DATA_HOME/ramekin/agents/` — deliberately separate from the host
+agent state sitting next to the mounted host config. State is per-agent,
+not per-profile: pi's auth file holds multiple providers by design, and
+claude's OAuth coexists with bedrock env. Concurrent access to the global
+bucket is the agent's own problem, which both agents already handle on a
+normal host.
 
 The two agents get opposite persistence policies, chosen by failure mode:
 
 - **claude: persist by default, denylist the junk.** `~/.claude` and
   `~/.claude.json` mount persistently from `$XDG_DATA_HOME/ramekin/agents/`
   (global bucket), with fresh session-scoped dirs bound *over* the known
-  ephemeral subdirs. `~/.claude.json` can't be split by mounts — it mixes
-  global identity with per-project trust — but doesn't need to be: the
-  per-slug workspace mount partitions its `projects` map by cwd, and the
-  transcript dirs under `projects/` partition the same way. If claude grows
-  a new state file we haven't classified, it persists (worst case: rot)
-  rather than vanishing (worst case: lost auth, mystery re-onboarding).
+  ephemeral subdirs, and the host-config mounts (read-only) above that.
+  `~/.claude.json` can't be split by mounts — it mixes global identity with
+  per-project trust — but doesn't need to be: the per-slug workspace mount
+  partitions its `projects` map by cwd, and the transcript dirs under
+  `projects/` partition the same way. If claude grows a new state file we
+  haven't classified, it persists (worst case: rot) rather than vanishing
+  (worst case: lost auth, mystery re-onboarding).
 - **pi: ephemeral by default, allowlist what persists.** A fresh empty
   writable dir per session at `/root/.pi/agent`, with `auth.json` and the
-  per-repo `sessions/` dir bind-mounted on top and read-only config entries
-  above that. Nothing is ever cleared; the dir is new each time. Pi's
-  persistent surface is small and stable enough that the allowlist risk is
-  acceptable, and the session dir is already forced by config immutability.
+  per-repo `sessions/` dir bind-mounted on top and the read-only host-config
+  mounts above that. Nothing is ever cleared; the dir is new each time.
+  Pi's persistent surface is small and stable enough that the allowlist
+  risk is acceptable, and the session dir is already forced by config
+  immutability.
 
 One mechanical caveat shapes the bucket boundaries: agents update state
 files by write-temp-then-rename, and a rename onto a bind-mounted *file*
@@ -227,8 +217,18 @@ into the persistent set — or confirming it's junk — instead of discovering
 the omission via broken onboarding weeks later. Durable state never appears
 silently; it rhymes with the outbox.
 
-Workspaces mount at `/workspace/<slug>` for both agents (Claude needs the
-cwd isolation; pi doesn't care; uniformity wins). Base images build to
+Workspaces mount at a per-repo path derived from the slug — `/workspace/<slug>`
+— for both agents, never a shared `/workspace`. Anything either agent keys
+by cwd (claude's `projects` map and transcripts, pi's session grouping)
+needs distinct paths per repo; a fixed `/workspace` makes every repo look
+like the same project. Whether the slug sits under a `/workspace/` parent
+or at the root is cosmetic — the slug does the isolating — but the stable
+parent keeps the "changes under here reach the host" story simple in the
+rendered prompt. A possible simplification falls out: if pi groups sessions
+by cwd on its own, distinct workspace paths may make ramekin's per-repo
+`sessions/` mount redundant — verify against pi's actual layout.
+
+Base images build to
 per-agent tags (`ramekin-pi`, `ramekin-claude`); a project
 `.ramekin/Dockerfile` declares `ARG BASE` / `FROM ${BASE}` and ramekin
 passes the active agent's tag, so one project Dockerfile serves both.
@@ -246,21 +246,20 @@ The only outbound channel, same for both agents:
   the workspace and the agent state mounts.
 - `ramekin-prompt.md` tells the agent: shared config is read-only by design;
   to propose a change, write the changed file into the outbox mirroring the
-  config-dir layout and tell the user.
+  agent config layout and tell the user.
 - Host side, `ramekin outbox`:
   - `list` — pending proposals across sessions
-  - `diff` — difftastic against the source each entry was mounted from (a
-    proposal's relative path maps straight back to the winning config tree)
-  - `apply` — copy over the source after confirmation, drop the proposal
+  - `diff` — difftastic against the host source each entry was mounted from
+    (a proposal's relative path maps straight back to the host agent dir)
+  - `apply` — copy over the host source after confirmation, drop the
+    proposal; when the source is a dotfiles symlink, apply writes through
+    to the target, where jj picks it up as a normal working-copy edit
   - `discard`
-- After `apply`, the change is an ordinary working-copy edit in dotfiles;
-  jj takes it from there.
-
-Safety: the container writes only to a session-scoped empty dir; nothing
-reaches dotfiles without explicit `apply`; diffs run against known sources
-so a confused or malicious proposal is visible before it lands; proposals
-that don't map back to a configured source need an explicit destination to
-apply.
+- Safety: the container writes only to a session-scoped empty dir; nothing
+  reaches host config without explicit `apply`; diffs run against known
+  sources so a confused or malicious proposal is visible before it lands;
+  proposals that don't map back to an allowlisted entry need an explicit
+  destination to apply.
 
 ## Sequencing
 
@@ -268,31 +267,37 @@ Build on main; harvest `claude-code` commits where they fit (claude
 Dockerfile + managed settings, per-slug workspace, long-form binds, BuildKit
 secret, side-effect-free `config`) rather than rebasing the branch:
 
-1. Session model refactor on pi only: per-session agent dir, config trees
-   replace the `pi {}` block, tree entries become read-only bind mounts,
-   staples move into the binary, teardown report on discarded session-dir
-   writes. Multi-session works from here on.
+1. Session model refactor on pi only: per-session agent dir, host
+   agent-config mounts replace the `pi {}` block, staples move into the
+   binary, teardown report on discarded session-dir writes. Multi-session
+   works from here on.
 2. Claude support: agent plumbing, `Dockerfile.claude` (harvested),
    per-agent tags + `ARG BASE` project builds, ephemeral denylist mounts
    over `~/.claude` junk.
 3. Profiles: KDL `profile` blocks + builtin trivial profiles, user-KDL
-   machine default, project `profile` scalar, `-p`, env passthrough.
+   machine default, project `profile` scalar, `-p`, env passthrough,
+   user layer reads `*.kdl`.
 4. Outbox: mount + prompt section, then the `ramekin outbox` subcommand.
 
 ## Open questions
 
+- Finalize the agent-config allowlists: which entries of `~/.claude/` and
+  `~/.pi/agent/` are config-shaped (claude `hooks/`? `output-styles/`? pi
+  extensions, models config?). Skip-if-missing makes over-inclusion cheap.
 - Does pi tolerate a read-only `AGENTS.md`/`skills/` in its agent dir, and
   where does it write scratch files at runtime? The fresh writable session
   dir underneath the read-only binds should absorb anything — verify before
   step 1.
+- Does pi key sessions by cwd? If so, per-slug workspace mounts may obsolete
+  ramekin's per-repo `sessions/` mount (see session model).
 - Single-file bind mounts vs atomic renames: verify claude's write pattern
   for `~/.claude.json` and pi's for `auth.json` before trusting file binds;
   fall back to `CLAUDE_CONFIG_DIR` / directory-level mounts if renames break
   them.
 - The claude ephemeral denylist (`statsig/`, `todos/`, `shell-snapshots/`,
   `debug/`) is a best-current-guess; the teardown report exists to refine it.
-- Merge granularity for agent trees: top-level entry (proposed) means a
-  project overriding one skill shadows the whole `skills/` dir. Per-file
-  merging fixes that at the cost of many more mounts. Start coarse.
+- Should the container share the *host's* agent auth instead of keeping its
+  own? Currently: own state, so a containerized agent never holds host
+  tokens. Revisit only if double-login friction annoys.
 - Firewall sidecar (long-planned) intersects with the session model — each
   session's compose stack is where it would attach. Out of scope here.
