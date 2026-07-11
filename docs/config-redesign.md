@@ -100,15 +100,19 @@ defined in KDL:
 // ~/.config/ramekin/profiles.kdl — symlinked from dotfiles, shared
 profile "claude-bedrock" {
     agent "claude"
-    env CLAUDE_CODE_USE_BEDROCK="1"
-    env AWS_PROFILE            // bare = pass through the host value
+    env {
+        CLAUDE_CODE_USE_BEDROCK "1"
+        AWS_PROFILE              // bare = pass through the host value
+    }
     mounts { source "~/.aws" }
 }
 
 profile "pi-glm" {
     agent "pi"
-    env ANTHROPIC_BASE_URL="https://open.bigmodel.cn/api/anthropic"
-    env ZHIPU_API_KEY
+    env {
+        ANTHROPIC_BASE_URL "https://open.bigmodel.cn/api/anthropic"
+        ZHIPU_API_KEY
+    }
 }
 ```
 
@@ -137,7 +141,20 @@ the container's persistent agent state.
 ### Config files: three KDL layers
 
 KDL carries profiles (definition and selection), `env`, and `mounts` —
-nothing content-shaped. Layers, lowest to highest precedence:
+nothing content-shaped. `env` has exactly one syntax, at the top level of a
+layer or inside a profile: a block with one child node per variable, whose
+single argument is the value — omit the argument to pass the host's value
+through at run time. The current flat-props form (`env FOO="bar"`) goes
+away; one shape, no synonyms.
+
+```kdl
+env {
+    RUST_BACKTRACE "1"
+    GITHUB_TOKEN            // forwarded from the host environment
+}
+```
+
+Layers, lowest to highest precedence:
 
 1. **binary** — staples (`~/.config/git`, `~/.config/jj`, read-only,
    skip-if-missing, overridable by any layer; the bar for a staple is
