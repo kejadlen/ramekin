@@ -1,7 +1,8 @@
 # Config redesign
 
-Status: in progress (2026-07) — step 1 of the sequencing (session model on
-pi) is implemented. Ramekin is single-user; this design leans on that
+Status: implemented (2026-07) — all four steps of the sequencing have
+landed; the open questions below remain to verify against the real agents.
+Ramekin is single-user; this design leans on that
 hard. The `claude-code` branch is a prototype to learn from, not a baseline
 to preserve.
 
