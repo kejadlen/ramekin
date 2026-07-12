@@ -132,7 +132,7 @@ impl Ramekin {
             .is_file()
             .then_some(custom_dockerfile_path);
 
-        let config = config::Config::load(&workspace, &workspace_target)
+        let config = config::ScopedConfig::load(&workspace, &workspace_target)
             .wrap_err("failed to load ramekin configuration")?;
 
         Ok(Self {
@@ -304,7 +304,10 @@ impl Ramekin {
             for scope in scopes {
                 println!("  {}", scope_label(scope));
                 for sv in merged_env.iter().filter(|sv| sv.scope == scope) {
-                    println!("    {}={}", sv.value.0, sv.value.1);
+                    match &sv.value.value {
+                        Some(value) => println!("    {}={value}", sv.value.name),
+                        None => println!("    {} (passed through from host)", sv.value.name),
+                    }
                 }
             }
         }
@@ -620,7 +623,7 @@ fn generate_compose(
     dockerfile: &Path,
     build_context: &Path,
     mounts: &[&config::ResolvedMount],
-    env_vars: &[config::ScopedValue<(&str, &str)>],
+    env_vars: &[config::ScopedValue<&config::EnvVar>],
     image: &str,
     working_dir: &str,
     pi_args: &[String],
@@ -635,9 +638,15 @@ fn generate_compose(
         })
         .collect();
 
+    // A bare name (no value) is compose's passthrough form: the variable is
+    // forwarded from the environment ramekin runs in, and stays unset in the
+    // container when the host doesn't have it either.
     let environment: Vec<String> = env_vars
         .iter()
-        .map(|sv| format!("{}={}", sv.value.0, sv.value.1))
+        .map(|sv| match &sv.value.value {
+            Some(value) => format!("{}={value}", sv.value.name),
+            None => sv.value.name.clone(),
+        })
         .collect();
 
     // Always pass --append-system-prompt for the ramekin container context.

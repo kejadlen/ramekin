@@ -12,13 +12,12 @@ miette = { version = "*", features = ["fancy"] }
 fastrand = "*"
 fs-err = "*"
 serde = { version = "*", features = ["derive"] }
-# Pinned to prerelease — alpha.4 fixes serde defaults with bare KDL values.
-serde-kdl2 = "0.1.1-alpha.6"
 serde_yaml = "*"
 shellexpand = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter"] }
 xdg = "*"
+kdl = "*"
 
 [dev-dependencies]
 tempfile = "*"

@@ -1,38 +1,21 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use miette::{Context, IntoDiagnostic, Result};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct Config {
-    #[serde(default)]
-    pub mounts: Vec<Mount>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
-
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct Mount {
-    pub source: String,
-    pub target: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "serde_kdl2::bare_defaults::bool::bare_true"
-    )]
-    pub writable: bool,
-}
+use kdl::{KdlDocument, KdlNode};
+use miette::{Context, IntoDiagnostic, Result, bail, miette};
 
 /// Configuration scope, ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// Compiled into the binary: staples and host agent-config mounts.
     Binary,
-    /// User-level `~/.config/ramekin/config.kdl`.
+    /// The user layer: every `*.kdl` in `~/.config/ramekin/`, merged.
     User,
-    /// Project-level `<workspace>/.ramekin/config.kdl`.
+    /// Project-level `<workspace>/.ramekin/config.kdl`, committed.
     Project,
+    /// Project-local `<workspace>/.ramekin/config.local.kdl`, gitignored.
+    ProjectLocal,
 }
 
 impl fmt::Display for Scope {
@@ -41,18 +24,55 @@ impl fmt::Display for Scope {
             Self::Binary => write!(f, "binary"),
             Self::User => write!(f, "user"),
             Self::Project => write!(f, "project"),
+            Self::ProjectLocal => write!(f, "project-local"),
         }
     }
 }
 
-/// A single configuration layer: a scope, an optional file path, and resolved mounts.
+/// A mount as written in config: unexpanded paths, optional target.
+#[derive(Debug, PartialEq)]
+pub struct Mount {
+    pub source: String,
+    pub target: Option<String>,
+    pub writable: bool,
+}
+
+/// A mount with tilde-expanded paths ready for Docker.
+#[derive(Debug, PartialEq, Clone)]
+pub struct ResolvedMount {
+    pub source: PathBuf,
+    pub target: String,
+    pub writable: bool,
+}
+
+impl ResolvedMount {
+    /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
+    pub fn display_target(&self) -> String {
+        if self.writable {
+            self.target.clone()
+        } else {
+            format!("{} (ro)", self.target)
+        }
+    }
+}
+
+/// An environment variable for the container. `value: None` means the
+/// variable passes through from the host environment at run time.
+#[derive(Debug, PartialEq, Clone)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+/// A single configuration layer.
 #[derive(Debug)]
 pub struct ConfigLayer {
     pub scope: Scope,
-    /// `None` for the binary scope; `Some(path)` for file-backed scopes.
+    /// `None` for the binary scope; the file (or directory, for the user
+    /// layer) the config came from otherwise.
     pub path: Option<PathBuf>,
     pub mounts: Vec<ResolvedMount>,
-    pub env: HashMap<String, String>,
+    pub env: Vec<EnvVar>,
 }
 
 /// A value tagged with the config scope it came from.
@@ -63,9 +83,6 @@ pub struct ScopedValue<T> {
 }
 
 /// All configuration layers, ordered from lowest to highest precedence.
-///
-/// The effective configuration comes from the highest-precedence layer
-/// that is present.
 #[derive(Debug)]
 pub struct ScopedConfig {
     pub layers: Vec<ConfigLayer>,
@@ -78,6 +95,63 @@ pub struct ScopedConfig {
 const MASK_SOURCE: &str = "/dev/null";
 
 impl ScopedConfig {
+    /// Load all configuration layers for the given workspace.
+    ///
+    /// `workspace_target` is the container path of the workspace mount;
+    /// relative mount targets resolve against it.
+    ///
+    /// Layers are returned in precedence order (lowest first):
+    /// 1. Binary (staples and host agent-config mounts)
+    /// 2. User (every `*.kdl` in `~/.config/ramekin/`, merged as one layer)
+    /// 3. Project (`<workspace>/.ramekin/config.kdl`)
+    /// 4. Project-local (`<workspace>/.ramekin/config.local.kdl`)
+    ///
+    /// Returns an error if a config file can't be parsed, or if two files
+    /// within the user layer define the same key.
+    pub fn load(workspace: &Path, workspace_target: &str) -> Result<Self> {
+        let mut layers = vec![ConfigLayer {
+            scope: Scope::Binary,
+            path: None,
+            mounts: binary_mounts(),
+            env: Vec::new(),
+        }];
+
+        // User layer: every *.kdl in the config dir, sorted by name for
+        // deterministic merging. Which files exist (and which are symlinks
+        // into dotfiles) is a dotfiles decision, not a ramekin one.
+        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
+        if let Some(config_dir) = xdg.get_config_home().filter(|d| d.is_dir()) {
+            let mut files: Vec<PathBuf> = fs_err::read_dir(&config_dir)
+                .into_diagnostic()?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|ext| ext == "kdl") && p.is_file())
+                .collect();
+            files.sort();
+            if !files.is_empty() {
+                let mut builder = LayerBuilder::new(Scope::User, Some(config_dir));
+                for file in &files {
+                    builder.add_file(file, workspace_target)?;
+                }
+                layers.push(builder.build());
+            }
+        }
+
+        // Project layers
+        for (scope, name) in [
+            (Scope::Project, "config.kdl"),
+            (Scope::ProjectLocal, "config.local.kdl"),
+        ] {
+            let path = workspace.join(".ramekin").join(name);
+            if path.exists() {
+                let mut builder = LayerBuilder::new(scope, Some(path.clone()));
+                builder.add_file(&path, workspace_target)?;
+                layers.push(builder.build());
+            }
+        }
+
+        Ok(Self { layers })
+    }
+
     /// Return merged mounts from all layers, de-duplicated by container target.
     ///
     /// Higher-precedence layers override mounts with the same target, and a
@@ -115,15 +189,15 @@ impl ScopedConfig {
     ///
     /// Higher-precedence layers override variables with the same name.
     /// Output order is lexicographic by name for reproducibility.
-    pub fn merged_env(&self) -> Vec<ScopedValue<(&str, &str)>> {
-        let mut by_name: BTreeMap<&str, ScopedValue<(&str, &str)>> = BTreeMap::new();
+    pub fn merged_env(&self) -> Vec<ScopedValue<&EnvVar>> {
+        let mut by_name: BTreeMap<&str, ScopedValue<&EnvVar>> = BTreeMap::new();
         for layer in &self.layers {
-            for (name, value) in &layer.env {
+            for var in &layer.env {
                 by_name.insert(
-                    name.as_str(),
+                    var.name.as_str(),
                     ScopedValue {
                         scope: layer.scope,
-                        value: (name.as_str(), value.as_str()),
+                        value: var,
                     },
                 );
             }
@@ -132,24 +206,203 @@ impl ScopedConfig {
     }
 }
 
-/// A mount with tilde-expanded paths ready for Docker.
-#[derive(Debug, PartialEq)]
-pub struct ResolvedMount {
-    pub source: PathBuf,
-    pub target: String,
-    pub writable: bool,
+// ---------------------------------------------------------------------------
+// Layer assembly
+// ---------------------------------------------------------------------------
+
+/// Accumulates parsed config into one layer, erroring on keys defined twice
+/// within the layer — which matters for the user layer, where multiple files
+/// merge and a silent last-writer-wins would depend on filename order.
+struct LayerBuilder {
+    scope: Scope,
+    path: Option<PathBuf>,
+    mounts: Vec<ResolvedMount>,
+    mount_targets: BTreeSet<String>,
+    env: Vec<EnvVar>,
+    env_names: BTreeSet<String>,
 }
 
-impl ResolvedMount {
-    /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
-    pub fn display_target(&self) -> String {
-        if self.writable {
-            self.target.clone()
-        } else {
-            format!("{} (ro)", self.target)
+impl LayerBuilder {
+    fn new(scope: Scope, path: Option<PathBuf>) -> Self {
+        Self {
+            scope,
+            path,
+            mounts: Vec::new(),
+            mount_targets: BTreeSet::new(),
+            env: Vec::new(),
+            env_names: BTreeSet::new(),
+        }
+    }
+
+    fn add_file(&mut self, file: &Path, workspace_target: &str) -> Result<()> {
+        let raw = parse_file(file)?;
+        self.add(raw, file, workspace_target)
+    }
+
+    fn add(&mut self, raw: RawConfig, file: &Path, workspace_target: &str) -> Result<()> {
+        for mount in &raw.mounts {
+            // Mounts with a missing host source are skipped entirely, so
+            // they don't participate in duplicate detection either.
+            let Some(resolved) = mount.resolve(workspace_target) else {
+                continue;
+            };
+            if !self.mount_targets.insert(resolved.target.clone()) {
+                bail!(
+                    "{}: mount target {} is defined twice in the {} layer",
+                    file.display(),
+                    resolved.target,
+                    self.scope,
+                );
+            }
+            self.mounts.push(resolved);
+        }
+        for var in raw.env {
+            if !self.env_names.insert(var.name.clone()) {
+                bail!(
+                    "{}: env variable {} is defined twice in the {} layer",
+                    file.display(),
+                    var.name,
+                    self.scope,
+                );
+            }
+            self.env.push(var);
+        }
+        Ok(())
+    }
+
+    fn build(self) -> ConfigLayer {
+        ConfigLayer {
+            scope: self.scope,
+            path: self.path,
+            mounts: self.mounts,
+            env: self.env,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// KDL parsing
+// ---------------------------------------------------------------------------
+
+/// The parsed contents of a single config file.
+#[derive(Debug, Default, PartialEq)]
+struct RawConfig {
+    mounts: Vec<Mount>,
+    env: Vec<EnvVar>,
+}
+
+fn parse_file(path: &Path) -> Result<RawConfig> {
+    let content = fs_err::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err("failed to read config file")?;
+    parse_config(&content).wrap_err_with(|| format!("failed to parse {}", path.display()))
+}
+
+fn parse_config(content: &str) -> Result<RawConfig> {
+    let doc: KdlDocument = content.parse().into_diagnostic()?;
+    let mut raw = RawConfig::default();
+    for node in doc.nodes() {
+        match node.name().value() {
+            "mounts" => raw.mounts.push(parse_mount(node)?),
+            "env" => raw.env.extend(parse_env(node)?),
+            other => bail!("unknown config node `{other}`"),
+        }
+    }
+    Ok(raw)
+}
+
+fn parse_mount(node: &KdlNode) -> Result<Mount> {
+    if !node.entries().is_empty() {
+        bail!("`mounts` takes a block of child nodes, not inline values");
+    }
+    let children = node
+        .children()
+        .ok_or_else(|| miette!("`mounts` requires a block with a `source`"))?;
+
+    let mut source = None;
+    let mut target = None;
+    let mut writable = false;
+    for child in children.nodes() {
+        match child.name().value() {
+            "source" => source = Some(single_string_arg(child)?),
+            "target" => target = Some(single_string_arg(child)?),
+            "writable" => writable = bool_flag(child)?,
+            other => bail!("unknown `mounts` field `{other}`"),
+        }
+    }
+
+    Ok(Mount {
+        source: source.ok_or_else(|| miette!("`mounts` block is missing `source`"))?,
+        target,
+        writable,
+    })
+}
+
+/// Parse an `env` block. Exactly one syntax: a block with one child node per
+/// variable, whose single argument is the value. A bare child (no argument)
+/// passes the host's value through at run time.
+fn parse_env(node: &KdlNode) -> Result<Vec<EnvVar>> {
+    if !node.entries().is_empty() {
+        bail!("`env` takes a block (env {{ NAME \"value\" }}), not inline values");
+    }
+    let Some(children) = node.children() else {
+        return Ok(Vec::new());
+    };
+    children
+        .nodes()
+        .iter()
+        .map(|child| {
+            let value = optional_string_arg(child)?;
+            Ok(EnvVar {
+                name: child.name().value().to_string(),
+                value,
+            })
+        })
+        .collect()
+}
+
+/// The node's single string argument, required.
+fn single_string_arg(node: &KdlNode) -> Result<String> {
+    optional_string_arg(node)?
+        .ok_or_else(|| miette!("`{}` requires a string value", node.name().value()))
+}
+
+/// The node's single string argument, if present. Errors on properties,
+/// extra arguments, or non-string values.
+fn optional_string_arg(node: &KdlNode) -> Result<Option<String>> {
+    let entries = node.entries();
+    match entries {
+        [] => Ok(None),
+        [entry] if entry.name().is_none() => match entry.value().as_string() {
+            Some(s) => Ok(Some(s.to_string())),
+            None => bail!(
+                "`{}` takes a string value, got {}",
+                node.name().value(),
+                entry.value()
+            ),
+        },
+        _ => bail!("`{}` takes at most one string value", node.name().value()),
+    }
+}
+
+/// A boolean flag node: bare means true, or one boolean argument.
+fn bool_flag(node: &KdlNode) -> Result<bool> {
+    match node.entries() {
+        [] => Ok(true),
+        [entry] if entry.name().is_none() => entry.value().as_bool().ok_or_else(|| {
+            miette!(
+                "`{}` takes a boolean value, got {}",
+                node.name().value(),
+                entry.value()
+            )
+        }),
+        _ => bail!("`{}` takes at most one boolean value", node.name().value()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builtin mounts and target resolution
+// ---------------------------------------------------------------------------
 
 /// Staple mounts every machine gets: read-only, skipped when missing on the
 /// host, overridable (or maskable) by any config layer. The bar for a staple
@@ -195,80 +448,6 @@ fn binary_mounts() -> Vec<ResolvedMount> {
             })
         })
         .collect()
-}
-
-impl Config {
-    /// Load all configuration layers for the given workspace.
-    ///
-    /// `workspace_target` is the container path of the workspace mount;
-    /// relative mount targets resolve against it.
-    ///
-    /// Layers are returned in precedence order (lowest first):
-    /// 1. Binary (staples and host agent-config mounts)
-    /// 2. User (`~/.config/ramekin/config.kdl`) — only if the file exists
-    /// 3. Project (`<workspace>/.ramekin/config.kdl`) — only if the file exists
-    ///
-    /// Returns an error if a config file exists but can't be parsed.
-    pub fn load(workspace: &Path, workspace_target: &str) -> Result<ScopedConfig> {
-        let mut layers = vec![ConfigLayer {
-            scope: Scope::Binary,
-            path: None,
-            mounts: binary_mounts(),
-            env: HashMap::new(),
-        }];
-
-        // User layer
-        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
-        let user_path = xdg
-            .place_config_file("config.kdl")
-            .into_diagnostic()
-            .wrap_err("failed to determine user config path")?;
-
-        if user_path.exists() {
-            let config = Self::load_file(&user_path)
-                .wrap_err_with(|| format!("failed to load user config: {}", user_path.display()))?;
-            layers.push(ConfigLayer {
-                scope: Scope::User,
-                path: Some(user_path),
-                mounts: config.resolve_mounts(workspace_target),
-                env: config.env,
-            });
-        }
-
-        // Project layer
-        let project_path = workspace.join(".ramekin/config.kdl");
-        if project_path.exists() {
-            let config = Self::load_file(&project_path).wrap_err_with(|| {
-                format!("failed to load project config: {}", project_path.display())
-            })?;
-            layers.push(ConfigLayer {
-                scope: Scope::Project,
-                path: Some(project_path),
-                mounts: config.resolve_mounts(workspace_target),
-                env: config.env,
-            });
-        }
-
-        Ok(ScopedConfig { layers })
-    }
-
-    /// Parse a config file.
-    fn load_file(path: &Path) -> Result<Self> {
-        let content = fs_err::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err("failed to read config file")?;
-        serde_kdl2::from_str(&content)
-            .into_diagnostic()
-            .wrap_err("failed to parse config file")
-    }
-
-    /// Resolve all mounts, skipping any whose source does not exist.
-    fn resolve_mounts(&self, workspace_target: &str) -> Vec<ResolvedMount> {
-        self.mounts
-            .iter()
-            .filter_map(|m| m.resolve(workspace_target))
-            .collect()
-    }
 }
 
 impl Mount {
@@ -324,69 +503,124 @@ mod tests {
     const WS: &str = "/workspace/test-slug";
 
     #[test]
-    fn kdl_deserialization_works() {
-        let kdl_content = r#"
-            mounts{
-            source "~/.config/git"
+    fn parse_mounts() {
+        let raw = parse_config(
+            r#"
+            mounts {
+                source "~/.config/git"
             }
-            mounts{
-            source "~/.config/jj"
-            }
-            mounts{
-            source "~/.local/share/ranger"
-            writable #true
-            }
-            mounts{
-            source "~/Downloads"
-            target "/root/downloads"
-            }
-        "#;
-
-        let parsed: Config = serde_kdl2::from_str(kdl_content).unwrap();
-        assert_eq!(parsed.mounts.len(), 4);
-        assert_eq!(parsed.mounts[0].source, "~/.config/git");
-        assert!(!parsed.mounts[0].writable);
-        assert!(parsed.mounts[2].writable);
-        assert_eq!(parsed.mounts[3].target, Some("/root/downloads".into()));
-        // writable defaults to false when omitted.
-        assert!(!parsed.mounts[3].writable);
-    }
-
-    #[test]
-    fn kdl_bare_writable() {
-        let kdl_content = r#"
             mounts {
                 source "~/.local/share/ranger"
                 writable
             }
             mounts {
-                source "~/.config/git"
+                source "~/Downloads"
+                target "/root/downloads"
             }
-        "#;
-
-        let parsed: Config = serde_kdl2::from_str(kdl_content).unwrap();
-        assert_eq!(parsed.mounts.len(), 2);
-        assert!(parsed.mounts[0].writable);
-        assert!(!parsed.mounts[1].writable);
+            mounts {
+                source "/x"
+                writable #false
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(raw.mounts.len(), 4);
+        assert_eq!(raw.mounts[0].source, "~/.config/git");
+        assert!(!raw.mounts[0].writable);
+        assert!(raw.mounts[1].writable);
+        assert_eq!(raw.mounts[2].target, Some("/root/downloads".into()));
+        assert!(!raw.mounts[2].writable);
+        assert!(!raw.mounts[3].writable);
     }
 
     #[test]
-    fn kdl_parse_error_on_invalid_syntax() {
-        let invalid_kdl = "invalid_syntax_here{ missing closing brace";
-        let result: Result<Config, _> = serde_kdl2::from_str(invalid_kdl);
+    fn parse_env_block() {
+        let raw = parse_config(
+            r#"
+            env {
+                API_KEY "secret123"
+                NODE_ENV "production"
+                GITHUB_TOKEN
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(raw.env.len(), 3);
+        assert_eq!(raw.env[0].name, "API_KEY");
+        assert_eq!(raw.env[0].value.as_deref(), Some("secret123"));
+        // Bare variable: pass the host's value through at run time.
+        assert_eq!(raw.env[2].name, "GITHUB_TOKEN");
+        assert_eq!(raw.env[2].value, None);
+    }
+
+    #[test]
+    fn env_flat_props_form_is_rejected() {
+        // The old `env FOO="bar"` inline form is gone: one shape, no synonyms.
+        let result = parse_config(r#"env FOO="bar""#);
         assert!(result.is_err());
     }
 
     #[test]
-    fn kdl_dash_notation_mounts_writable() {
-        let kdl = r#"
+    fn unknown_node_is_rejected() {
+        let result = parse_config(r#"pi { source "~/x" }"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_mount_field_is_rejected() {
+        let result = parse_config(
+            r#"
             mounts {
-                - { source "~/.local/share/ranger"; writable }
+                source "/x"
+                bogus "y"
             }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert_eq!(parsed.mounts.len(), 1);
-        assert!(parsed.mounts[0].writable);
+            "#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mount_without_source_is_rejected() {
+        let result = parse_config("mounts {\ntarget \"/x\"\n}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_syntax_is_rejected() {
+        let result = parse_config("mounts { missing closing brace");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_env_within_layer_is_an_error() {
+        let mut builder = LayerBuilder::new(Scope::User, None);
+        let a = parse_config(r#"env { FOO "1" }"#).unwrap();
+        let b = parse_config(r#"env { FOO "2" }"#).unwrap();
+        builder.add(a, Path::new("a.kdl"), WS).unwrap();
+        let err = builder.add(b, Path::new("b.kdl"), WS).unwrap_err();
+        assert!(err.to_string().contains("FOO"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_mount_target_within_layer_is_an_error() {
+        let mut builder = LayerBuilder::new(Scope::User, None);
+        let a = parse_config("mounts {\nsource \"/tmp\"\ntarget \"/t\"\n}").unwrap();
+        let b = parse_config("mounts {\nsource \"/dev/null\"\ntarget \"/t\"\n}").unwrap();
+        builder.add(a, Path::new("a.kdl"), WS).unwrap();
+        let err = builder.add(b, Path::new("b.kdl"), WS).unwrap_err();
+        assert!(err.to_string().contains("/t"), "{err}");
+    }
+
+    #[test]
+    fn missing_source_skips_duplicate_detection() {
+        let mut builder = LayerBuilder::new(Scope::User, None);
+        let a = parse_config("mounts {\nsource \"/nonexistent-a\"\ntarget \"/t\"\n}").unwrap();
+        let b = parse_config("mounts {\nsource \"/tmp\"\ntarget \"/t\"\n}").unwrap();
+        builder.add(a, Path::new("a.kdl"), WS).unwrap();
+        builder.add(b, Path::new("b.kdl"), WS).unwrap();
+        let layer = builder.build();
+        assert_eq!(layer.mounts.len(), 1);
+        assert_eq!(layer.mounts[0].source, PathBuf::from("/tmp"));
     }
 
     #[test]
@@ -438,19 +672,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_existing_dir_and_explicit_target() {
-        let mount = Mount {
-            source: "/tmp".into(),
-            target: Some("/container/tmp".into()),
-            writable: false,
-        };
-        let resolved = mount.resolve(WS).unwrap();
-        assert_eq!(resolved.source, PathBuf::from("/tmp"));
-        assert_eq!(resolved.target, "/container/tmp");
-        assert!(!resolved.writable);
-    }
-
-    #[test]
     fn resolve_expands_tilde_in_explicit_target() {
         let mount = Mount {
             source: "/tmp".into(),
@@ -473,32 +694,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mounts_filters_nonexistent() {
-        let config = Config {
-            mounts: vec![
-                Mount {
-                    source: "/tmp".into(),
-                    target: Some("/container/tmp".into()),
-                    writable: true,
-                },
-                Mount {
-                    source: "/nonexistent".into(),
-                    target: None,
-                    writable: false,
-                },
-            ],
-            env: HashMap::new(),
-        };
-        let resolved = config.resolve_mounts(WS);
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].target, "/container/tmp");
-    }
-
-    #[test]
     fn scope_display() {
         assert_eq!(Scope::Binary.to_string(), "binary");
         assert_eq!(Scope::User.to_string(), "user");
         assert_eq!(Scope::Project.to_string(), "project");
+        assert_eq!(Scope::ProjectLocal.to_string(), "project-local");
     }
 
     fn layer(scope: Scope, mounts: Vec<ResolvedMount>) -> ConfigLayer {
@@ -506,7 +706,7 @@ mod tests {
             scope,
             path: None,
             mounts,
-            env: HashMap::new(),
+            env: Vec::new(),
         }
     }
 
@@ -642,12 +842,13 @@ mod tests {
 
     #[test]
     fn load_with_no_project_config() {
-        // Use a workspace with no .ramekin/config.kdl
-        let config = Config::load(Path::new("/tmp"), WS).unwrap();
+        // Use a workspace with no .ramekin/ config files
+        let config = ScopedConfig::load(Path::new("/tmp"), WS).unwrap();
         // Binary layer is always first (lowest precedence)
         assert_eq!(config.layers.first().unwrap().scope, Scope::Binary);
-        // No project layer
+        // No project layers
         assert!(!config.layers.iter().any(|l| l.scope == Scope::Project));
+        assert!(!config.layers.iter().any(|l| l.scope == Scope::ProjectLocal));
     }
 
     #[test]
@@ -655,84 +856,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ramekin_dir = dir.path().join(".ramekin");
         fs_err::create_dir_all(&ramekin_dir).unwrap();
-        let config_path = ramekin_dir.join("config.kdl");
-        // serde_kdl2 requires at least two repeated nodes for Vec deserialization
         fs_err::write(
-            &config_path,
-            "mounts{\nsource \"/tmp\"\ntarget \"/container/tmp\"\n}\nmounts{\nsource \"/tmp\"\ntarget \"/container/tmp2\"\n}\n",
+            ramekin_dir.join("config.kdl"),
+            "mounts {\nsource \"/tmp\"\ntarget \"/container/tmp\"\n}\n",
+        )
+        .unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.local.kdl"),
+            "env {\nFOO \"bar\"\n}\n",
         )
         .unwrap();
 
-        let config = Config::load(dir.path(), WS).unwrap();
+        let config = ScopedConfig::load(dir.path(), WS).unwrap();
 
-        // Should have binary + project layers
-        assert!(config.layers.len() >= 2);
-        let project_layer = config
+        let project = config
             .layers
             .iter()
             .find(|l| l.scope == Scope::Project)
             .expect("project layer missing");
-        assert_eq!(project_layer.mounts.len(), 2);
-        assert_eq!(project_layer.mounts[0].target, "/container/tmp");
-        // Binary is always first (lowest precedence)
-        assert_eq!(config.layers.first().unwrap().scope, Scope::Binary);
-    }
+        assert_eq!(project.mounts.len(), 1);
+        assert_eq!(project.mounts[0].target, "/container/tmp");
 
-    #[test]
-    fn kdl_env_flat_props() {
-        let kdl = r#"
-            env FOO="bar"
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert_eq!(parsed.env.get("FOO").unwrap(), "bar");
-    }
-
-    #[test]
-    fn kdl_env_multiple() {
-        let kdl = r#"
-            env {
-                API_KEY "secret123"
-                NODE_ENV "production"
-            }
-        "#;
-        let parsed: Config = serde_kdl2::from_str(kdl).unwrap();
-        assert_eq!(parsed.env.len(), 2);
-        assert_eq!(parsed.env.get("API_KEY").unwrap(), "secret123");
-        assert_eq!(parsed.env.get("NODE_ENV").unwrap(), "production");
+        let local = config
+            .layers
+            .iter()
+            .find(|l| l.scope == Scope::ProjectLocal)
+            .expect("project-local layer missing");
+        assert_eq!(local.env.len(), 1);
+        assert_eq!(local.env[0].name, "FOO");
     }
 
     #[test]
     fn merged_env_deduplicates_by_name() {
-        let mut user_env = HashMap::new();
-        user_env.insert("FOO".into(), "user".into());
-        user_env.insert("BAR".into(), "user".into());
-
-        let mut project_env = HashMap::new();
-        project_env.insert("FOO".into(), "project".into());
-
-        let config = ScopedConfig {
-            layers: vec![
-                ConfigLayer {
-                    scope: Scope::User,
-                    path: None,
-                    mounts: vec![],
-                    env: user_env,
+        let user = ConfigLayer {
+            scope: Scope::User,
+            path: None,
+            mounts: vec![],
+            env: vec![
+                EnvVar {
+                    name: "FOO".into(),
+                    value: Some("user".into()),
                 },
-                ConfigLayer {
-                    scope: Scope::Project,
-                    path: None,
-                    mounts: vec![],
-                    env: project_env,
+                EnvVar {
+                    name: "BAR".into(),
+                    value: Some("user".into()),
                 },
             ],
         };
+        let project = ConfigLayer {
+            scope: Scope::Project,
+            path: None,
+            mounts: vec![],
+            env: vec![EnvVar {
+                name: "FOO".into(),
+                value: Some("project".into()),
+            }],
+        };
+        let config = ScopedConfig {
+            layers: vec![user, project],
+        };
         let merged = config.merged_env();
         assert_eq!(merged.len(), 2);
-        let foo = merged.iter().find(|sv| sv.value.0 == "FOO").unwrap();
-        assert_eq!(foo.value.1, "project");
+        let foo = merged.iter().find(|sv| sv.value.name == "FOO").unwrap();
+        assert_eq!(foo.value.value.as_deref(), Some("project"));
         assert_eq!(foo.scope, Scope::Project);
-        let bar = merged.iter().find(|sv| sv.value.0 == "BAR").unwrap();
-        assert_eq!(bar.value.1, "user");
+        let bar = merged.iter().find(|sv| sv.value.name == "BAR").unwrap();
         assert_eq!(bar.scope, Scope::User);
     }
 }
