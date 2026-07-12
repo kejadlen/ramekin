@@ -8,29 +8,125 @@ use miette::{Context, IntoDiagnostic, Result, bail, miette};
 /// Configuration scope, ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
-    /// Compiled into the binary: staples and host agent-config mounts.
+    /// Compiled into the binary: staples, host agent-config mounts, and the
+    /// trivial profiles.
     Binary,
+    /// The active profile's own env and mounts, overlaid by every file layer.
+    Profile,
     /// The user layer: every `*.kdl` in `~/.config/ramekin/`, merged.
     User,
     /// Project-level `<workspace>/.ramekin/config.kdl`, committed.
     Project,
     /// Project-local `<workspace>/.ramekin/config.local.kdl`, gitignored.
     ProjectLocal,
+    /// Command-line arguments (currently just `-p`).
+    Cli,
 }
 
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Binary => write!(f, "binary"),
+            Self::Profile => write!(f, "profile"),
             Self::User => write!(f, "user"),
             Self::Project => write!(f, "project"),
             Self::ProjectLocal => write!(f, "project-local"),
+            Self::Cli => write!(f, "cli"),
         }
     }
 }
 
+/// The coding agent a session runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    Pi,
+    Claude,
+}
+
+impl Agent {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "pi" => Ok(Self::Pi),
+            "claude" => Ok(Self::Claude),
+            other => bail!("unknown agent `{other}` (expected `pi` or `claude`)"),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::Claude => "claude",
+        }
+    }
+
+    /// Host directory where this agent keeps its config (and, mixed in with
+    /// it, runtime state that must not enter the container).
+    pub fn host_config_dir(&self) -> &'static str {
+        match self {
+            Self::Pi => "~/.pi/agent",
+            Self::Claude => "~/.claude",
+        }
+    }
+
+    /// The config-shaped entries of the host agent dir. Only these mount
+    /// into the container (read-only); the rest is host runtime state —
+    /// credentials, transcripts, caches. Skip-if-missing makes
+    /// over-inclusion cheap.
+    pub fn config_allowlist(&self) -> &'static [&'static str] {
+        match self {
+            Self::Pi => &["AGENTS.md", "skills"],
+            Self::Claude => &["CLAUDE.md", "settings.json", "skills", "agents", "commands"],
+        }
+    }
+
+    /// The agent's config dir inside the container.
+    pub fn container_config_dir(&self) -> &'static str {
+        match self {
+            Self::Pi => PI_AGENT_DIR,
+            Self::Claude => "/root/.claude",
+        }
+    }
+}
+
+impl fmt::Display for Agent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// A named bundle of agent + provider plumbing: env vars and extra mounts.
+/// Profiles merge by name across layers, last writer takes the whole
+/// definition; fine-grained tweaks go through the ordinary layered `env`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    pub agent: Agent,
+    pub env: Vec<EnvVar>,
+    pub mounts: Vec<Mount>,
+}
+
+impl Profile {
+    /// The trivial profiles shipped in the binary: bare agents with no
+    /// provider plumbing, so ramekin runs with zero config. Everything
+    /// richer is defined in KDL.
+    fn builtin() -> Vec<Self> {
+        [Agent::Pi, Agent::Claude]
+            .into_iter()
+            .map(|agent| Self {
+                name: agent.name().to_string(),
+                agent,
+                env: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .collect()
+    }
+}
+
+/// The profile selected in the binary when no layer or flag picks one.
+const DEFAULT_PROFILE: &str = "pi";
+
 /// A mount as written in config: unexpanded paths, optional target.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Mount {
     pub source: String,
     pub target: Option<String>,
@@ -82,10 +178,24 @@ pub struct ScopedValue<T> {
     pub value: T,
 }
 
-/// All configuration layers, ordered from lowest to highest precedence.
+/// All configuration layers, ordered from lowest to highest precedence,
+/// plus the resolved profile.
 #[derive(Debug)]
 pub struct ScopedConfig {
     pub layers: Vec<ConfigLayer>,
+    /// Every known profile (builtin trivial ones plus KDL definitions),
+    /// merged by name — later layers take the whole definition.
+    pub profiles: BTreeMap<String, ScopedValue<Profile>>,
+    /// The active profile's name and the scope that selected it.
+    pub selection: ScopedValue<String>,
+    /// The active profile.
+    pub profile: Profile,
+}
+
+impl ScopedConfig {
+    pub fn agent(&self) -> Agent {
+        self.profile.agent
+    }
 }
 
 /// Mask source: a mount whose source is `/dev/null` *removes* an inherited
@@ -101,20 +211,23 @@ impl ScopedConfig {
     /// relative mount targets resolve against it.
     ///
     /// Layers are returned in precedence order (lowest first):
-    /// 1. Binary (staples and host agent-config mounts)
-    /// 2. User (every `*.kdl` in `~/.config/ramekin/`, merged as one layer)
-    /// 3. Project (`<workspace>/.ramekin/config.kdl`)
-    /// 4. Project-local (`<workspace>/.ramekin/config.local.kdl`)
+    /// 1. Binary (staples, host agent-config mounts, trivial profiles)
+    /// 2. Profile (the active profile's env and mounts)
+    /// 3. User (every `*.kdl` in `~/.config/ramekin/`, merged as one layer)
+    /// 4. Project (`<workspace>/.ramekin/config.kdl`)
+    /// 5. Project-local (`<workspace>/.ramekin/config.local.kdl`)
     ///
-    /// Returns an error if a config file can't be parsed, or if two files
-    /// within the user layer define the same key.
-    pub fn load(workspace: &Path, workspace_target: &str) -> Result<Self> {
-        let mut layers = vec![ConfigLayer {
-            scope: Scope::Binary,
-            path: None,
-            mounts: binary_mounts(),
-            env: Vec::new(),
-        }];
+    /// `cli_profile` is the `-p` selection, which beats any layer's.
+    ///
+    /// Returns an error if a config file can't be parsed, if two files
+    /// within the user layer define the same key, or if the selected
+    /// profile isn't defined anywhere.
+    pub fn load(
+        workspace: &Path,
+        workspace_target: &str,
+        cli_profile: Option<&str>,
+    ) -> Result<Self> {
+        let mut builders = Vec::new();
 
         // User layer: every *.kdl in the config dir, sorted by name for
         // deterministic merging. Which files exist (and which are symlinks
@@ -132,7 +245,7 @@ impl ScopedConfig {
                 for file in &files {
                     builder.add_file(file, workspace_target)?;
                 }
-                layers.push(builder.build());
+                builders.push(builder);
             }
         }
 
@@ -145,11 +258,91 @@ impl ScopedConfig {
             if path.exists() {
                 let mut builder = LayerBuilder::new(scope, Some(path.clone()));
                 builder.add_file(&path, workspace_target)?;
-                layers.push(builder.build());
+                builders.push(builder);
             }
         }
 
-        Ok(Self { layers })
+        // Profiles merge by name across layers, last writer takes the whole
+        // definition. Selection: highest layer wins, CLI beats all, binary
+        // default when nothing selects.
+        let mut profiles: BTreeMap<String, ScopedValue<Profile>> = Profile::builtin()
+            .into_iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    ScopedValue {
+                        scope: Scope::Binary,
+                        value: p,
+                    },
+                )
+            })
+            .collect();
+        let mut selection = ScopedValue {
+            scope: Scope::Binary,
+            value: DEFAULT_PROFILE.to_string(),
+        };
+        for builder in &builders {
+            for profile in &builder.profiles {
+                profiles.insert(
+                    profile.name.clone(),
+                    ScopedValue {
+                        scope: builder.scope,
+                        value: profile.clone(),
+                    },
+                );
+            }
+            if let Some(name) = &builder.selection {
+                selection = ScopedValue {
+                    scope: builder.scope,
+                    value: name.clone(),
+                };
+            }
+        }
+        if let Some(name) = cli_profile {
+            selection = ScopedValue {
+                scope: Scope::Cli,
+                value: name.to_string(),
+            };
+        }
+
+        let profile = profiles
+            .get(&selection.value)
+            .map(|sv| sv.value.clone())
+            .ok_or_else(|| {
+                let known = profiles.keys().cloned().collect::<Vec<_>>().join(", ");
+                miette!(
+                    "profile `{}` (selected by {}) is not defined; known profiles: {known}",
+                    selection.value,
+                    selection.scope,
+                )
+            })?;
+
+        // The binary layer's agent-config mounts depend on the resolved
+        // agent, so the layer is assembled only now.
+        let mut layers = vec![ConfigLayer {
+            scope: Scope::Binary,
+            path: None,
+            mounts: binary_mounts(profile.agent),
+            env: Vec::new(),
+        }];
+        layers.push(ConfigLayer {
+            scope: Scope::Profile,
+            path: None,
+            mounts: profile
+                .mounts
+                .iter()
+                .filter_map(|m| m.resolve(workspace_target))
+                .collect(),
+            env: profile.env.clone(),
+        });
+        layers.extend(builders.into_iter().map(LayerBuilder::build));
+
+        Ok(Self {
+            layers,
+            profiles,
+            selection,
+            profile,
+        })
     }
 
     /// Return merged mounts from all layers, de-duplicated by container target.
@@ -220,6 +413,9 @@ struct LayerBuilder {
     mount_targets: BTreeSet<String>,
     env: Vec<EnvVar>,
     env_names: BTreeSet<String>,
+    profiles: Vec<Profile>,
+    profile_names: BTreeSet<String>,
+    selection: Option<String>,
 }
 
 impl LayerBuilder {
@@ -231,6 +427,9 @@ impl LayerBuilder {
             mount_targets: BTreeSet::new(),
             env: Vec::new(),
             env_names: BTreeSet::new(),
+            profiles: Vec::new(),
+            profile_names: BTreeSet::new(),
+            selection: None,
         }
     }
 
@@ -267,6 +466,27 @@ impl LayerBuilder {
             }
             self.env.push(var);
         }
+        for profile in raw.profiles {
+            if !self.profile_names.insert(profile.name.clone()) {
+                bail!(
+                    "{}: profile `{}` is defined twice in the {} layer",
+                    file.display(),
+                    profile.name,
+                    self.scope,
+                );
+            }
+            self.profiles.push(profile);
+        }
+        for name in raw.selections {
+            if self.selection.is_some() {
+                bail!(
+                    "{}: the {} layer selects a profile twice",
+                    file.display(),
+                    self.scope,
+                );
+            }
+            self.selection = Some(name);
+        }
         Ok(())
     }
 
@@ -289,6 +509,8 @@ impl LayerBuilder {
 struct RawConfig {
     mounts: Vec<Mount>,
     env: Vec<EnvVar>,
+    profiles: Vec<Profile>,
+    selections: Vec<String>,
 }
 
 fn parse_file(path: &Path) -> Result<RawConfig> {
@@ -305,10 +527,55 @@ fn parse_config(content: &str) -> Result<RawConfig> {
         match node.name().value() {
             "mounts" => raw.mounts.push(parse_mount(node)?),
             "env" => raw.env.extend(parse_env(node)?),
+            // `profile "name" { ... }` defines; `profile "name"` selects.
+            "profile" => match parse_profile(node)? {
+                ProfileNode::Definition(profile) => raw.profiles.push(profile),
+                ProfileNode::Selection(name) => raw.selections.push(name),
+            },
             other => bail!("unknown config node `{other}`"),
         }
     }
     Ok(raw)
+}
+
+enum ProfileNode {
+    Definition(Profile),
+    Selection(String),
+}
+
+fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
+    let name = match node.entries() {
+        [entry] if entry.name().is_none() => entry
+            .value()
+            .as_string()
+            .ok_or_else(|| miette!("`profile` takes a string name, got {}", entry.value()))?
+            .to_string(),
+        _ => bail!("`profile` takes exactly one string name"),
+    };
+
+    let Some(children) = node.children() else {
+        return Ok(ProfileNode::Selection(name));
+    };
+
+    let mut agent = None;
+    let mut env = Vec::new();
+    let mut mounts = Vec::new();
+    for child in children.nodes() {
+        match child.name().value() {
+            "agent" => agent = Some(Agent::parse(&single_string_arg(child)?)?),
+            "env" => env.extend(parse_env(child)?),
+            "mounts" => mounts.push(parse_mount(child)?),
+            other => bail!("unknown `profile` field `{other}`"),
+        }
+    }
+
+    Ok(ProfileNode::Definition(Profile {
+        agent: agent
+            .ok_or_else(|| miette!("profile `{name}` is missing `agent` (`pi` or `claude`)"))?,
+        name,
+        env,
+        mounts,
+    }))
 }
 
 fn parse_mount(node: &KdlNode) -> Result<Mount> {
@@ -409,30 +676,23 @@ fn bool_flag(node: &KdlNode) -> Result<bool> {
 /// is "true on every machine".
 const STAPLES: &[&str] = &["~/.config/git", "~/.config/jj"];
 
-/// Host directory where pi keeps its agent config and state.
-const HOST_PI_AGENT_DIR: &str = "~/.pi/agent";
-
-/// The config-shaped entries of the host's pi agent dir. Only these mount
-/// into the container (read-only); the rest of the dir is runtime state —
-/// credentials, session history — which must not leak in.
-pub const PI_AGENT_CONFIG: &[&str] = &["AGENTS.md", "skills"];
-
 /// Pi's agent dir inside the container.
 pub const PI_AGENT_DIR: &str = "/root/.pi/agent";
 
-/// Mounts compiled into the binary: staples plus the host's pi agent config.
+/// Mounts compiled into the binary: staples plus the host's agent config for
+/// the active agent.
 ///
 /// Sources are canonicalized because agent dirs and staples commonly symlink
 /// into dotfiles, and bind sources need real paths. Missing entries are
 /// skipped.
-fn binary_mounts() -> Vec<ResolvedMount> {
+fn binary_mounts(agent: Agent) -> Vec<ResolvedMount> {
     let staples = STAPLES
         .iter()
         .map(|source| ((*source).to_string(), resolve_container_target(source, "")));
-    let agent_config = PI_AGENT_CONFIG.iter().map(|entry| {
+    let agent_config = agent.config_allowlist().iter().map(move |entry| {
         (
-            format!("{HOST_PI_AGENT_DIR}/{entry}"),
-            format!("{PI_AGENT_DIR}/{entry}"),
+            format!("{}/{entry}", agent.host_config_dir()),
+            format!("{}/{entry}", agent.container_config_dir()),
         )
     });
 
@@ -501,6 +761,25 @@ mod tests {
     use super::*;
 
     const WS: &str = "/workspace/test-slug";
+
+    /// A ScopedConfig with the given layers and an inert trivial profile,
+    /// for tests that only exercise merging.
+    fn scoped(layers: Vec<ConfigLayer>) -> ScopedConfig {
+        ScopedConfig {
+            layers,
+            profiles: BTreeMap::new(),
+            selection: ScopedValue {
+                scope: Scope::Binary,
+                value: DEFAULT_PROFILE.into(),
+            },
+            profile: Profile {
+                name: DEFAULT_PROFILE.into(),
+                agent: Agent::Pi,
+                env: Vec::new(),
+                mounts: Vec::new(),
+            },
+        }
+    }
 
     #[test]
     fn parse_mounts() {
@@ -720,13 +999,11 @@ mod tests {
 
     #[test]
     fn merged_mounts_accumulates_across_layers() {
-        let config = ScopedConfig {
-            layers: vec![
-                layer(Scope::Binary, vec![mount("/a", "/a", false)]),
-                layer(Scope::User, vec![mount("/b", "/b", true)]),
-                layer(Scope::Project, vec![mount("/c", "/c", true)]),
-            ],
-        };
+        let config = scoped(vec![
+            layer(Scope::Binary, vec![mount("/a", "/a", false)]),
+            layer(Scope::User, vec![mount("/b", "/b", true)]),
+            layer(Scope::Project, vec![mount("/c", "/c", true)]),
+        ]);
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 3);
         let a = merged.iter().find(|sv| sv.value.target == "/a").unwrap();
@@ -739,22 +1016,20 @@ mod tests {
 
     #[test]
     fn merged_mounts_deduplicates_by_target() {
-        let config = ScopedConfig {
-            layers: vec![
-                layer(
-                    Scope::User,
-                    vec![
-                        mount("/user/git", "/root/.config/git", false),
-                        mount("/user/jj", "/root/.config/jj", false),
-                    ],
-                ),
-                layer(
-                    Scope::Project,
-                    // Override the user git mount with a different source
-                    vec![mount("/project/git", "/root/.config/git", true)],
-                ),
-            ],
-        };
+        let config = scoped(vec![
+            layer(
+                Scope::User,
+                vec![
+                    mount("/user/git", "/root/.config/git", false),
+                    mount("/user/jj", "/root/.config/jj", false),
+                ],
+            ),
+            layer(
+                Scope::Project,
+                // Override the user git mount with a different source
+                vec![mount("/project/git", "/root/.config/git", true)],
+            ),
+        ]);
         let merged = config.merged_mounts();
         // /root/.config/git appears in both layers; project layer wins
         assert_eq!(merged.len(), 2);
@@ -774,18 +1049,16 @@ mod tests {
 
     #[test]
     fn merged_mounts_orders_parents_before_children() {
-        let config = ScopedConfig {
-            layers: vec![
-                layer(
-                    Scope::Binary,
-                    vec![mount("/host/agents-md", "/root/.pi/agent/AGENTS.md", false)],
-                ),
-                layer(
-                    Scope::User,
-                    vec![mount("/host/agent-dir", "/root/.pi/agent", true)],
-                ),
-            ],
-        };
+        let config = scoped(vec![
+            layer(
+                Scope::Binary,
+                vec![mount("/host/agents-md", "/root/.pi/agent/AGENTS.md", false)],
+            ),
+            layer(
+                Scope::User,
+                vec![mount("/host/agent-dir", "/root/.pi/agent", true)],
+            ),
+        ]);
         let merged = config.merged_mounts();
         let targets: Vec<&str> = merged.iter().map(|sv| sv.value.target.as_str()).collect();
         assert_eq!(
@@ -796,30 +1069,26 @@ mod tests {
 
     #[test]
     fn dev_null_mask_removes_inherited_mount() {
-        let config = ScopedConfig {
-            layers: vec![
-                layer(
-                    Scope::Binary,
-                    vec![mount("/host/skills", "/root/.pi/agent/skills", false)],
-                ),
-                layer(
-                    Scope::Project,
-                    vec![mount("/dev/null", "/root/.pi/agent/skills", false)],
-                ),
-            ],
-        };
+        let config = scoped(vec![
+            layer(
+                Scope::Binary,
+                vec![mount("/host/skills", "/root/.pi/agent/skills", false)],
+            ),
+            layer(
+                Scope::Project,
+                vec![mount("/dev/null", "/root/.pi/agent/skills", false)],
+            ),
+        ]);
         let merged = config.merged_mounts();
         assert!(merged.is_empty(), "mask should remove the inherited mount");
     }
 
     #[test]
     fn dev_null_without_inherited_mount_stays_a_bind() {
-        let config = ScopedConfig {
-            layers: vec![layer(
-                Scope::Project,
-                vec![mount("/dev/null", "/workspace/test-slug/.envrc", false)],
-            )],
-        };
+        let config = scoped(vec![layer(
+            Scope::Project,
+            vec![mount("/dev/null", "/workspace/test-slug/.envrc", false)],
+        )]);
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].value.source, PathBuf::from("/dev/null"));
@@ -827,13 +1096,11 @@ mod tests {
 
     #[test]
     fn mount_overriding_mask_survives() {
-        let config = ScopedConfig {
-            layers: vec![
-                layer(Scope::Binary, vec![mount("/host/skills", "/s", false)]),
-                layer(Scope::User, vec![mount("/dev/null", "/s", false)]),
-                layer(Scope::Project, vec![mount("/project/skills", "/s", false)]),
-            ],
-        };
+        let config = scoped(vec![
+            layer(Scope::Binary, vec![mount("/host/skills", "/s", false)]),
+            layer(Scope::User, vec![mount("/dev/null", "/s", false)]),
+            layer(Scope::Project, vec![mount("/project/skills", "/s", false)]),
+        ]);
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].value.source, PathBuf::from("/project/skills"));
@@ -843,7 +1110,7 @@ mod tests {
     #[test]
     fn load_with_no_project_config() {
         // Use a workspace with no .ramekin/ config files
-        let config = ScopedConfig::load(Path::new("/tmp"), WS).unwrap();
+        let config = ScopedConfig::load(Path::new("/tmp"), WS, None).unwrap();
         // Binary layer is always first (lowest precedence)
         assert_eq!(config.layers.first().unwrap().scope, Scope::Binary);
         // No project layers
@@ -867,7 +1134,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = ScopedConfig::load(dir.path(), WS).unwrap();
+        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
 
         let project = config
             .layers
@@ -912,9 +1179,7 @@ mod tests {
                 value: Some("project".into()),
             }],
         };
-        let config = ScopedConfig {
-            layers: vec![user, project],
-        };
+        let config = scoped(vec![user, project]);
         let merged = config.merged_env();
         assert_eq!(merged.len(), 2);
         let foo = merged.iter().find(|sv| sv.value.name == "FOO").unwrap();
@@ -922,5 +1187,189 @@ mod tests {
         assert_eq!(foo.scope, Scope::Project);
         let bar = merged.iter().find(|sv| sv.value.name == "BAR").unwrap();
         assert_eq!(bar.scope, Scope::User);
+    }
+
+    #[test]
+    fn parse_profile_definition() {
+        let raw = parse_config(
+            r#"
+            profile "claude-bedrock" {
+                agent "claude"
+                env {
+                    CLAUDE_CODE_USE_BEDROCK "1"
+                    AWS_PROFILE
+                }
+                mounts { source "~/.aws" }
+            }
+            "#,
+        )
+        .unwrap();
+        assert!(raw.selections.is_empty());
+        assert_eq!(raw.profiles.len(), 1);
+        let p = &raw.profiles[0];
+        assert_eq!(p.name, "claude-bedrock");
+        assert_eq!(p.agent, Agent::Claude);
+        assert_eq!(p.env.len(), 2);
+        assert_eq!(p.env[1].name, "AWS_PROFILE");
+        assert_eq!(p.env[1].value, None);
+        assert_eq!(p.mounts.len(), 1);
+        assert_eq!(p.mounts[0].source, "~/.aws");
+    }
+
+    #[test]
+    fn parse_profile_selection() {
+        let raw = parse_config(r#"profile "pi-glm""#).unwrap();
+        assert!(raw.profiles.is_empty());
+        assert_eq!(raw.selections, vec!["pi-glm".to_string()]);
+    }
+
+    #[test]
+    fn profile_without_agent_is_rejected() {
+        let result = parse_config(r#"profile "x" { env { FOO "1" } }"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn profile_with_unknown_agent_is_rejected() {
+        let result = parse_config(r#"profile "x" { agent "glm" }"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builtin_trivial_profile_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        assert_eq!(config.selection.value, "pi");
+        assert_eq!(config.selection.scope, Scope::Binary);
+        assert_eq!(config.agent(), Agent::Pi);
+    }
+
+    #[test]
+    fn project_selection_beats_binary_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(ramekin_dir.join("config.kdl"), "profile \"claude\"\n").unwrap();
+
+        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        assert_eq!(config.selection.value, "claude");
+        assert_eq!(config.selection.scope, Scope::Project);
+        assert_eq!(config.agent(), Agent::Claude);
+    }
+
+    #[test]
+    fn cli_selection_beats_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(ramekin_dir.join("config.kdl"), "profile \"claude\"\n").unwrap();
+
+        let config = ScopedConfig::load(dir.path(), WS, Some("pi")).unwrap();
+        assert_eq!(config.selection.value, "pi");
+        assert_eq!(config.selection.scope, Scope::Cli);
+        assert_eq!(config.agent(), Agent::Pi);
+    }
+
+    #[test]
+    fn unknown_profile_selection_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ScopedConfig::load(dir.path(), WS, Some("bogus")).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn profile_env_and_mounts_form_a_layer_below_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.kdl"),
+            r#"
+            profile "pi-glm" {
+                agent "pi"
+                env {
+                    ANTHROPIC_BASE_URL "https://open.bigmodel.cn/api/anthropic"
+                    ZHIPU_API_KEY
+                }
+                mounts {
+                    source "/tmp"
+                    target "/root/extra"
+                }
+            }
+            profile "pi-glm"
+            env {
+                ANTHROPIC_BASE_URL "https://elsewhere.example"
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        assert_eq!(config.profile.name, "pi-glm");
+
+        // Layered env overlays the profile's env per variable.
+        let merged = config.merged_env();
+        let base_url = merged
+            .iter()
+            .find(|sv| sv.value.name == "ANTHROPIC_BASE_URL")
+            .unwrap();
+        assert_eq!(base_url.scope, Scope::Project);
+        assert_eq!(
+            base_url.value.value.as_deref(),
+            Some("https://elsewhere.example")
+        );
+        let key = merged
+            .iter()
+            .find(|sv| sv.value.name == "ZHIPU_API_KEY")
+            .unwrap();
+        assert_eq!(key.scope, Scope::Profile);
+        assert_eq!(key.value.value, None);
+
+        // Profile mounts join the merge at profile scope.
+        let mounts = config.merged_mounts();
+        let extra = mounts
+            .iter()
+            .find(|sv| sv.value.target == "/root/extra")
+            .unwrap();
+        assert_eq!(extra.scope, Scope::Profile);
+    }
+
+    #[test]
+    fn later_layer_redefines_profile_wholesale() {
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.kdl"),
+            r#"
+            profile "custom" {
+                agent "pi"
+                env { FOO "project" }
+            }
+            profile "custom"
+            "#,
+        )
+        .unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.local.kdl"),
+            r#"
+            profile "custom" {
+                agent "claude"
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        // Local layer's definition wins wholesale: agent changes, env gone.
+        assert_eq!(config.agent(), Agent::Claude);
+        assert!(config.profile.env.is_empty());
+    }
+
+    #[test]
+    fn agent_allowlists() {
+        assert!(Agent::Pi.config_allowlist().contains(&"AGENTS.md"));
+        assert!(Agent::Claude.config_allowlist().contains(&"CLAUDE.md"));
+        assert_eq!(Agent::Claude.container_config_dir(), "/root/.claude");
     }
 }
