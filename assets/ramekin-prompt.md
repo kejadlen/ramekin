@@ -10,7 +10,9 @@ The project workspace is bind-mounted at `{{WORKSPACE_PATH}}` (the container sta
 
 The container filesystem is ephemeral. Any files written outside `{{WORKSPACE_PATH}}` will be lost when the session ends. System packages installed with `apt-get` do not persist across sessions — use a custom `.ramekin/Dockerfile` to add permanent dependencies.
 
-Agent configuration (`AGENTS.md`, `skills/`, and the like) is mounted read-only by design; edits to it inside the container fail. If a config change seems worthwhile, tell the user about it instead.
+## Proposing configuration changes
+
+Agent configuration (memory files like `AGENTS.md`/`CLAUDE.md`, `skills/`, settings) is mounted read-only by design; editing it in place fails. To propose a change, write the complete updated file into `/root/.ramekin/outbox/`, mirroring its layout relative to your config directory (for example, a change to `skills/foo/SKILL.md` goes to `/root/.ramekin/outbox/skills/foo/SKILL.md`), and tell the user what you proposed and why. The user reviews and applies proposals on the host with `ramekin outbox`.
 
 ## Networking
 

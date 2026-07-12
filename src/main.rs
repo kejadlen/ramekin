@@ -1,4 +1,5 @@
 mod config;
+mod outbox;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -56,10 +57,42 @@ enum Cmd {
     },
     /// Show resolved paths and mount configuration
     Config,
+    /// Review config changes proposed by agents
+    Outbox {
+        #[command(subcommand)]
+        command: OutboxCmd,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutboxCmd {
+    /// List pending proposals across all repos and sessions
+    List,
+    /// Diff proposals against the host config they were mounted from
+    Diff {
+        /// A single proposal (`<slug>/<session>/<path>`) or session
+        /// (`<slug>/<session>`); all proposals when omitted
+        entry: Option<String>,
+    },
+    /// Copy a proposal over its host source, after confirmation
+    Apply {
+        /// The proposal to apply (`<slug>/<session>/<path>`)
+        entry: String,
+        /// Destination for proposals that don't map back to an allowlisted
+        /// agent-config entry
+        #[arg(long)]
+        to: Option<PathBuf>,
+    },
+    /// Drop proposals without applying them
+    Discard {
+        /// A single proposal (`<slug>/<session>/<path>`) or a whole session
+        /// (`<slug>/<session>`)
+        entry: String,
     },
 }
 
@@ -86,13 +119,130 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Outbox review is host-global: it spans repos and needs no workspace,
+    // profile, or agent resolution.
+    if let Cmd::Outbox { command } = command {
+        return run_outbox(command);
+    }
+
     let ramekin = Ramekin::resolve(cli.workspace, cli.profile.as_deref())?;
 
     match command {
         Cmd::Run { rebuild } => ramekin.run(rebuild, &cli.agent_args),
         Cmd::Config => ramekin.config(),
-        Cmd::Completions { .. } => unreachable!(),
+        Cmd::Completions { .. } | Cmd::Outbox { .. } => unreachable!(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Outbox commands
+// ---------------------------------------------------------------------------
+
+fn run_outbox(command: OutboxCmd) -> Result<()> {
+    let data_home = xdg::BaseDirectories::with_prefix("ramekin")
+        .get_data_home()
+        .ok_or_else(|| miette!("could not determine XDG data home"))?;
+
+    match command {
+        OutboxCmd::List => {
+            let proposals = outbox::scan(&data_home)?;
+            if proposals.is_empty() {
+                println!("no pending proposals");
+                return Ok(());
+            }
+            for p in proposals {
+                match p.host_target() {
+                    Some(target) => println!("{} → {}", p.entry(), target.display()),
+                    None => println!("{} (no mapped target; apply needs --to)", p.entry()),
+                }
+            }
+        }
+        OutboxCmd::Diff { entry } => {
+            let proposals = match entry {
+                Some(entry) => outbox::find(&data_home, &entry)?,
+                None => outbox::scan(&data_home)?,
+            };
+            for p in proposals {
+                diff_proposal(&p, p.host_target().as_deref())?;
+            }
+        }
+        OutboxCmd::Apply { entry, to } => {
+            let proposals = outbox::find(&data_home, &entry)?;
+            let [proposal] = proposals.as_slice() else {
+                bail!(
+                    "`{entry}` matches {} proposals; apply one file at a time",
+                    proposals.len()
+                );
+            };
+            let target = to.or_else(|| proposal.host_target()).ok_or_else(|| {
+                miette!(
+                    "`{entry}` doesn't map back to an allowlisted agent-config entry; \
+                     pass an explicit destination with --to"
+                )
+            })?;
+
+            diff_proposal(proposal, Some(&target))?;
+            if !confirm(&format!("apply to {}?", target.display()))? {
+                println!("not applied");
+                return Ok(());
+            }
+
+            // Write through a symlinked host source (dotfiles), so the
+            // change lands in the dotfiles working copy, not over the link.
+            let dest = if target.exists() {
+                target.canonicalize().into_diagnostic()?
+            } else {
+                if let Some(parent) = target.parent() {
+                    fs_err::create_dir_all(parent).into_diagnostic()?;
+                }
+                target
+            };
+            fs_err::copy(&proposal.file, &dest).into_diagnostic()?;
+            outbox::remove(&data_home, proposal)?;
+            println!("applied to {}", dest.display());
+        }
+        OutboxCmd::Discard { entry } => {
+            for proposal in outbox::find(&data_home, &entry)? {
+                outbox::remove(&data_home, &proposal)?;
+                println!("discarded {}", proposal.entry());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Show a proposal's diff against its host source (difftastic when
+/// available, `diff -u` otherwise). A missing host source diffs against
+/// /dev/null, i.e. shows the whole proposal as new.
+fn diff_proposal(proposal: &outbox::Proposal, target: Option<&Path>) -> Result<()> {
+    println!("--- {}", proposal.entry());
+    let host: &Path = match target {
+        Some(t) if t.exists() => t,
+        _ => Path::new("/dev/null"),
+    };
+    let difft = Command::new("difft").arg(host).arg(&proposal.file).status();
+    if difft.is_err() {
+        // difftastic not installed; plain diff. Exit code 1 just means the
+        // files differ.
+        Command::new("diff")
+            .arg("-u")
+            .arg(host)
+            .arg(&proposal.file)
+            .status()
+            .into_diagnostic()
+            .wrap_err("failed to run diff")?;
+    }
+    Ok(())
+}
+
+/// Ask the user to confirm on stdin. Anything but `y`/`yes` is a no.
+fn confirm(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N] ");
+    std::io::stdout().flush().into_diagnostic()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).into_diagnostic()?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +449,7 @@ struct Ramekin {
     workspace_target: String,
     repo_slug: String,
     xdg: xdg::BaseDirectories,
+    data_home: PathBuf,
     cache_dir: PathBuf,
     custom_dockerfile: Option<PathBuf>,
     config: config::ScopedConfig,
@@ -343,6 +494,7 @@ impl Ramekin {
             workspace_target,
             repo_slug,
             xdg,
+            data_home,
             cache_dir,
             custom_dockerfile,
             config,
@@ -350,14 +502,19 @@ impl Ramekin {
         })
     }
 
-    /// Session plumbing mounts shared by both agents: the rendered prompt
-    /// and the workspace.
-    fn session_mounts(&self, session_dir: &Path) -> Vec<config::ResolvedMount> {
+    /// Session plumbing mounts shared by both agents: the rendered prompt,
+    /// the outbox, and the workspace.
+    fn session_mounts(&self, session_dir: &Path, outbox_dir: &Path) -> Vec<config::ResolvedMount> {
         let mut mounts = self.agent_state.mounts(session_dir);
         mounts.push(config::ResolvedMount {
             source: session_dir.join("ramekin-prompt.md"),
             target: PROMPT_TARGET.into(),
             writable: false,
+        });
+        mounts.push(config::ResolvedMount {
+            source: outbox_dir.to_path_buf(),
+            target: outbox::OUTBOX_TARGET.into(),
+            writable: true,
         });
         mounts.push(config::ResolvedMount {
             source: self.workspace.clone(),
@@ -453,9 +610,12 @@ impl Ramekin {
 
         // Session mounts (sources materialize per run; shown with a placeholder)
         let placeholder = self.cache_dir.join("sessions/<session>");
+        let outbox_placeholder = self
+            .data_home
+            .join(format!("repos/{}/outbox/<session>", self.repo_slug));
         println!();
         println!("Session mounts");
-        for mount in self.session_mounts(&placeholder) {
+        for mount in self.session_mounts(&placeholder, &outbox_placeholder) {
             println!(
                 "    {} → {}",
                 mount.source.display(),
@@ -587,7 +747,11 @@ impl Ramekin {
         let prompt = RAMEKIN_PROMPT.replace("{{WORKSPACE_PATH}}", &self.workspace_target);
         fs_err::write(session_dir.join("ramekin-prompt.md"), prompt).into_diagnostic()?;
 
-        let session_mounts = self.session_mounts(&session_dir);
+        let outbox_dir =
+            outbox::create_session(&self.data_home, &self.repo_slug, &session_id, agent)
+                .wrap_err("failed to create session outbox")?;
+
+        let session_mounts = self.session_mounts(&session_dir, &outbox_dir);
         let all_mounts = self.final_mounts(&session_mounts);
         let env_vars = self.config.merged_env();
         let compose = generate_compose(ComposeParams {
@@ -687,6 +851,15 @@ impl Ramekin {
                 }
                 Err(e) => error!("failed to inspect session agent dir: {e}"),
             }
+        }
+
+        // A non-empty outbox survives teardown as pending proposals.
+        match outbox::finish_session(&self.data_home, &self.repo_slug, &session_id) {
+            Ok(0) => {}
+            Ok(pending) => {
+                info!("{pending} config proposal(s) pending — review with `ramekin outbox list`");
+            }
+            Err(e) => error!("failed to finalize session outbox: {e}"),
         }
 
         if let Err(e) = fs_err::remove_dir_all(&session_dir) {
