@@ -227,21 +227,41 @@ impl ScopedConfig {
         workspace_target: &str,
         cli_profile: Option<&str>,
     ) -> Result<Self> {
+        // Resolve the user config home here rather than in `load_from` so
+        // tests can inject an isolated directory and stay independent of
+        // whatever `~/.config/ramekin/` holds on the developer's machine.
+        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
+        Self::load_from(
+            xdg.get_config_home().as_deref(),
+            workspace,
+            workspace_target,
+            cli_profile,
+        )
+    }
+
+    /// The layered load with the user config directory injected. `config_home`
+    /// is where the user layer's `*.kdl` files live; `None`, or a path that
+    /// isn't a directory, skips the user layer.
+    fn load_from(
+        config_home: Option<&Path>,
+        workspace: &Path,
+        workspace_target: &str,
+        cli_profile: Option<&str>,
+    ) -> Result<Self> {
         let mut builders = Vec::new();
 
         // User layer: every *.kdl in the config dir, sorted by name for
         // deterministic merging. Which files exist (and which are symlinks
         // into dotfiles) is a dotfiles decision, not a ramekin one.
-        let xdg = xdg::BaseDirectories::with_prefix("ramekin");
-        if let Some(config_dir) = xdg.get_config_home().filter(|d| d.is_dir()) {
-            let mut files: Vec<PathBuf> = fs_err::read_dir(&config_dir)
+        if let Some(config_dir) = config_home.filter(|d| d.is_dir()) {
+            let mut files: Vec<PathBuf> = fs_err::read_dir(config_dir)
                 .into_diagnostic()?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
                 .filter(|p| p.extension().is_some_and(|ext| ext == "kdl") && p.is_file())
                 .collect();
             files.sort();
             if !files.is_empty() {
-                let mut builder = LayerBuilder::new(Scope::User, Some(config_dir));
+                let mut builder = LayerBuilder::new(Scope::User, Some(config_dir.to_path_buf()));
                 for file in &files {
                     builder.add_file(file, workspace_target)?;
                 }
@@ -1093,7 +1113,7 @@ mod tests {
     #[test]
     fn load_with_no_project_config() {
         // Use a workspace with no .ramekin/ config files
-        let config = ScopedConfig::load(Path::new("/tmp"), WS, None).unwrap();
+        let config = ScopedConfig::load_from(None, Path::new("/tmp"), WS, None).unwrap();
         // Binary layer is always first (lowest precedence)
         assert_eq!(config.layers.first().unwrap().scope, Scope::Binary);
         // No project layer
@@ -1111,7 +1131,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        let config = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap();
 
         let project = config
             .layers
@@ -1122,6 +1142,26 @@ mod tests {
         assert_eq!(project.mounts[0].target, "/container/tmp");
         assert_eq!(project.env.len(), 1);
         assert_eq!(project.env[0].name, "FOO");
+    }
+
+    #[test]
+    fn user_layer_loads_from_injected_config_home() {
+        // The user layer reads from the injected config home, not the
+        // developer's real `~/.config/ramekin/`. A bare `profile` selection
+        // there overrides the binary `pi` default.
+        let config_home = tempfile::tempdir().unwrap();
+        fs_err::write(
+            config_home.path().join("config.kdl"),
+            "profile \"claude\"\n",
+        )
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let config =
+            ScopedConfig::load_from(Some(config_home.path()), workspace.path(), WS, None).unwrap();
+
+        assert_eq!(config.selected_by, Some(Scope::User));
+        assert_eq!(config.agent(), Agent::Claude);
     }
 
     #[test]
@@ -1209,7 +1249,7 @@ mod tests {
     #[test]
     fn builtin_trivial_profile_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
-        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        let config = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap();
         assert_eq!(config.profile.name, "pi");
         assert_eq!(config.selected_by, Some(Scope::Binary));
         assert_eq!(config.agent(), Agent::Pi);
@@ -1222,7 +1262,7 @@ mod tests {
         fs_err::create_dir_all(&ramekin_dir).unwrap();
         fs_err::write(ramekin_dir.join("config.kdl"), "profile \"claude\"\n").unwrap();
 
-        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        let config = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap();
         assert_eq!(config.profile.name, "claude");
         assert_eq!(config.selected_by, Some(Scope::Project));
         assert_eq!(config.agent(), Agent::Claude);
@@ -1235,7 +1275,7 @@ mod tests {
         fs_err::create_dir_all(&ramekin_dir).unwrap();
         fs_err::write(ramekin_dir.join("config.kdl"), "profile \"claude\"\n").unwrap();
 
-        let config = ScopedConfig::load(dir.path(), WS, Some("pi")).unwrap();
+        let config = ScopedConfig::load_from(None, dir.path(), WS, Some("pi")).unwrap();
         assert_eq!(config.profile.name, "pi");
         // `-p` isn't a layer; selected_by is None.
         assert_eq!(config.selected_by, None);
@@ -1245,7 +1285,7 @@ mod tests {
     #[test]
     fn unknown_profile_selection_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = ScopedConfig::load(dir.path(), WS, Some("bogus")).unwrap_err();
+        let err = ScopedConfig::load_from(None, dir.path(), WS, Some("bogus")).unwrap_err();
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
@@ -1276,7 +1316,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        let config = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap();
         assert_eq!(config.profile.name, "pi-glm");
 
         // Layered env overlays the profile's env per variable.
@@ -1322,7 +1362,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
+        let config = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap();
         // The default selection still names `pi`, but the project layer's
         // definition wins wholesale: it now runs claude.
         assert_eq!(config.profile.name, "pi");
