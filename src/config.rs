@@ -532,7 +532,7 @@ fn parse_config(content: &str) -> Result<RawConfig> {
     let mut raw = RawConfig::default();
     for node in doc.nodes() {
         match node.name().value() {
-            "mounts" => raw.mounts.push(parse_mount(node)?),
+            "mounts" => raw.mounts.extend(parse_mounts(node)?),
             "env" => raw.env.extend(parse_env(node)?),
             // `profile "name" { ... }` defines; `profile "name"` selects.
             "profile" => match parse_profile(node)? {
@@ -571,7 +571,7 @@ fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
         match child.name().value() {
             "agent" => agent = Some(Agent::parse(&single_string_arg(child)?)?),
             "env" => env.extend(parse_env(child)?),
-            "mounts" => mounts.push(parse_mount(child)?),
+            "mounts" => mounts.extend(parse_mounts(child)?),
             other => bail!("unknown `profile` field `{other}`"),
         }
     }
@@ -585,28 +585,70 @@ fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
     }))
 }
 
-fn parse_mount(node: &KdlNode) -> Result<Mount> {
+/// Parse a `mounts` block. Exactly one syntax, mirroring `env`: a block with
+/// one child node per mount, whose name is the host source path, with
+/// optional `target` and `writable` properties.
+fn parse_mounts(node: &KdlNode) -> Result<Vec<Mount>> {
     if !node.entries().is_empty() {
-        bail!("`mounts` takes a block of child nodes, not inline values");
+        bail!("`mounts` takes a block (mounts {{ \"~/path\" }}), not inline values");
     }
-    let children = node
-        .children()
-        .ok_or_else(|| miette!("`mounts` requires a block with a `source`"))?;
+    let Some(children) = node.children() else {
+        return Ok(Vec::new());
+    };
+    children.nodes().iter().map(parse_mount).collect()
+}
 
-    let mut source = None;
+fn parse_mount(node: &KdlNode) -> Result<Mount> {
+    let source = node.name().value().to_string();
+    // Catch the retired one-block-per-mount form (`mounts { source "..." }`)
+    // and point at the current shape instead of misparsing its field names
+    // as source paths.
+    if matches!(source.as_str(), "source" | "target" | "writable") {
+        bail!(
+            "`{source}` is not a mount source: each mount is one node, \
+             e.g. mounts {{ \"~/path\" target=\"/container/path\" writable=#true }}"
+        );
+    }
+    if node.children().is_some() {
+        bail!("mount \"{source}\" takes properties (target=\"...\", writable=#true), not a block");
+    }
+
     let mut target = None;
     let mut writable = false;
-    for child in children.nodes() {
-        match child.name().value() {
-            "source" => source = Some(single_string_arg(child)?),
-            "target" => target = Some(single_string_arg(child)?),
-            "writable" => writable = bool_flag(child)?,
-            other => bail!("unknown `mounts` field `{other}`"),
+    for entry in node.entries() {
+        let Some(name) = entry.name() else {
+            if entry.value().as_string() == Some("writable") {
+                bail!("mount \"{source}\": write writable=#true to allow writes");
+            }
+            bail!(
+                "mount \"{source}\": unexpected argument {}; the container path \
+                 goes in target=\"...\"",
+                entry.value()
+            );
+        };
+        match name.value() {
+            "target" => match entry.value().as_string() {
+                Some(s) => target = Some(s.to_string()),
+                None => bail!(
+                    "mount \"{source}\": `target` takes a string, got {}",
+                    entry.value()
+                ),
+            },
+            "writable" => match entry.value().as_bool() {
+                Some(b) => writable = b,
+                None => bail!(
+                    "mount \"{source}\": `writable` takes #true or #false, got {}",
+                    entry.value()
+                ),
+            },
+            other => bail!(
+                "mount \"{source}\": unknown property `{other}` (expected `target` or `writable`)"
+            ),
         }
     }
 
     Ok(Mount {
-        source: source.ok_or_else(|| miette!("`mounts` block is missing `source`"))?,
+        source,
         target,
         writable,
     })
@@ -656,21 +698,6 @@ fn optional_string_arg(node: &KdlNode) -> Result<Option<String>> {
             ),
         },
         _ => bail!("`{}` takes at most one string value", node.name().value()),
-    }
-}
-
-/// A boolean flag node: bare means true, or one boolean argument.
-fn bool_flag(node: &KdlNode) -> Result<bool> {
-    match node.entries() {
-        [] => Ok(true),
-        [entry] if entry.name().is_none() => entry.value().as_bool().ok_or_else(|| {
-            miette!(
-                "`{}` takes a boolean value, got {}",
-                node.name().value(),
-                entry.value()
-            )
-        }),
-        _ => bail!("`{}` takes at most one boolean value", node.name().value()),
     }
 }
 
@@ -786,23 +813,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_mounts() {
+    fn parse_mounts_block() {
         let raw = parse_config(
             r#"
             mounts {
-                source "~/.config/git"
-            }
-            mounts {
-                source "~/.local/share/ranger"
-                writable
-            }
-            mounts {
-                source "~/Downloads"
-                target "/root/downloads"
-            }
-            mounts {
-                source "/x"
-                writable #false
+                "~/.config/git"
+                "~/.local/share/ranger" writable=#true
+                "~/Downloads" target="/root/downloads"
+                "/x" writable=#false
             }
             "#,
         )
@@ -850,22 +868,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mount_field_is_rejected() {
-        let result = parse_config(
-            r#"
-            mounts {
-                source "/x"
-                bogus "y"
-            }
-            "#,
-        );
+    fn unknown_mount_property_is_rejected() {
+        let result = parse_config(r#"mounts { "/x" bogus="y" }"#);
         assert!(result.is_err());
     }
 
     #[test]
-    fn mount_without_source_is_rejected() {
-        let result = parse_config("mounts {\ntarget \"/x\"\n}");
+    fn mount_positional_argument_is_rejected() {
+        // The target goes in a property, not a bare argument.
+        let result = parse_config(r#"mounts { "/x" "/y" }"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mount_block_form_is_rejected() {
+        // The old one-block-per-mount form is gone: one shape, no synonyms.
+        let err = parse_config(r#"mounts { source "/x" target "/y" }"#).unwrap_err();
+        assert!(err.to_string().contains("not a mount source"), "{err}");
+    }
+
+    #[test]
+    fn mount_bare_writable_suggests_the_property() {
+        let err = parse_config(r#"mounts { "/x" writable }"#).unwrap_err();
+        assert!(err.to_string().contains("writable=#true"), "{err}");
     }
 
     #[test]
@@ -887,8 +912,8 @@ mod tests {
     #[test]
     fn duplicate_mount_target_within_layer_is_an_error() {
         let mut builder = LayerBuilder::new(Scope::User, None);
-        let a = parse_config("mounts {\nsource \"/tmp\"\ntarget \"/t\"\n}").unwrap();
-        let b = parse_config("mounts {\nsource \"/dev/null\"\ntarget \"/t\"\n}").unwrap();
+        let a = parse_config(r#"mounts { "/tmp" target="/t" }"#).unwrap();
+        let b = parse_config(r#"mounts { "/dev/null" target="/t" }"#).unwrap();
         builder.add(a, Path::new("a.kdl"), WS).unwrap();
         let err = builder.add(b, Path::new("b.kdl"), WS).unwrap_err();
         assert!(err.to_string().contains("/t"), "{err}");
@@ -897,8 +922,8 @@ mod tests {
     #[test]
     fn missing_source_skips_duplicate_detection() {
         let mut builder = LayerBuilder::new(Scope::User, None);
-        let a = parse_config("mounts {\nsource \"/nonexistent-a\"\ntarget \"/t\"\n}").unwrap();
-        let b = parse_config("mounts {\nsource \"/tmp\"\ntarget \"/t\"\n}").unwrap();
+        let a = parse_config(r#"mounts { "/nonexistent-a" target="/t" }"#).unwrap();
+        let b = parse_config(r#"mounts { "/tmp" target="/t" }"#).unwrap();
         builder.add(a, Path::new("a.kdl"), WS).unwrap();
         builder.add(b, Path::new("b.kdl"), WS).unwrap();
         let layer = builder.build();
@@ -1127,7 +1152,7 @@ mod tests {
         fs_err::create_dir_all(&ramekin_dir).unwrap();
         fs_err::write(
             ramekin_dir.join("config.kdl"),
-            "mounts {\nsource \"/tmp\"\ntarget \"/container/tmp\"\n}\nenv {\nFOO \"bar\"\n}\n",
+            "mounts {\n\"/tmp\" target=\"/container/tmp\"\n}\nenv {\nFOO \"bar\"\n}\n",
         )
         .unwrap();
 
@@ -1210,7 +1235,7 @@ mod tests {
                     CLAUDE_CODE_USE_BEDROCK "1"
                     AWS_PROFILE
                 }
-                mounts { source "~/.aws" }
+                mounts { "~/.aws" }
             }
             "#,
         )
@@ -1304,8 +1329,7 @@ mod tests {
                     ZHIPU_API_KEY
                 }
                 mounts {
-                    source "/tmp"
-                    target "/root/extra"
+                    "/tmp" target="/root/extra"
                 }
             }
             profile "pi-glm"

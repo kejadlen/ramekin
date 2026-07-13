@@ -53,7 +53,7 @@ profile "claude-bedrock" {
         CLAUDE_CODE_USE_BEDROCK "1"
         AWS_PROFILE              // bare = pass the host's value through
     }
-    mounts { source "~/.aws" }
+    mounts { "~/.aws" }
 }
 
 profile "pi-glm" {
@@ -107,40 +107,29 @@ Mount configuration merges across layers, lowest to highest precedence:
 Additional host paths can be mounted into the container via the KDL layers. Directories, files, and devices (such as `/dev/null`) all work. Mounts whose source doesn't exist on the host are silently skipped.
 
 ```kdl
-// Mount ranger database (writable)
 mounts {
-    source "~/.local/share/ranger"
-    writable
-}
-
-// Mount extra data at an explicit path
-mounts {
-    source "~/datasets"
-    target "/root/datasets"
+    // Ranger database, writable
+    "~/.local/share/ranger" writable=#true
+    // Extra data at an explicit container path
+    "~/datasets" target="/root/datasets"
 }
 ```
 
-Each `mounts` block supports:
+A `mounts` block holds one child node per mount, mirroring `env`. The node name is the host source path (`~` expands to the home directory), with optional properties:
 
-| Field | Required | Description |
-|---|---|---|
-| `source` | yes | Host path (`~` expands to home directory) |
-| `target` | no | Container path; `~` expands to the container home, a relative path resolves against the workspace mount, and omitting it derives the target from the source |
-| `writable` | no | Allow writes (read-only by default) |
+| Property | Description |
+|---|---|
+| `target` | Container path; `~` expands to the container home, a relative path resolves against the workspace mount, and omitting it derives the target from the source |
+| `writable` | `#true` allows writes (read-only by default) |
 
 When two layers define a mount with the same container target, the higher layer wins wholesale. A `/dev/null` source *masks*: it removes a mount inherited from a lower layer (say, a staple or an agent-config entry this machine or project doesn't want), and where there's nothing to remove it stays a real bind, blanking a workspace file from the agent:
 
 ```kdl
-// Remove the inherited skills mount
 mounts {
-    source "/dev/null"
-    target "/root/.pi/agent/skills"
-}
-
-// Hide the repo's .envrc from the agent
-mounts {
-    source "/dev/null"
-    target ".envrc"
+    // Remove the inherited skills mount
+    "/dev/null" target="/root/.pi/agent/skills"
+    // Hide the repo's .envrc from the agent
+    "/dev/null" target=".envrc"
 }
 ```
 

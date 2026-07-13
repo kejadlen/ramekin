@@ -108,7 +108,7 @@ profile "claude-bedrock" {
         CLAUDE_CODE_USE_BEDROCK "1"
         AWS_PROFILE              // bare = pass through the host value
     }
-    mounts { source "~/.aws" }
+    mounts { "~/.aws" }
 }
 
 profile "pi-glm" {
@@ -155,6 +155,18 @@ away; one shape, no synonyms.
 env {
     RUST_BACKTRACE "1"
     GITHUB_TOKEN            // forwarded from the host environment
+}
+```
+
+`mounts` follows the same one-block shape: one child node per mount, whose
+name is the host source path, with optional `target` and `writable`
+properties. (The original one-block-per-mount form — `mounts { source
+"..." }` repeated — was dropped as unergonomic.)
+
+```kdl
+mounts {
+    "~/.local/share/ranger" writable=#true
+    "~/datasets" target="/root/datasets"
 }
 ```
 
