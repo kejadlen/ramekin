@@ -33,8 +33,27 @@ RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
       | tar xz --strip-components=0 -C /usr/local/bin ./jj
 
 RUN --mount=type=cache,target=/root/.npm \
-    npm install -g @mariozechner/pi-coding-agent
+    npm install -g @mariozechner/pi-coding-agent @anthropic-ai/claude-code
+
+# Claude Code refuses --dangerously-skip-permissions when running as root
+# unless IS_SANDBOX=1 acknowledges the sandbox. The container is the sandbox.
+# Pi ignores this.
+ENV IS_SANDBOX=1
+
+# Run Claude in bypass-permissions mode and skip the bypass dialog. Managed
+# settings is the highest tier, so this overrides whatever's in the user's
+# mounted ~/.claude. defaultMode replaces the --dangerously-skip-permissions
+# CLI flag; skipDangerousModePermissionPrompt suppresses the once-per-machine
+# acceptance dialog. The container is already a sandbox (see IS_SANDBOX), so
+# prompting is redundant.
+RUN mkdir -p /etc/claude-code && cat > /etc/claude-code/managed-settings.json <<'EOF'
+{
+  "permissions": { "defaultMode": "bypassPermissions" },
+  "skipDangerousModePermissionPrompt": true
+}
+EOF
 
 WORKDIR /workspace
 
-ENTRYPOINT ["pi"]
+# No ENTRYPOINT: one image carries both agents, and the generated compose
+# config picks `pi` or `claude` per session.

@@ -55,8 +55,10 @@ state while auth stays global; yolo mode belongs in the image (managed
 settings + `IS_SANDBOX=1`); keep side-effect-free `ramekin config`,
 deterministic parent-before-child mount ordering, long-form compose binds,
 and the GitHub-token BuildKit secret. Anti-lesson: one shared image tag
-across agents silently redefines `FROM ramekin-agent` — images must be
-per-agent.
+over two *different* Dockerfiles silently redefines `FROM ramekin-agent`.
+Resolved by collapsing to a single Dockerfile carrying both agents — one
+tag, one definition, entrypoint chosen per session — rather than per-agent
+images.
 
 ## Design
 
@@ -247,13 +249,12 @@ rendered prompt. A possible simplification falls out: if pi groups sessions
 by cwd on its own, distinct workspace paths may make ramekin's per-repo
 `sessions/` mount redundant — verify against pi's actual layout.
 
-Base images build to
-per-agent tags (`ramekin-pi`, `ramekin-claude`); a project
-`.ramekin/Dockerfile` declares `ARG BASE` / `FROM ${BASE}` and ramekin
-passes the active agent's tag, so one project Dockerfile serves both.
-Project image tags stay repo-specific and gain the agent suffix. Concurrent
-builds of the same tag are idempotent; per-agent tags remove the pi/claude
-race.
+One base image (`ramekin-agent`) carries both agents and no ENTRYPOINT;
+the generated compose config sets the entrypoint to `pi` or `claude` per
+session. A project `.ramekin/Dockerfile` builds `FROM ramekin-agent` with
+a repo-specific tag, so one project image serves both agents too.
+Concurrent builds of the same tag are idempotent, and a single Dockerfile
+means there is no pi/claude tag race to avoid.
 
 ### Outbox
 
@@ -290,9 +291,9 @@ secret, side-effect-free `config`) rather than rebasing the branch:
    agent-config mounts replace the `pi {}` block, staples move into the
    binary, teardown report on discarded session-dir writes. Multi-session
    works from here on.
-2. Claude support: agent plumbing, `Dockerfile.claude` (harvested),
-   per-agent tags + `ARG BASE` project builds, ephemeral denylist mounts
-   over `~/.claude` junk.
+2. Claude support: agent plumbing, claude install + managed settings in
+   the shared Dockerfile (harvested), per-session entrypoint selection,
+   ephemeral denylist mounts over `~/.claude` junk.
 3. Profiles: KDL `profile` blocks + builtin trivial profiles, user-KDL
    machine default, project `profile` scalar, `-p`, env passthrough,
    user layer reads `*.kdl`.

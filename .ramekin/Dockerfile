@@ -1,5 +1,4 @@
-ARG BASE
-FROM ${BASE}
+FROM ramekin-agent
 
 ENV RANGER_DEFAULT_BACKLOG="ramekin"
 
