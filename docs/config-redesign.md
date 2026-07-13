@@ -171,8 +171,10 @@ Layers, lowest to highest precedence:
    `profile` selection and machine-only mounts (ranger). Symlink
    granularity is a dotfiles decision, not a ramekin one.
 3. **project** — `<workspace>/.ramekin/config.kdl`, committed
-4. **project-local** — `<workspace>/.ramekin/config.local.kdl`, gitignored
-5. **CLI** — `-p`; `--mount`/`--env` when they earn their keep
+4. **CLI** — `-p`; `--mount`/`--env` when they earn their keep. (A
+   gitignored `config.local.kdl` layer was tried and dropped as
+   unnecessary — `-p` covers the per-run case; revisit if a durable
+   local-override need shows up.)
 
 Merging: `env` merges per variable, overlaying the active profile's env, so
 any layer can adjust one variable without redefining the profile; mounts

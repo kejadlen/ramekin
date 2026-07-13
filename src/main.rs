@@ -552,11 +552,14 @@ impl Ramekin {
 
         println!();
         println!("Profile");
+        let selected_by = self
+            .config
+            .selected_by
+            .map_or("-p".to_string(), |scope| scope.to_string());
         println!(
-            "  {} (agent {}, selected by {})",
+            "  {} (agent {}, selected by {selected_by})",
             self.config.profile.name,
             self.config.agent(),
-            self.config.selection.scope,
         );
         for (name, sv) in &self.config.profiles {
             let marker = if *name == self.config.profile.name {

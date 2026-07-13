@@ -17,10 +17,6 @@ pub enum Scope {
     User,
     /// Project-level `<workspace>/.ramekin/config.kdl`, committed.
     Project,
-    /// Project-local `<workspace>/.ramekin/config.local.kdl`, gitignored.
-    ProjectLocal,
-    /// Command-line arguments (currently just `-p`).
-    Cli,
 }
 
 impl fmt::Display for Scope {
@@ -30,8 +26,6 @@ impl fmt::Display for Scope {
             Self::Profile => write!(f, "profile"),
             Self::User => write!(f, "user"),
             Self::Project => write!(f, "project"),
-            Self::ProjectLocal => write!(f, "project-local"),
-            Self::Cli => write!(f, "cli"),
         }
     }
 }
@@ -186,8 +180,8 @@ pub struct ScopedConfig {
     /// Every known profile (builtin trivial ones plus KDL definitions),
     /// merged by name — later layers take the whole definition.
     pub profiles: BTreeMap<String, ScopedValue<Profile>>,
-    /// The active profile's name and the scope that selected it.
-    pub selection: ScopedValue<String>,
+    /// The layer that selected the active profile, or `None` for `-p`.
+    pub selected_by: Option<Scope>,
     /// The active profile.
     pub profile: Profile,
 }
@@ -215,7 +209,6 @@ impl ScopedConfig {
     /// 2. Profile (the active profile's env and mounts)
     /// 3. User (every `*.kdl` in `~/.config/ramekin/`, merged as one layer)
     /// 4. Project (`<workspace>/.ramekin/config.kdl`)
-    /// 5. Project-local (`<workspace>/.ramekin/config.local.kdl`)
     ///
     /// `cli_profile` is the `-p` selection, which beats any layer's.
     ///
@@ -249,17 +242,12 @@ impl ScopedConfig {
             }
         }
 
-        // Project layers
-        for (scope, name) in [
-            (Scope::Project, "config.kdl"),
-            (Scope::ProjectLocal, "config.local.kdl"),
-        ] {
-            let path = workspace.join(".ramekin").join(name);
-            if path.exists() {
-                let mut builder = LayerBuilder::new(scope, Some(path.clone()));
-                builder.add_file(&path, workspace_target)?;
-                builders.push(builder);
-            }
+        // Project layer
+        let project_path = workspace.join(".ramekin/config.kdl");
+        if project_path.exists() {
+            let mut builder = LayerBuilder::new(Scope::Project, Some(project_path.clone()));
+            builder.add_file(&project_path, workspace_target)?;
+            builders.push(builder);
         }
 
         // Profiles merge by name across layers, last writer takes the whole
@@ -277,10 +265,7 @@ impl ScopedConfig {
                 )
             })
             .collect();
-        let mut selection = ScopedValue {
-            scope: Scope::Binary,
-            value: DEFAULT_PROFILE.to_string(),
-        };
+        let mut selection = (DEFAULT_PROFILE.to_string(), Some(Scope::Binary));
         for builder in &builders {
             for profile in &builder.profiles {
                 profiles.insert(
@@ -292,28 +277,23 @@ impl ScopedConfig {
                 );
             }
             if let Some(name) = &builder.selection {
-                selection = ScopedValue {
-                    scope: builder.scope,
-                    value: name.clone(),
-                };
+                selection = (name.clone(), Some(builder.scope));
             }
         }
         if let Some(name) = cli_profile {
-            selection = ScopedValue {
-                scope: Scope::Cli,
-                value: name.to_string(),
-            };
+            selection = (name.to_string(), None);
         }
+        let (selected_name, selected_by) = selection;
 
         let profile = profiles
-            .get(&selection.value)
+            .get(&selected_name)
             .map(|sv| sv.value.clone())
             .ok_or_else(|| {
                 let known = profiles.keys().cloned().collect::<Vec<_>>().join(", ");
+                let by = selected_by.map_or("-p".to_string(), |s| s.to_string());
                 miette!(
-                    "profile `{}` (selected by {}) is not defined; known profiles: {known}",
-                    selection.value,
-                    selection.scope,
+                    "profile `{selected_name}` (selected by {by}) is not defined; \
+                     known profiles: {known}",
                 )
             })?;
 
@@ -340,7 +320,7 @@ impl ScopedConfig {
         Ok(Self {
             layers,
             profiles,
-            selection,
+            selected_by,
             profile,
         })
     }
@@ -768,10 +748,7 @@ mod tests {
         ScopedConfig {
             layers,
             profiles: BTreeMap::new(),
-            selection: ScopedValue {
-                scope: Scope::Binary,
-                value: DEFAULT_PROFILE.into(),
-            },
+            selected_by: Some(Scope::Binary),
             profile: Profile {
                 name: DEFAULT_PROFILE.into(),
                 agent: Agent::Pi,
@@ -977,7 +954,6 @@ mod tests {
         assert_eq!(Scope::Binary.to_string(), "binary");
         assert_eq!(Scope::User.to_string(), "user");
         assert_eq!(Scope::Project.to_string(), "project");
-        assert_eq!(Scope::ProjectLocal.to_string(), "project-local");
     }
 
     fn layer(scope: Scope, mounts: Vec<ResolvedMount>) -> ConfigLayer {
@@ -1113,9 +1089,8 @@ mod tests {
         let config = ScopedConfig::load(Path::new("/tmp"), WS, None).unwrap();
         // Binary layer is always first (lowest precedence)
         assert_eq!(config.layers.first().unwrap().scope, Scope::Binary);
-        // No project layers
+        // No project layer
         assert!(!config.layers.iter().any(|l| l.scope == Scope::Project));
-        assert!(!config.layers.iter().any(|l| l.scope == Scope::ProjectLocal));
     }
 
     #[test]
@@ -1125,12 +1100,7 @@ mod tests {
         fs_err::create_dir_all(&ramekin_dir).unwrap();
         fs_err::write(
             ramekin_dir.join("config.kdl"),
-            "mounts {\nsource \"/tmp\"\ntarget \"/container/tmp\"\n}\n",
-        )
-        .unwrap();
-        fs_err::write(
-            ramekin_dir.join("config.local.kdl"),
-            "env {\nFOO \"bar\"\n}\n",
+            "mounts {\nsource \"/tmp\"\ntarget \"/container/tmp\"\n}\nenv {\nFOO \"bar\"\n}\n",
         )
         .unwrap();
 
@@ -1143,14 +1113,8 @@ mod tests {
             .expect("project layer missing");
         assert_eq!(project.mounts.len(), 1);
         assert_eq!(project.mounts[0].target, "/container/tmp");
-
-        let local = config
-            .layers
-            .iter()
-            .find(|l| l.scope == Scope::ProjectLocal)
-            .expect("project-local layer missing");
-        assert_eq!(local.env.len(), 1);
-        assert_eq!(local.env[0].name, "FOO");
+        assert_eq!(project.env.len(), 1);
+        assert_eq!(project.env[0].name, "FOO");
     }
 
     #[test]
@@ -1239,8 +1203,8 @@ mod tests {
     fn builtin_trivial_profile_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
         let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
-        assert_eq!(config.selection.value, "pi");
-        assert_eq!(config.selection.scope, Scope::Binary);
+        assert_eq!(config.profile.name, "pi");
+        assert_eq!(config.selected_by, Some(Scope::Binary));
         assert_eq!(config.agent(), Agent::Pi);
     }
 
@@ -1252,8 +1216,8 @@ mod tests {
         fs_err::write(ramekin_dir.join("config.kdl"), "profile \"claude\"\n").unwrap();
 
         let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
-        assert_eq!(config.selection.value, "claude");
-        assert_eq!(config.selection.scope, Scope::Project);
+        assert_eq!(config.profile.name, "claude");
+        assert_eq!(config.selected_by, Some(Scope::Project));
         assert_eq!(config.agent(), Agent::Claude);
     }
 
@@ -1265,8 +1229,9 @@ mod tests {
         fs_err::write(ramekin_dir.join("config.kdl"), "profile \"claude\"\n").unwrap();
 
         let config = ScopedConfig::load(dir.path(), WS, Some("pi")).unwrap();
-        assert_eq!(config.selection.value, "pi");
-        assert_eq!(config.selection.scope, Scope::Cli);
+        assert_eq!(config.profile.name, "pi");
+        // `-p` isn't a layer; selected_by is None.
+        assert_eq!(config.selected_by, None);
         assert_eq!(config.agent(), Agent::Pi);
     }
 
@@ -1339,21 +1304,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ramekin_dir = dir.path().join(".ramekin");
         fs_err::create_dir_all(&ramekin_dir).unwrap();
+        // Redefine the builtin trivial `pi` profile from the project layer.
         fs_err::write(
             ramekin_dir.join("config.kdl"),
             r#"
-            profile "custom" {
-                agent "pi"
-                env { FOO "project" }
-            }
-            profile "custom"
-            "#,
-        )
-        .unwrap();
-        fs_err::write(
-            ramekin_dir.join("config.local.kdl"),
-            r#"
-            profile "custom" {
+            profile "pi" {
                 agent "claude"
             }
             "#,
@@ -1361,9 +1316,12 @@ mod tests {
         .unwrap();
 
         let config = ScopedConfig::load(dir.path(), WS, None).unwrap();
-        // Local layer's definition wins wholesale: agent changes, env gone.
+        // The default selection still names `pi`, but the project layer's
+        // definition wins wholesale: it now runs claude.
+        assert_eq!(config.profile.name, "pi");
+        assert_eq!(config.selected_by, Some(Scope::Binary));
         assert_eq!(config.agent(), Agent::Claude);
-        assert!(config.profile.env.is_empty());
+        assert_eq!(config.profiles.get("pi").unwrap().scope, Scope::Project);
     }
 
     #[test]

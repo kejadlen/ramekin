@@ -65,7 +65,7 @@ profile "pi-glm" {
 }
 ```
 
-A bare `profile "name"` node (no block) *selects* a profile. Selection precedence, lowest to highest: binary default (`pi`) → user KDL (the per-machine default) → project KDL → project-local KDL → `-p` on the command line. Profile selection subsumes agent selection; there is no separate `--agent`. Model choice within a provider stays out of profiles — that's per-run agent args after `--`.
+A bare `profile "name"` node (no block) *selects* a profile. Selection precedence, lowest to highest: binary default (`pi`) → user KDL (the per-machine default) → project KDL → `-p` on the command line. Profile selection subsumes agent selection; there is no separate `--agent`. Model choice within a provider stays out of profiles — that's per-run agent args after `--`.
 
 Profiles merge by name across layers and the last writer takes the whole definition. Fine-grained tweaks (one env var) go through the ordinary layered `env`, which overlays the active profile's env per variable.
 
@@ -103,7 +103,6 @@ Mount configuration merges across layers, lowest to highest precedence:
 2. **Profile** — the active profile's `mounts`
 3. **User** — every `*.kdl` in `$XDG_CONFIG_HOME/ramekin/`, merged as one layer (defining the same key twice within the layer is an error; per-file symlinking into dotfiles is a dotfiles decision)
 4. **Project** — `<workspace>/.ramekin/config.kdl`, committed
-5. **Project-local** — `<workspace>/.ramekin/config.local.kdl`, gitignored
 
 Additional host paths can be mounted into the container via the KDL layers. Directories, files, and devices (such as `/dev/null`) all work. Mounts whose source doesn't exist on the host are silently skipped.
 
