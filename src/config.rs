@@ -69,7 +69,14 @@ impl Agent {
     pub fn config_allowlist(&self) -> &'static [&'static str] {
         match self {
             Self::Pi => &["AGENTS.md", "skills"],
-            Self::Claude => &["CLAUDE.md", "settings.json", "skills", "agents", "commands"],
+            Self::Claude => &[
+                "CLAUDE.md",
+                "settings.json",
+                "skills",
+                "agents",
+                "commands",
+                "hooks",
+            ],
         }
     }
 
@@ -1328,6 +1335,7 @@ mod tests {
     fn agent_allowlists() {
         assert!(Agent::Pi.config_allowlist().contains(&"AGENTS.md"));
         assert!(Agent::Claude.config_allowlist().contains(&"CLAUDE.md"));
+        assert!(Agent::Claude.config_allowlist().contains(&"hooks"));
         assert_eq!(Agent::Claude.container_config_dir(), "/root/.claude");
     }
 }
