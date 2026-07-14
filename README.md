@@ -76,7 +76,7 @@ Provider credentials never appear in config: passthrough env forwards host value
 Agent config comes from the host's own dirs — the agents are also used locally, so their config already exists where they look for it. The config-shaped entries mount read-only at their normal paths inside the container:
 
 - pi: `~/.pi/agent/` — `AGENTS.md`, `skills/`
-- claude: `~/.claude/` — `CLAUDE.md`, `settings.json`, `skills/`, `agents/`, `commands/`
+- claude: `~/.claude/` — `CLAUDE.md`, `settings.json`, `skills/`, `agents/`, `commands/`, `hooks/`
 
 Ramekin keeps no parallel copy — edit the host files (or the dotfiles they symlink to) and the next session sees the changes. The rest of each host dir is runtime state (credentials, transcripts) and never enters the container. Project-level agent config (`.claude/`, `CLAUDE.md`, `AGENTS.md` in the repo) rides the workspace mount; the agents layer it themselves.
 

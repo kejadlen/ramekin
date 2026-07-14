@@ -316,8 +316,9 @@ secret, side-effect-free `config`) rather than rebasing the branch:
 ## Open questions
 
 - Finalize the agent-config allowlists: which entries of `~/.claude/` and
-  `~/.pi/agent/` are config-shaped (claude `hooks/`? `output-styles/`? pi
-  extensions, models config?). Skip-if-missing makes over-inclusion cheap.
+  `~/.pi/agent/` are config-shaped (claude `hooks/` is now included —
+  `settings.json` references its scripts; `output-styles/`? pi extensions,
+  models config?). Skip-if-missing makes over-inclusion cheap.
 - Does pi tolerate a read-only `AGENTS.md`/`skills/` in its agent dir, and
   where does it write scratch files at runtime? The fresh writable session
   dir underneath the read-only binds should absorb anything — verify before
