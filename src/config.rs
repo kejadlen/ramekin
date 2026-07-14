@@ -104,6 +104,7 @@ pub struct Profile {
     pub agent: Agent,
     pub env: Vec<EnvVar>,
     pub mounts: Vec<Mount>,
+    pub args: Vec<String>,
 }
 
 impl Profile {
@@ -118,6 +119,7 @@ impl Profile {
                 agent,
                 env: Vec::new(),
                 mounts: Vec::new(),
+                args: Vec::new(),
             })
             .collect()
     }
@@ -567,11 +569,13 @@ fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
     let mut agent = None;
     let mut env = Vec::new();
     let mut mounts = Vec::new();
+    let mut args = Vec::new();
     for child in children.nodes() {
         match child.name().value() {
             "agent" => agent = Some(Agent::parse(&single_string_arg(child)?)?),
             "env" => env.extend(parse_env(child)?),
             "mounts" => mounts.extend(parse_mounts(child)?),
+            "args" => args.extend(parse_args(child)?),
             other => bail!("unknown `profile` field `{other}`"),
         }
     }
@@ -582,7 +586,29 @@ fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
         name,
         env,
         mounts,
+        args,
     }))
+}
+
+/// Parse an `args` node: bare string entries passed verbatim to the agent
+/// binary (`args "--provider" "amazon-bedrock"`). No properties, no block.
+fn parse_args(node: &KdlNode) -> Result<Vec<String>> {
+    if node.children().is_some() {
+        bail!("`args` takes inline string values (args \"--flag\" \"value\"), not a block");
+    }
+    node.entries()
+        .iter()
+        .map(|entry| {
+            if entry.name().is_some() {
+                bail!("`args` takes bare string values, not properties");
+            }
+            entry
+                .value()
+                .as_string()
+                .map(str::to_string)
+                .ok_or_else(|| miette!("`args` takes string values, got {}", entry.value()))
+        })
+        .collect()
 }
 
 /// Parse a `mounts` block. Exactly one syntax, mirroring `env`: a block with
@@ -808,6 +834,7 @@ mod tests {
                 agent: Agent::Pi,
                 env: Vec::new(),
                 mounts: Vec::new(),
+                args: Vec::new(),
             },
         }
     }
@@ -1250,6 +1277,45 @@ mod tests {
         assert_eq!(p.env[1].value, None);
         assert_eq!(p.mounts.len(), 1);
         assert_eq!(p.mounts[0].source, "~/.aws");
+    }
+
+    #[test]
+    fn parse_profile_with_args() {
+        let raw = parse_config(
+            r#"
+            profile "pi-bedrock" {
+                agent "pi"
+                args "--provider" "amazon-bedrock"
+            }
+            "#,
+        )
+        .unwrap();
+        let p = &raw.profiles[0];
+        assert_eq!(p.args, vec!["--provider", "amazon-bedrock"]);
+    }
+
+    #[test]
+    fn parse_profile_concatenates_multiple_args_nodes() {
+        let raw = parse_config(
+            r#"
+            profile "x" {
+                agent "pi"
+                args "--provider" "amazon-bedrock"
+                args "--model" "some-model"
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            raw.profiles[0].args,
+            vec!["--provider", "amazon-bedrock", "--model", "some-model"]
+        );
+    }
+
+    #[test]
+    fn parse_profile_rejects_non_string_args() {
+        let result = parse_config("profile \"x\" {\n    agent \"pi\"\n    args 42\n}");
+        assert!(result.is_err());
     }
 
     #[test]
