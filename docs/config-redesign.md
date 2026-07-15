@@ -95,7 +95,7 @@ entry when generating mounts, since bind sources need real paths.
 
 ### Profiles: KDL bundles of agent + provider
 
-A profile is a named bundle: agent, env vars, extra mounts. The binary
+A profile is a named bundle: agent, env vars, extra mounts, and agent CLI args. The binary
 ships only the two trivial ones — `pi` and `claude`, bare agent with no
 provider plumbing — so ramekin runs with zero config. Everything richer is
 defined in KDL:
@@ -119,6 +119,26 @@ profile "pi-glm" {
     }
 }
 ```
+
+A profile also pins CLI flags for the agent binary through `args`, for
+providers the agent selects by flag rather than by environment (pi reaches
+Amazon Bedrock through `--provider`, which has no env equivalent):
+
+```kdl
+profile "pi-bedrock" {
+    agent "pi"
+    args "--provider" "amazon-bedrock"
+    env {
+        AWS_PROFILE
+        AWS_REGION
+    }
+    mounts { "~/.aws" }
+}
+```
+
+Args ride with the profile definition, so the wholesale profile-merge rule
+covers them too; the run's trailing `ramekin -- ...` args come after and
+override.
 
 Profiles merge by name across layers, last writer takes the whole
 definition — a project can redefine `claude-bedrock` wholesale, but
