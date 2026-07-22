@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use kdl::{KdlDocument, KdlNode};
-use miette::{Context, IntoDiagnostic, Result, bail, miette};
+use miette::{Context, IntoDiagnostic, Result, bail, ensure, miette};
 
 /// Configuration scope, ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -42,7 +42,9 @@ impl Agent {
         match s {
             "pi" => Ok(Self::Pi),
             "claude" => Ok(Self::Claude),
-            other => bail!("unknown agent `{other}` (expected `pi` or `claude`)"),
+            other => {
+                bail!("unknown agent `{other}` (expected `pi` or `claude`)");
+            }
         }
     }
 
@@ -454,46 +456,42 @@ impl LayerBuilder {
             let Some(resolved) = mount.resolve(workspace_target) else {
                 continue;
             };
-            if !self.mount_targets.insert(resolved.target.clone()) {
-                bail!(
-                    "{}: mount target {} is defined twice in the {} layer",
-                    file.display(),
-                    resolved.target,
-                    self.scope,
-                );
-            }
+            ensure!(
+                self.mount_targets.insert(resolved.target.clone()),
+                "{}: mount target {} is defined twice in the {} layer",
+                file.display(),
+                resolved.target,
+                self.scope,
+            );
             self.mounts.push(resolved);
         }
         for var in raw.env {
-            if !self.env_names.insert(var.name.clone()) {
-                bail!(
-                    "{}: env variable {} is defined twice in the {} layer",
-                    file.display(),
-                    var.name,
-                    self.scope,
-                );
-            }
+            ensure!(
+                self.env_names.insert(var.name.clone()),
+                "{}: env variable {} is defined twice in the {} layer",
+                file.display(),
+                var.name,
+                self.scope,
+            );
             self.env.push(var);
         }
         for profile in raw.profiles {
-            if !self.profile_names.insert(profile.name.clone()) {
-                bail!(
-                    "{}: profile `{}` is defined twice in the {} layer",
-                    file.display(),
-                    profile.name,
-                    self.scope,
-                );
-            }
+            ensure!(
+                self.profile_names.insert(profile.name.clone()),
+                "{}: profile `{}` is defined twice in the {} layer",
+                file.display(),
+                profile.name,
+                self.scope,
+            );
             self.profiles.push(profile);
         }
         for name in raw.selections {
-            if self.selection.is_some() {
-                bail!(
-                    "{}: the {} layer selects a profile twice",
-                    file.display(),
-                    self.scope,
-                );
-            }
+            ensure!(
+                self.selection.is_none(),
+                "{}: the {} layer selects a profile twice",
+                file.display(),
+                self.scope,
+            );
             self.selection = Some(name);
         }
         Ok(())
@@ -541,7 +539,9 @@ fn parse_config(content: &str) -> Result<RawConfig> {
                 ProfileNode::Definition(profile) => raw.profiles.push(profile),
                 ProfileNode::Selection(name) => raw.selections.push(name),
             },
-            other => bail!("unknown config node `{other}`"),
+            other => {
+                bail!("unknown config node `{other}`");
+            }
         }
     }
     Ok(raw)
@@ -559,7 +559,9 @@ fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
             .as_string()
             .ok_or_else(|| miette!("`profile` takes a string name, got {}", entry.value()))?
             .to_string(),
-        _ => bail!("`profile` takes exactly one string name"),
+        _ => {
+            bail!("`profile` takes exactly one string name");
+        }
     };
 
     let Some(children) = node.children() else {
@@ -576,7 +578,9 @@ fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
             "env" => env.extend(parse_env(child)?),
             "mounts" => mounts.extend(parse_mounts(child)?),
             "args" => args.extend(parse_args(child)?),
-            other => bail!("unknown `profile` field `{other}`"),
+            other => {
+                bail!("unknown `profile` field `{other}`");
+            }
         }
     }
 
@@ -593,15 +597,18 @@ fn parse_profile(node: &KdlNode) -> Result<ProfileNode> {
 /// Parse an `args` node: bare string entries passed verbatim to the agent
 /// binary (`args "--provider" "amazon-bedrock"`). No properties, no block.
 fn parse_args(node: &KdlNode) -> Result<Vec<String>> {
-    if node.children().is_some() {
-        bail!("`args` takes inline string values (args \"--flag\" \"value\"), not a block");
-    }
+    ensure!(
+        node.children().is_none(),
+        "`args` takes inline string values (args \"--flag\" \"value\"), not a block"
+    );
     node.entries()
         .iter()
         .map(|entry| {
-            if entry.name().is_some() {
-                bail!("`args` takes bare string values, not properties");
-            }
+            ensure!(
+                entry.name().is_none(),
+                "`args` takes bare string values, not properties"
+            );
+
             entry
                 .value()
                 .as_string()
@@ -615,9 +622,11 @@ fn parse_args(node: &KdlNode) -> Result<Vec<String>> {
 /// one child node per mount, whose name is the host source path, with
 /// optional `target` and `writable` properties.
 fn parse_mounts(node: &KdlNode) -> Result<Vec<Mount>> {
-    if !node.entries().is_empty() {
-        bail!("`mounts` takes a block (mounts {{ \"~/path\" }}), not inline values");
-    }
+    ensure!(
+        node.entries().is_empty(),
+        "`mounts` takes a block (mounts {{ \"~/path\" }}), not inline values"
+    );
+
     let Some(children) = node.children() else {
         return Ok(Vec::new());
     };
@@ -635,17 +644,19 @@ fn parse_mount(node: &KdlNode) -> Result<Mount> {
              e.g. mounts {{ \"~/path\" target=\"/container/path\" writable=#true }}"
         );
     }
-    if node.children().is_some() {
-        bail!("mount \"{source}\" takes properties (target=\"...\", writable=#true), not a block");
-    }
+    ensure!(
+        node.children().is_none(),
+        "mount \"{source}\" takes properties (target=\"...\", writable=#true), not a block"
+    );
 
     let mut target = None;
     let mut writable = false;
     for entry in node.entries() {
         let Some(name) = entry.name() else {
-            if entry.value().as_string() == Some("writable") {
-                bail!("mount \"{source}\": write writable=#true to allow writes");
-            }
+            ensure!(
+                entry.value().as_string() != Some("writable"),
+                "mount \"{source}\": write writable=#true to allow writes"
+            );
             bail!(
                 "mount \"{source}\": unexpected argument {}; the container path \
                  goes in target=\"...\"",
@@ -655,21 +666,27 @@ fn parse_mount(node: &KdlNode) -> Result<Mount> {
         match name.value() {
             "target" => match entry.value().as_string() {
                 Some(s) => target = Some(s.to_string()),
-                None => bail!(
-                    "mount \"{source}\": `target` takes a string, got {}",
-                    entry.value()
-                ),
+                None => {
+                    bail!(
+                        "mount \"{source}\": `target` takes a string, got {}",
+                        entry.value()
+                    );
+                }
             },
             "writable" => match entry.value().as_bool() {
                 Some(b) => writable = b,
-                None => bail!(
-                    "mount \"{source}\": `writable` takes #true or #false, got {}",
-                    entry.value()
-                ),
+                None => {
+                    bail!(
+                        "mount \"{source}\": `writable` takes #true or #false, got {}",
+                        entry.value()
+                    );
+                }
             },
-            other => bail!(
-                "mount \"{source}\": unknown property `{other}` (expected `target` or `writable`)"
-            ),
+            other => {
+                bail!(
+                    "mount \"{source}\": unknown property `{other}` (expected `target` or `writable`)"
+                );
+            }
         }
     }
 
@@ -684,9 +701,11 @@ fn parse_mount(node: &KdlNode) -> Result<Mount> {
 /// variable, whose single argument is the value. A bare child (no argument)
 /// passes the host's value through at run time.
 fn parse_env(node: &KdlNode) -> Result<Vec<EnvVar>> {
-    if !node.entries().is_empty() {
-        bail!("`env` takes a block (env {{ NAME \"value\" }}), not inline values");
-    }
+    ensure!(
+        node.entries().is_empty(),
+        "`env` takes a block (env {{ NAME \"value\" }}), not inline values"
+    );
+
     let Some(children) = node.children() else {
         return Ok(Vec::new());
     };
@@ -717,13 +736,17 @@ fn optional_string_arg(node: &KdlNode) -> Result<Option<String>> {
         [] => Ok(None),
         [entry] if entry.name().is_none() => match entry.value().as_string() {
             Some(s) => Ok(Some(s.to_string())),
-            None => bail!(
-                "`{}` takes a string value, got {}",
-                node.name().value(),
-                entry.value()
-            ),
+            None => {
+                bail!(
+                    "`{}` takes a string value, got {}",
+                    node.name().value(),
+                    entry.value()
+                );
+            }
         },
-        _ => bail!("`{}` takes at most one string value", node.name().value()),
+        _ => {
+            bail!("`{}` takes at most one string value", node.name().value());
+        }
     }
 }
 
