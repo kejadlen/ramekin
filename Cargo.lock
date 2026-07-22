@@ -591,9 +591,9 @@ dependencies = [
  "clap_complete",
  "fastrand",
  "fs-err",
+ "kdl",
  "miette",
  "serde",
- "serde-kdl2",
  "serde_yaml",
  "shellexpand",
  "tempfile",
@@ -669,17 +669,6 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-kdl2"
-version = "0.1.1-alpha.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f4e8799918040f88aaf3fae3d26fa405ca45b66eb653aecc597cfe9709170a"
-dependencies = [
- "kdl",
- "serde",
- "thiserror",
 ]
 
 [[package]]

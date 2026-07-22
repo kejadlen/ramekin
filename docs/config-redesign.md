@@ -1,6 +1,8 @@
 # Config redesign
 
-Status: proposal (2026-07). Ramekin is single-user; this design leans on that
+Status: implemented (2026-07) — all four steps of the sequencing have
+landed; the open questions below remain to verify against the real agents.
+Ramekin is single-user; this design leans on that
 hard. The `claude-code` branch is a prototype to learn from, not a baseline
 to preserve.
 
@@ -53,8 +55,10 @@ state while auth stays global; yolo mode belongs in the image (managed
 settings + `IS_SANDBOX=1`); keep side-effect-free `ramekin config`,
 deterministic parent-before-child mount ordering, long-form compose binds,
 and the GitHub-token BuildKit secret. Anti-lesson: one shared image tag
-across agents silently redefines `FROM ramekin-agent` — images must be
-per-agent.
+over two *different* Dockerfiles silently redefines `FROM ramekin-agent`.
+Resolved by collapsing to a single Dockerfile carrying both agents — one
+tag, one definition, entrypoint chosen per session — rather than per-agent
+images.
 
 ## Design
 
@@ -91,7 +95,7 @@ entry when generating mounts, since bind sources need real paths.
 
 ### Profiles: KDL bundles of agent + provider
 
-A profile is a named bundle: agent, env vars, extra mounts. The binary
+A profile is a named bundle: agent, env vars, extra mounts, and agent CLI args. The binary
 ships only the two trivial ones — `pi` and `claude`, bare agent with no
 provider plumbing — so ramekin runs with zero config. Everything richer is
 defined in KDL:
@@ -104,7 +108,7 @@ profile "claude-bedrock" {
         CLAUDE_CODE_USE_BEDROCK "1"
         AWS_PROFILE              // bare = pass through the host value
     }
-    mounts { source "~/.aws" }
+    mounts { "~/.aws" }
 }
 
 profile "pi-glm" {
@@ -115,6 +119,26 @@ profile "pi-glm" {
     }
 }
 ```
+
+A profile also pins CLI flags for the agent binary through `args`, for
+providers the agent selects by flag rather than by environment (pi reaches
+Amazon Bedrock through `--provider`, which has no env equivalent):
+
+```kdl
+profile "pi-bedrock" {
+    agent "pi"
+    args "--provider" "amazon-bedrock"
+    env {
+        AWS_PROFILE
+        AWS_REGION
+    }
+    mounts { "~/.aws" }
+}
+```
+
+Args ride with the profile definition, so the wholesale profile-merge rule
+covers them too; the run's trailing `ramekin -- ...` args come after and
+override.
 
 Profiles merge by name across layers, last writer takes the whole
 definition — a project can redefine `claude-bedrock` wholesale, but
@@ -154,6 +178,18 @@ env {
 }
 ```
 
+`mounts` follows the same one-block shape: one child node per mount, whose
+name is the host source path, with optional `target` and `writable`
+properties. (The original one-block-per-mount form — `mounts { source
+"..." }` repeated — was dropped as unergonomic.)
+
+```kdl
+mounts {
+    "~/.local/share/ranger" writable=#true
+    "~/datasets" target="/root/datasets"
+}
+```
+
 Layers, lowest to highest precedence:
 
 1. **binary** — staples (`~/.config/git`, `~/.config/jj`, read-only,
@@ -167,8 +203,10 @@ Layers, lowest to highest precedence:
    `profile` selection and machine-only mounts (ranger). Symlink
    granularity is a dotfiles decision, not a ramekin one.
 3. **project** — `<workspace>/.ramekin/config.kdl`, committed
-4. **project-local** — `<workspace>/.ramekin/config.local.kdl`, gitignored
-5. **CLI** — `-p`; `--mount`/`--env` when they earn their keep
+4. **CLI** — `-p`; `--mount`/`--env` when they earn their keep. (A
+   gitignored `config.local.kdl` layer was tried and dropped as
+   unnecessary — `-p` covers the per-run case; revisit if a durable
+   local-override need shows up.)
 
 Merging: `env` merges per variable, overlaying the active profile's env, so
 any layer can adjust one variable without redefining the profile; mounts
@@ -245,13 +283,12 @@ rendered prompt. A possible simplification falls out: if pi groups sessions
 by cwd on its own, distinct workspace paths may make ramekin's per-repo
 `sessions/` mount redundant — verify against pi's actual layout.
 
-Base images build to
-per-agent tags (`ramekin-pi`, `ramekin-claude`); a project
-`.ramekin/Dockerfile` declares `ARG BASE` / `FROM ${BASE}` and ramekin
-passes the active agent's tag, so one project Dockerfile serves both.
-Project image tags stay repo-specific and gain the agent suffix. Concurrent
-builds of the same tag are idempotent; per-agent tags remove the pi/claude
-race.
+One base image (`ramekin-agent`) carries both agents and no ENTRYPOINT;
+the generated compose config sets the entrypoint to `pi` or `claude` per
+session. A project `.ramekin/Dockerfile` builds `FROM ramekin-agent` with
+a repo-specific tag, so one project image serves both agents too.
+Concurrent builds of the same tag are idempotent, and a single Dockerfile
+means there is no pi/claude tag race to avoid.
 
 ### Outbox
 
@@ -288,9 +325,9 @@ secret, side-effect-free `config`) rather than rebasing the branch:
    agent-config mounts replace the `pi {}` block, staples move into the
    binary, teardown report on discarded session-dir writes. Multi-session
    works from here on.
-2. Claude support: agent plumbing, `Dockerfile.claude` (harvested),
-   per-agent tags + `ARG BASE` project builds, ephemeral denylist mounts
-   over `~/.claude` junk.
+2. Claude support: agent plumbing, claude install + managed settings in
+   the shared Dockerfile (harvested), per-session entrypoint selection,
+   ephemeral denylist mounts over `~/.claude` junk.
 3. Profiles: KDL `profile` blocks + builtin trivial profiles, user-KDL
    machine default, project `profile` scalar, `-p`, env passthrough,
    user layer reads `*.kdl`.
@@ -299,8 +336,9 @@ secret, side-effect-free `config`) rather than rebasing the branch:
 ## Open questions
 
 - Finalize the agent-config allowlists: which entries of `~/.claude/` and
-  `~/.pi/agent/` are config-shaped (claude `hooks/`? `output-styles/`? pi
-  extensions, models config?). Skip-if-missing makes over-inclusion cheap.
+  `~/.pi/agent/` are config-shaped (claude `hooks/` is now included —
+  `settings.json` references its scripts; `output-styles/`? pi extensions,
+  models config?). Skip-if-missing makes over-inclusion cheap.
 - Does pi tolerate a read-only `AGENTS.md`/`skills/` in its agent dir, and
   where does it write scratch files at runtime? The fresh writable session
   dir underneath the read-only binds should absorb anything — verify before
