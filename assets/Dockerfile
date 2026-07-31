@@ -32,8 +32,12 @@ RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
     curl -fsSL "https://github.com/jj-vcs/jj/releases/download/${JJ_VERSION}/jj-${JJ_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
       | tar xz --strip-components=0 -C /usr/local/bin ./jj
 
+# pi publishes under @earendil-works. The older @mariozechner scope still
+# resolves and still carries the `latest` tag, so it looks current, but it's
+# abandoned at 0.73.1 — far enough behind that host extensions fail to load
+# against it (no ./compat export in its pi-ai).
 RUN --mount=type=cache,target=/root/.npm \
-    npm install -g @mariozechner/pi-coding-agent @anthropic-ai/claude-code
+    npm install -g @earendil-works/pi-coding-agent @anthropic-ai/claude-code
 
 # Claude Code refuses --dangerously-skip-permissions when running as root
 # unless IS_SANDBOX=1 acknowledges the sandbox. The container is the sandbox.
