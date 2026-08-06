@@ -70,7 +70,17 @@ impl Agent {
     /// over-inclusion cheap.
     pub fn config_allowlist(&self) -> &'static [&'static str] {
         match self {
-            Self::Pi => &["AGENTS.md", "skills"],
+            Self::Pi => &[
+                "AGENTS.md",
+                "settings.json",
+                "models.json",
+                "keybindings.json",
+                "skills",
+                "extensions",
+                "prompts",
+                "themes",
+                "tools",
+            ],
             Self::Claude => &[
                 "CLAUDE.md",
                 "settings.json",
@@ -1487,6 +1497,12 @@ mod tests {
     #[test]
     fn agent_allowlists() {
         assert!(Agent::Pi.config_allowlist().contains(&"AGENTS.md"));
+        assert!(Agent::Pi.config_allowlist().contains(&"settings.json"));
+        assert!(Agent::Pi.config_allowlist().contains(&"extensions"));
+        // Pi's state lives in the same dir as its config; it must not ride in.
+        assert!(!Agent::Pi.config_allowlist().contains(&"auth.json"));
+        assert!(!Agent::Pi.config_allowlist().contains(&"sessions"));
+        assert_eq!(Agent::Pi.container_config_dir(), "/root/.pi/agent");
         assert!(Agent::Claude.config_allowlist().contains(&"CLAUDE.md"));
         assert!(Agent::Claude.config_allowlist().contains(&"hooks"));
         assert_eq!(Agent::Claude.container_config_dir(), "/root/.claude");
