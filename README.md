@@ -164,7 +164,7 @@ ramekin outbox discard <slug>/<session>       # drop proposals
 
 A built-in system prompt (`ramekin-prompt.md`) is rendered per session, mounted read-only at `/root/.ramekin/ramekin-prompt.md`, and passed to the agent (`--append-system-prompt` for pi, `--append-system-prompt-file` for Claude). It tells the agent about the container environment — the workspace mount, ephemeral filesystem, read-only config, the outbox, and networking. `AGENTS.md`/`CLAUDE.md` remain fully available for user customization.
 
-For Claude, the base image bakes in yolo mode: managed settings set `permissions.defaultMode = bypassPermissions` and `IS_SANDBOX=1` acknowledges the container as the sandbox.
+For Claude, the base image bakes in yolo mode: managed settings set `permissions.defaultMode = bypassPermissions` and `IS_SANDBOX=1` acknowledges the container as the sandbox. Pi has no config equivalent, so it gets `--approve` prepended to every run — its `trust.json` is session-scoped state, and without the flag it re-prompts to trust the workspace each time. These container flags sit below profile `args` and per-run `--` args, so both still override them.
 
 ### Custom Dockerfile
 

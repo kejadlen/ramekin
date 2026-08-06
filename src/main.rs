@@ -784,6 +784,7 @@ impl Ramekin {
                 config::Agent::Pi => "--append-system-prompt",
                 config::Agent::Claude => "--append-system-prompt-file",
             },
+            container_args: agent.container_args(),
             profile_args: &self.config.profile.args,
             agent_args,
         });
@@ -1045,6 +1046,9 @@ struct ComposeParams<'a> {
     /// of its own.
     entrypoint: &'a str,
     prompt_flag: &'a str,
+    /// Flags the agent needs to work in the container, from
+    /// [`config::Agent::container_args`]. Lowest precedence of the three.
+    container_args: &'a [&'a str],
     /// CLI flags the active profile pins for the agent binary. Placed before
     /// the per-run trailing args so a `ramekin -- ...` flag still wins.
     profile_args: &'a [String],
@@ -1062,6 +1066,7 @@ fn generate_compose(params: ComposeParams) -> String {
         working_dir,
         entrypoint,
         prompt_flag,
+        container_args,
         profile_args,
         agent_args,
     } = params;
@@ -1087,10 +1092,12 @@ fn generate_compose(params: ComposeParams) -> String {
         })
         .collect();
 
-    // Always pass the prompt flag for the ramekin container context.
-    // Profile args come next; user-supplied CLI args come last so they win.
+    // Always pass the prompt flag for the ramekin container context, then
+    // the rest of the container's own flags. Profile args come next;
+    // user-supplied CLI args come last so they win.
     let command: Vec<String> = [prompt_flag.to_string(), PROMPT_TARGET.to_string()]
         .into_iter()
+        .chain(container_args.iter().map(|a| (*a).to_string()))
         .chain(profile_args.iter().cloned())
         .chain(agent_args.iter().cloned())
         .collect();
@@ -1144,26 +1151,29 @@ mod tests {
             working_dir: "/workspace/x-1",
             entrypoint: "pi",
             prompt_flag: "--append-system-prompt",
+            container_args: &[],
             profile_args: &[],
             agent_args: &[],
         }
     }
 
     #[test]
-    fn generate_compose_places_profile_args_before_cli_args() {
+    fn generate_compose_orders_container_profile_then_cli_args() {
         let profile_args = vec!["--provider".to_string(), "amazon-bedrock".to_string()];
         let cli_args = vec!["--model".to_string(), "override".to_string()];
         let mut params = compose_params(&[], &[]);
+        params.container_args = &["--approve"];
         params.profile_args = &profile_args;
         params.agent_args = &cli_args;
         let yaml = generate_compose(params);
 
         let prompt = yaml.find(PROMPT_TARGET).expect("prompt target missing");
+        let approve = yaml.find("--approve").expect("container arg missing");
         let provider = yaml.find("amazon-bedrock").expect("profile arg missing");
         let model = yaml.find("override").expect("cli arg missing");
         assert!(
-            prompt < provider && provider < model,
-            "expected prompt < profile arg < cli arg, got {yaml}"
+            prompt < approve && approve < provider && provider < model,
+            "expected prompt < container arg < profile arg < cli arg, got {yaml}"
         );
     }
 

@@ -92,6 +92,20 @@ impl Agent {
         }
     }
 
+    /// Flags this agent needs because it runs in the container, prepended to
+    /// every invocation so profile and per-run args can still override them.
+    ///
+    /// Claude gets the equivalent baked into the base image as managed
+    /// settings; pi has no config form for trust, only the flag. Pi's
+    /// `trust.json` is session-scoped state, so without `--approve` it
+    /// re-prompts to trust the workspace on every run.
+    pub fn container_args(&self) -> &'static [&'static str] {
+        match self {
+            Self::Pi => &["--approve"],
+            Self::Claude => &[],
+        }
+    }
+
     /// The agent's config dir inside the container.
     pub fn container_config_dir(&self) -> &'static str {
         match self {
