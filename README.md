@@ -105,7 +105,7 @@ Mount configuration merges across layers, lowest to highest precedence:
 3. **User** — every `*.kdl` in `$XDG_CONFIG_HOME/ramekin/`, merged as one layer (defining the same key twice within the layer is an error; per-file symlinking into dotfiles is a dotfiles decision)
 4. **Project** — `<workspace>/.ramekin/config.kdl`, committed
 
-Additional host paths can be mounted into the container via the KDL layers. Directories, files, and devices (such as `/dev/null`) all work. Mounts whose source doesn't exist on the host are silently skipped.
+Additional host paths can be mounted into the container via the KDL layers. Directories, files, and devices (such as `/dev/null`) all work. Mounts whose source doesn't exist on the host are silently skipped. Sources canonicalize, since bind mounts need real paths and configured paths routinely run through a dotfiles symlink; targets don't, so a `~/.dotfiles/ai/skills` source lands at `/root/.dotfiles/ai/skills` regardless of where the symlink points.
 
 ```kdl
 mounts {

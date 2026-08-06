@@ -818,16 +818,19 @@ fn binary_mounts(agent: Agent) -> Vec<ResolvedMount> {
 }
 
 impl Mount {
-    /// Expand tildes and derive the container target path.
+    /// Expand tildes, canonicalize the source, and derive the container
+    /// target path.
     ///
     /// Returns `None` if the source does not exist on the host. Files and
     /// devices (such as `/dev/null`) resolve like directories — Docker binds
-    /// them all the same way.
+    /// them all the same way. The source canonicalizes for the same reason
+    /// the binary layer's does: configured paths routinely run through a
+    /// dotfiles symlink, and bind sources need real paths. The target still
+    /// derives from the path as written, so a `~/.dotfiles/...` source lands
+    /// at `/root/.dotfiles/...` rather than wherever the symlink points.
     pub fn resolve(&self, workspace_target: &str) -> Option<ResolvedMount> {
         let expanded = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
-        if !expanded.exists() {
-            return None;
-        }
+        let canonical = expanded.canonicalize().ok()?;
 
         let target = match &self.target {
             Some(t) => resolve_container_target(t, workspace_target),
@@ -835,7 +838,7 @@ impl Mount {
         };
 
         Some(ResolvedMount {
-            source: expanded,
+            source: canonical,
             target,
             writable: self.writable,
         })
@@ -1002,7 +1005,11 @@ mod tests {
         builder.add(b, Path::new("b.kdl"), WS).unwrap();
         let layer = builder.build();
         assert_eq!(layer.mounts.len(), 1);
-        assert_eq!(layer.mounts[0].source, PathBuf::from("/tmp"));
+        // Canonicalized, so on macOS this is /private/tmp.
+        assert_eq!(
+            layer.mounts[0].source,
+            PathBuf::from("/tmp").canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -1062,6 +1069,25 @@ mod tests {
         };
         let resolved = mount.resolve(WS).unwrap();
         assert_eq!(resolved.target, "/root/downloads");
+    }
+
+    #[test]
+    fn resolve_canonicalizes_the_source_but_not_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs_err::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        fs_err::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mount = Mount {
+            source: link.display().to_string(),
+            target: Some("~/thing".into()),
+            writable: false,
+        };
+        let resolved = mount.resolve(WS).unwrap();
+        // Docker binds need the real path, but the target stays as written.
+        assert_eq!(resolved.source, real.canonicalize().unwrap());
+        assert_eq!(resolved.target, "/root/thing");
     }
 
     #[test]
