@@ -90,6 +90,7 @@ The two agents get opposite persistence policies, chosen by failure mode.
 
 - `auth.json` — global, at `$XDG_DATA_HOME/ramekin/agents/pi/auth.json`, so the containerized agent keeps its own credentials (separate from the host's)
 - `sessions/` — per-repo, at `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`
+- `git/` and `bin/` — global, at `$XDG_DATA_HOME/ramekin/agents/pi/`, writable. Pi fills these over the network on startup: `git/` holds clones of the packages `settings.json` lists, `bin/` its managed `fd` and `rg`. Ramekin keeps its own copies rather than mounting the host's, so host and container never write to the same clones.
 
 On teardown, ramekin logs anything else the agent wrote to its session dir before discarding it, so a path that deserves persistence gets noticed rather than silently vanishing.
 

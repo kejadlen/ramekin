@@ -32,6 +32,12 @@ const PROMPT_TARGET: &str = "/root/.ramekin/ramekin-prompt.md";
 /// (worst case: rot) rather than vanishing (worst case: lost auth).
 const CLAUDE_EPHEMERAL: &[&str] = &["statsig", "todos", "shell-snapshots", "debug"];
 
+/// The `~/.pi/agent` subdirectories pi fills over the network on startup —
+/// clones of the git packages `settings.json` lists, and the managed `fd`
+/// and `rg` binaries. Ramekin owns its own copies rather than mounting the
+/// host's, so host and container don't write to the same clones.
+const PI_PERSISTENT_DIRS: &[&str] = &["git", "bin"];
+
 #[derive(Parser)]
 #[command(about = "Run a coding agent (pi or Claude Code) in a containerized environment", version = VERSION)]
 struct Cli {
@@ -262,8 +268,9 @@ fn confirm(prompt: &str) -> Result<bool> {
 /// vanish along with auth or onboarding state).
 enum AgentState {
     Pi {
-        /// `$XDG_DATA_HOME/ramekin/agents/pi/`; holds `auth.json`, the one
-        /// global file that survives across sessions.
+        /// `$XDG_DATA_HOME/ramekin/agents/pi/`; holds `auth.json` plus the
+        /// [`PI_PERSISTENT_DIRS`] caches, the state that is global rather
+        /// than per-repo.
         state_dir: PathBuf,
         /// `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`.
         repo_sessions_dir: PathBuf,
@@ -304,6 +311,9 @@ impl AgentState {
             } => {
                 fs_err::create_dir_all(state_dir).into_diagnostic()?;
                 fs_err::create_dir_all(repo_sessions_dir).into_diagnostic()?;
+                for name in PI_PERSISTENT_DIRS {
+                    fs_err::create_dir_all(state_dir.join(name)).into_diagnostic()?;
+                }
 
                 // auth.json bind-mounts as a file, so it has to exist before
                 // the container starts. Migrate from the pre-redesign
@@ -361,21 +371,31 @@ impl AgentState {
         };
         match self {
             // Fresh empty writable dir per session, with the allowlisted
-            // persistent pieces (auth.json, per-repo sessions/) bound on top.
+            // persistent pieces (auth.json, the network-filled caches,
+            // per-repo sessions/) bound on top.
             Self::Pi {
                 state_dir,
                 repo_sessions_dir,
-            } => vec![
-                rw(session_dir.join("agent"), config::PI_AGENT_DIR.into()),
-                rw(
-                    state_dir.join("auth.json"),
-                    format!("{}/auth.json", config::PI_AGENT_DIR),
-                ),
-                rw(
-                    repo_sessions_dir.clone(),
-                    format!("{}/sessions", config::PI_AGENT_DIR),
-                ),
-            ],
+            } => {
+                let mut mounts = vec![
+                    rw(session_dir.join("agent"), config::PI_AGENT_DIR.into()),
+                    rw(
+                        state_dir.join("auth.json"),
+                        format!("{}/auth.json", config::PI_AGENT_DIR),
+                    ),
+                    rw(
+                        repo_sessions_dir.clone(),
+                        format!("{}/sessions", config::PI_AGENT_DIR),
+                    ),
+                ];
+                mounts.extend(PI_PERSISTENT_DIRS.iter().map(|name| {
+                    rw(
+                        state_dir.join(name),
+                        format!("{}/{name}", config::PI_AGENT_DIR),
+                    )
+                }));
+                mounts
+            }
             // Persistent state dir and state file, with fresh session-scoped
             // dirs bound over the known ephemeral subdirs.
             Self::Claude {
@@ -1273,5 +1293,12 @@ mod tests {
 
         let sessions = target("/root/.pi/agent/sessions").expect("sessions mount");
         assert_eq!(sessions.source, PathBuf::from("/data/repos/x-1/sessions"));
+
+        // The network-filled caches are global, not per-repo, and writable
+        // so pi can update them from inside the container.
+        let git = target("/root/.pi/agent/git").expect("package cache mount");
+        assert_eq!(git.source, PathBuf::from("/data/agents/pi/git"));
+        assert!(git.writable);
+        assert!(target("/root/.pi/agent/bin").is_some());
     }
 }
