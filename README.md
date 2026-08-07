@@ -100,7 +100,7 @@ On teardown, ramekin logs anything else the agent wrote to its session dir befor
 
 Mount configuration merges across layers, lowest to highest precedence:
 
-1. **Binary** — compiled-in staples (`~/.config/git`, `~/.config/jj`, read-only, skipped when missing) and the agent-config mounts described above
+1. **Binary** — the agent-config mounts described above, and nothing else. Host toolchain config (git, jj, shells) isn't compiled in: where it lives varies by machine, and whether its contents survive a Linux container varies by what's in it — a git config naming a keychain helper, a GUI signing program, or an ssh transport can't be satisfied in the container, and a URL rewrite in particular can't be overridden by a later layer. Mount what you want from the user layer.
 2. **Profile** — the active profile's `mounts`
 3. **User** — every `*.kdl` in `$XDG_CONFIG_HOME/ramekin/`, merged as one layer (defining the same key twice within the layer is an error; per-file symlinking into dotfiles is a dotfiles decision)
 4. **Project** — `<workspace>/.ramekin/config.kdl`, committed
@@ -123,7 +123,7 @@ A `mounts` block holds one child node per mount, mirroring `env`. The node name 
 | `target` | Container path; `~` expands to the container home, a relative path resolves against the workspace mount, and omitting it derives the target from the source |
 | `writable` | `#true` allows writes (read-only by default) |
 
-When two layers define a mount with the same container target, the higher layer wins wholesale. A `/dev/null` source *masks*: it removes a mount inherited from a lower layer (say, a staple or an agent-config entry this machine or project doesn't want), and where there's nothing to remove it stays a real bind, blanking a workspace file from the agent:
+When two layers define a mount with the same container target, the higher layer wins wholesale. A `/dev/null` source *masks*: it removes a mount inherited from a lower layer (say, an agent-config entry this machine or project doesn't want), and where there's nothing to remove it stays a real bind, blanking a workspace file from the agent:
 
 ```kdl
 mounts {

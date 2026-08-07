@@ -8,8 +8,8 @@ use miette::{Context, IntoDiagnostic, Result, bail, ensure, miette};
 /// Configuration scope, ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
-    /// Compiled into the binary: staples, host agent-config mounts, and the
-    /// trivial profiles.
+    /// Compiled into the binary: host agent-config mounts and the trivial
+    /// profiles.
     Binary,
     /// The active profile's own env and mounts, overlaid by every file layer.
     Profile,
@@ -240,7 +240,7 @@ impl ScopedConfig {
     /// relative mount targets resolve against it.
     ///
     /// Layers are returned in precedence order (lowest first):
-    /// 1. Binary (staples, host agent-config mounts, trivial profiles)
+    /// 1. Binary (host agent-config mounts, trivial profiles)
     /// 2. Profile (the active profile's env and mounts)
     /// 3. User (every `*.kdl` in `~/.config/ramekin/`, merged as one layer)
     /// 4. Project (`<workspace>/.ramekin/config.kdl`)
@@ -778,33 +778,31 @@ fn optional_string_arg(node: &KdlNode) -> Result<Option<String>> {
 // Builtin mounts and target resolution
 // ---------------------------------------------------------------------------
 
-/// Staple mounts every machine gets: read-only, skipped when missing on the
-/// host, overridable (or maskable) by any config layer. The bar for a staple
-/// is "true on every machine".
-const STAPLES: &[&str] = &["~/.config/git", "~/.config/jj"];
-
 /// Pi's agent dir inside the container.
 pub const PI_AGENT_DIR: &str = "/root/.pi/agent";
 
-/// Mounts compiled into the binary: staples plus the host's agent config for
-/// the active agent.
+/// Mounts compiled into the binary: the host's config for the active agent,
+/// and nothing else.
 ///
-/// Sources are canonicalized because agent dirs and staples commonly symlink
-/// into dotfiles, and bind sources need real paths. Missing entries are
-/// skipped.
+/// Host toolchain config (git, jj, shells) deliberately isn't here. Where it
+/// lives is a property of the machine, not of ramekin — `~/.config/git`
+/// against `~/.gitconfig`, say — and what survives a Linux container is a
+/// property of its contents: a git config can name a keychain helper, a GUI
+/// signing program, or an ssh transport the container has no way to satisfy.
+/// The binary can't judge either, so the user layer declares what it wants.
+///
+/// Sources are canonicalized because agent dirs commonly symlink into
+/// dotfiles, and bind sources need real paths. Missing entries are skipped.
 fn binary_mounts(agent: Agent) -> Vec<ResolvedMount> {
-    let staples = STAPLES
+    agent
+        .config_allowlist()
         .iter()
-        .map(|source| ((*source).to_string(), resolve_container_target(source, "")));
-    let agent_config = agent.config_allowlist().iter().map(move |entry| {
-        (
-            format!("{}/{entry}", agent.host_config_dir()),
-            format!("{}/{entry}", agent.container_config_dir()),
-        )
-    });
-
-    staples
-        .chain(agent_config)
+        .map(move |entry| {
+            (
+                format!("{}/{entry}", agent.host_config_dir()),
+                format!("{}/{entry}", agent.container_config_dir()),
+            )
+        })
         .filter_map(|(source, target)| {
             let expanded = PathBuf::from(shellexpand::tilde(&source).as_ref());
             let canonical = expanded.canonicalize().ok()?;
