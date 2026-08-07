@@ -29,7 +29,7 @@ Three tiers, by rate of change:
 
 - **The binary** holds globals — anything stable across machines and
   projects that's a fact about the tools or their one user: agent plumbing,
-  which agent files are config vs state, staple mounts, session model.
+  which agent files are config vs state, session model.
   Changing these is an edit + `just install`, which is the loop this repo
   already lives in. Config files never restate them.
 - **The host's existing files** hold content. Agent config (memory files,
@@ -74,7 +74,7 @@ carries an allowlist per agent of the *config-shaped* entries in those dirs:
 
 Each entry that exists on the host mounts **read-only** at its normal path
 inside the container, layered over the container's own persistent agent
-state. Missing entries are skipped, like staples. The allowlist matters
+state. Missing entries are skipped. The allowlist matters
 because the same host dirs also hold runtime state — host credentials,
 transcripts, caches — which must *not* leak into the container; the
 container has its own persistent state (below).
@@ -192,10 +192,15 @@ mounts {
 
 Layers, lowest to highest precedence:
 
-1. **binary** — staples (`~/.config/git`, `~/.config/jj`, read-only,
-   skip-if-missing, overridable by any layer; the bar for a staple is
-   "true on every machine" — ranger isn't, so it stays user KDL), trivial
-   profiles, the agent-config allowlist
+1. **binary** — trivial profiles and the agent-config allowlist. This layer
+   originally also carried staple mounts (`~/.config/git`, `~/.config/jj`),
+   on the bar "true on every machine". That bar turned out not to hold:
+   where host toolchain config lives varies (`~/.gitconfig` is the common
+   case), and whether its *contents* survive a Linux container varies too —
+   a git config can name a keychain helper, a GUI signing program, or an
+   ssh transport the container can't satisfy, and `url.insteadOf` in
+   particular can't be revoked by a higher layer. Staples were dropped;
+   host toolchain config is the user layer's job.
 2. **user** — every `*.kdl` in `~/.config/ramekin/`, merged as one layer;
    defining the same key twice within the layer is an error. Sharing is
    per-file symlinks into dotfiles: `profiles.kdl` is shared, while
@@ -216,8 +221,8 @@ stays at `.ramekin/Dockerfile`, beside the KDL.
 
 ### Session model
 
-Every path a run touches is either read-only **config** (staple mounts and
-host agent-config mounts — immutable from the container, so sessions can't
+Every path a run touches is either read-only **config** (host agent-config
+mounts and whatever the KDL layers add — immutable from the container, so sessions can't
 fight over it), **session plumbing** (the compose file and project name
 under a random session id, the rendered `ramekin-prompt.md` mounted
 read-only, the outbox), or **agent runtime state** — which is not one
