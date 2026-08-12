@@ -280,10 +280,10 @@ mod tests {
     #[test]
     fn unallowlisted_proposal_has_no_host_target() {
         let data_home = tempfile::tempdir().unwrap();
-        write_proposal(data_home.path(), "repo-1", "abc", "pi", "settings.json");
+        write_proposal(data_home.path(), "repo-1", "abc", "pi", "auth.json");
 
         let proposals = scan(data_home.path()).unwrap();
-        // settings.json is claude-shaped, not in pi's allowlist.
+        // auth.json is pi runtime state, never config, so it's unallowlisted.
         assert_eq!(proposals[0].host_target(), None);
     }
 
