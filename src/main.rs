@@ -527,6 +527,29 @@ impl Ramekin {
         })
     }
 
+    /// Host directory backing this repo's caches, one subdirectory per
+    /// configured `cache`.
+    fn repo_caches_dir(&self) -> PathBuf {
+        self.data_home
+            .join(format!("repos/{}/caches", self.repo_slug))
+    }
+
+    /// Mounts for the configured caches. Forced like the session mounts: the
+    /// container path comes from config, the host path never does.
+    fn cache_mounts(&self) -> Result<Vec<config::ResolvedMount>> {
+        let base = self.repo_caches_dir();
+        Ok(self
+            .config
+            .merged_caches()?
+            .into_iter()
+            .map(|sv| config::ResolvedMount {
+                source: base.join(&sv.value.name),
+                target: sv.value.target.clone(),
+                writable: true,
+            })
+            .collect())
+    }
+
     /// Session plumbing mounts shared by both agents: the rendered prompt,
     /// the outbox, and the workspace.
     fn session_mounts(&self, session_dir: &Path, outbox_dir: &Path) -> Vec<config::ResolvedMount> {
@@ -549,11 +572,12 @@ impl Ramekin {
         mounts
     }
 
-    /// Merge config mounts with the forced session mounts, ordered
-    /// lexicographically by target so parents precede children.
+    /// Merge config mounts with the forced ones (session plumbing and
+    /// caches), ordered lexicographically by target so parents precede
+    /// children.
     fn final_mounts<'a>(
         &'a self,
-        session_mounts: &'a [config::ResolvedMount],
+        forced: &'a [config::ResolvedMount],
     ) -> Vec<&'a config::ResolvedMount> {
         let mut by_target: BTreeMap<&str, &config::ResolvedMount> = self
             .config
@@ -561,7 +585,7 @@ impl Ramekin {
             .into_iter()
             .map(|sv| (sv.value.target.as_str(), sv.value))
             .collect();
-        for mount in session_mounts {
+        for mount in forced {
             by_target.insert(mount.target.as_str(), mount);
         }
         by_target.into_values().collect()
@@ -644,6 +668,25 @@ impl Ramekin {
                 mount.source.display(),
                 mount.display_target()
             );
+        }
+
+        // Caches
+        let caches = self.config.merged_caches()?;
+        if !caches.is_empty() {
+            println!();
+            println!("Caches");
+            let base = self.repo_caches_dir();
+            let scopes: BTreeSet<_> = caches.iter().map(|sv| sv.scope).collect();
+            for scope in scopes {
+                println!("  {}", scope_label(scope));
+                for sv in caches.iter().filter(|sv| sv.scope == scope) {
+                    println!(
+                        "    {} → {}",
+                        base.join(&sv.value.name).display(),
+                        sv.value.target
+                    );
+                }
+            }
         }
 
         // Environment
@@ -766,8 +809,14 @@ impl Ramekin {
             outbox::create_session(&self.data_home, &self.repo_slug, &session_id, agent)
                 .wrap_err("failed to create session outbox")?;
 
-        let session_mounts = self.session_mounts(&session_dir, &outbox_dir);
-        let all_mounts = self.final_mounts(&session_mounts);
+        // Caches are created rather than skipped when absent: a cache that
+        // silently didn't mount would look like nothing but slow builds.
+        let mut forced_mounts = self.session_mounts(&session_dir, &outbox_dir);
+        for mount in self.cache_mounts()? {
+            fs_err::create_dir_all(&mount.source).into_diagnostic()?;
+            forced_mounts.push(mount);
+        }
+        let all_mounts = self.final_mounts(&forced_mounts);
         let env_vars = self.config.merged_env();
         let compose = generate_compose(ComposeParams {
             dockerfile: &dockerfile,

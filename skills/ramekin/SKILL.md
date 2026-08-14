@@ -112,3 +112,16 @@ while `df` inside the container shows plenty free on the overlay.
 Symptom: writes to the workspace fail mysteriously. Keep build
 artifacts on the container side — e.g.
 `CARGO_TARGET_DIR=/tmp/<something>` — which also speeds up builds.
+
+Better still, declare a `cache` in `.ramekin/config.kdl` and let ramekin
+keep the directory across sessions:
+
+```kdl
+cache {
+    target    # shadows the workspace's own target/
+}
+```
+
+A bare node uses its name as the container path, and relative paths
+resolve inside the workspace, so the build tool needs no configuring and
+the host's build directory stays untouched.

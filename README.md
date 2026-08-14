@@ -137,6 +137,30 @@ mounts {
 
 Session mounts (the workspace, agent state, the rendered prompt, the outbox) are forced and cannot be overridden from config.
 
+### Caches
+
+A `cache` is a writable directory ramekin creates per repo and keeps across sessions. Build tools are the reason it exists: without one, every session pays a cold build, and pointing the tool at the workspace instead means the container and the host fight over one build directory.
+
+```kdl
+cache {
+    // Cargo's build directory, shadowing the host's target/ inside the
+    // workspace, so plain `cargo build` finds it
+    target
+    // uv's cache, at an explicit container path
+    uv "~/.cache/uv"
+}
+```
+
+Each child node names a directory under `$XDG_DATA_HOME/ramekin/repos/<slug>/caches/`; its argument is the container path, resolved like a mount target (`~` is the container home, a relative path resolves against the workspace mount). Omit the argument and the name serves as the path — a bare `target` is the whole declaration for a build directory the tool already looks for in the workspace. Caches merge by name across layers, so a higher layer can retarget one, and two names claiming the same container path is an error.
+
+Unlike `mounts`, the host side isn't configurable and the directory is created rather than skipped when missing — a cache that silently failed to mount would look like nothing but slow builds. Caches are per repo because build directories can't be shared: tools take an exclusive lock on them for the duration of a build, and a toolchain change invalidates their contents wholesale. Download caches have the opposite shape — keyed by name and version, safe to share — so those belong in `mounts`:
+
+```kdl
+mounts {
+    "~/.cache/ramekin-rust/registry" target="/root/.cargo/registry" writable=#true
+}
+```
+
 ### Environment variables
 
 `env` has exactly one syntax: a block with one child node per variable. The single argument is the value; omit it to pass the host's value through at run time (the value never lands in config or the generated compose file). `env` merges per variable across layers, overlaying the active profile's env.

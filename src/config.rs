@@ -164,6 +164,66 @@ impl ResolvedMount {
     }
 }
 
+/// A cache's name, checked to be a single path component.
+///
+/// The name is `join`ed onto this repo's `caches/` directory, so an unchecked
+/// one would let config write outside it. Parsing is the only way to build
+/// one, which keeps that guarantee structural rather than a convention the
+/// call site has to know about.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub struct CacheName(String);
+
+impl CacheName {
+    pub fn parse(name: &str) -> Result<Self> {
+        ensure!(!name.is_empty(), "a cache name can't be empty");
+        ensure!(
+            !name.contains('/'),
+            "cache `{name}`: a name is one directory under this repo's caches, \
+             so it can't contain `/`"
+        );
+        ensure!(
+            !name.starts_with('.'),
+            "cache `{name}`: a name can't start with `.`, which would hide the \
+             directory or escape the one above it"
+        );
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for CacheName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl AsRef<Path> for CacheName {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+/// A per-repo cache: a writable directory ramekin creates and keeps across
+/// sessions, mounted at `target` in the container.
+///
+/// Unlike a `mounts` entry, the host side isn't configurable — it's
+/// `$XDG_DATA_HOME/ramekin/repos/<slug>/caches/<name>`, created eagerly like
+/// the sessions and outbox dirs. That keeps caches per repo (build
+/// directories can't be shared: tools lock them, and a differing toolchain
+/// invalidates their contents) without a host path in config, and without
+/// the silent skip that a missing mount source gets.
+#[derive(Debug, PartialEq, Clone)]
+pub struct Cache {
+    /// Directory name on the host, under this repo's `caches/`.
+    pub name: CacheName,
+    /// Container path, already resolved: `~` is the container home and a
+    /// relative path resolves against the workspace mount.
+    pub target: String,
+}
+
 /// An environment variable for the container. `value: None` means the
 /// variable passes through from the host environment at run time.
 #[derive(Debug, PartialEq, Clone)]
@@ -181,6 +241,7 @@ pub struct ConfigLayer {
     pub path: Option<PathBuf>,
     pub mounts: Vec<ResolvedMount>,
     pub env: Vec<EnvVar>,
+    pub caches: Vec<Cache>,
 }
 
 /// A value tagged with the config scope it came from.
@@ -342,6 +403,7 @@ impl ScopedConfig {
             path: None,
             mounts: binary_mounts(profile.agent),
             env: Vec::new(),
+            caches: Vec::new(),
         }];
         layers.push(ConfigLayer {
             scope: Scope::Profile,
@@ -352,6 +414,7 @@ impl ScopedConfig {
                 .filter_map(|m| m.resolve(workspace_target))
                 .collect(),
             env: profile.env.clone(),
+            caches: Vec::new(),
         });
         layers.extend(builders.into_iter().map(LayerBuilder::build));
 
@@ -396,6 +459,41 @@ impl ScopedConfig {
             .collect()
     }
 
+    /// Merge caches from all layers, de-duplicated by name, so a higher layer
+    /// can retarget a cache a lower one declared. Two names pointing at the
+    /// same container path is a config error rather than a silent
+    /// last-writer-wins, since one of the two host directories would then
+    /// hold artifacts nothing ever reads.
+    pub fn merged_caches(&self) -> Result<Vec<ScopedValue<&Cache>>> {
+        let mut by_name: BTreeMap<&str, ScopedValue<&Cache>> = BTreeMap::new();
+        for layer in &self.layers {
+            for cache in &layer.caches {
+                by_name.insert(
+                    cache.name.as_str(),
+                    ScopedValue {
+                        scope: layer.scope,
+                        value: cache,
+                    },
+                );
+            }
+        }
+
+        let mut by_target: BTreeMap<&str, &str> = BTreeMap::new();
+        for sv in by_name.values() {
+            if let Some(other) = by_target.insert(sv.value.target.as_str(), sv.value.name.as_str())
+            {
+                bail!(
+                    "caches `{other}` and `{}` both mount at {}; give them separate paths \
+                     or drop one",
+                    sv.value.name,
+                    sv.value.target,
+                );
+            }
+        }
+
+        Ok(by_name.into_values().collect())
+    }
+
     /// Merge environment variables from all layers, de-duplicated by name.
     ///
     /// Higher-precedence layers override variables with the same name.
@@ -433,6 +531,8 @@ struct LayerBuilder {
     env_names: BTreeSet<String>,
     profiles: Vec<Profile>,
     profile_names: BTreeSet<String>,
+    caches: Vec<Cache>,
+    cache_names: BTreeSet<CacheName>,
     selection: Option<String>,
 }
 
@@ -447,6 +547,8 @@ impl LayerBuilder {
             env_names: BTreeSet::new(),
             profiles: Vec::new(),
             profile_names: BTreeSet::new(),
+            caches: Vec::new(),
+            cache_names: BTreeSet::new(),
             selection: None,
         }
     }
@@ -492,6 +594,19 @@ impl LayerBuilder {
             );
             self.profiles.push(profile);
         }
+        for cache in raw.caches {
+            ensure!(
+                self.cache_names.insert(cache.name.clone()),
+                "{}: cache `{}` is defined twice in the {} layer",
+                file.display(),
+                cache.name,
+                self.scope,
+            );
+            self.caches.push(Cache {
+                target: resolve_container_target(&cache.target, workspace_target),
+                ..cache
+            });
+        }
         for name in raw.selections {
             ensure!(
                 self.selection.is_none(),
@@ -510,6 +625,7 @@ impl LayerBuilder {
             path: self.path,
             mounts: self.mounts,
             env: self.env,
+            caches: self.caches,
         }
     }
 }
@@ -523,6 +639,7 @@ impl LayerBuilder {
 struct RawConfig {
     mounts: Vec<Mount>,
     env: Vec<EnvVar>,
+    caches: Vec<Cache>,
     profiles: Vec<Profile>,
     selections: Vec<String>,
 }
@@ -541,6 +658,7 @@ fn parse_config(content: &str) -> Result<RawConfig> {
         match node.name().value() {
             "mounts" => raw.mounts.extend(parse_mounts(node)?),
             "env" => raw.env.extend(parse_env(node)?),
+            "cache" => raw.caches.extend(parse_cache(node)?),
             // `profile "name" { ... }` defines; `profile "name"` selects.
             "profile" => match parse_profile(node)? {
                 ProfileNode::Definition(profile) => raw.profiles.push(profile),
@@ -724,6 +842,33 @@ fn parse_env(node: &KdlNode) -> Result<Vec<EnvVar>> {
             Ok(EnvVar {
                 name: child.name().value().to_string(),
                 value,
+            })
+        })
+        .collect()
+}
+
+/// Parse a `cache` block: one child node per cache, named by the host
+/// directory it gets under this repo's `caches/`, with the container path as
+/// its argument. A bare node takes the name as its path too, which for the
+/// common case (a build directory the tool looks for in the workspace) is
+/// the whole declaration: `cache { target }`.
+fn parse_cache(node: &KdlNode) -> Result<Vec<Cache>> {
+    ensure!(
+        node.entries().is_empty(),
+        "`cache` takes a block (cache {{ target }}), not inline values"
+    );
+
+    let Some(children) = node.children() else {
+        return Ok(Vec::new());
+    };
+    children
+        .nodes()
+        .iter()
+        .map(|child| {
+            let name = CacheName::parse(child.name().value())?;
+            Ok(Cache {
+                target: optional_string_arg(child)?.unwrap_or_else(|| name.to_string()),
+                name,
             })
         })
         .collect()
@@ -1059,6 +1204,118 @@ mod tests {
     }
 
     #[test]
+    fn parse_cache_block() {
+        let raw = parse_config(
+            r#"
+            cache {
+                target "/root/target"
+                uv "~/.cache/uv"
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            raw.caches,
+            vec![
+                Cache {
+                    name: cache_name("target"),
+                    target: "/root/target".into(),
+                },
+                Cache {
+                    name: cache_name("uv"),
+                    target: "~/.cache/uv".into(),
+                },
+            ]
+        );
+    }
+
+    /// Cache targets resolve like mount targets, so a relative one lands in
+    /// the workspace — shadowing the host's build dir with the container's.
+    #[test]
+    fn cache_target_resolves_against_the_workspace() {
+        let raw = parse_config(r#"cache { target "target" }"#).unwrap();
+        let mut builder = LayerBuilder::new(Scope::Project, None);
+        builder.add(raw, Path::new("c.kdl"), WS).unwrap();
+        let layer = builder.build();
+        assert_eq!(layer.caches[0].target, "/workspace/test-slug/target");
+    }
+
+    #[test]
+    fn cache_name_cannot_escape_its_directory() {
+        let err = parse_config(r#"cache { "../elsewhere" "/root/target" }"#).unwrap_err();
+        assert!(err.to_string().contains("can't contain `/`"), "{err}");
+
+        let err = parse_config(r#"cache { ".." "/root/target" }"#).unwrap_err();
+        assert!(err.to_string().contains("can't start with `.`"), "{err}");
+    }
+
+    #[test]
+    fn cache_name_cannot_be_empty() {
+        let err = CacheName::parse("").unwrap_err();
+        assert!(err.to_string().contains("can't be empty"), "{err}");
+    }
+
+    /// A bare node names a directory in the workspace, so `cache { target }`
+    /// covers a build dir the tool already looks for there.
+    #[test]
+    fn bare_cache_takes_its_name_as_the_path() {
+        let raw = parse_config(r#"cache { target }"#).unwrap();
+        assert_eq!(
+            raw.caches,
+            vec![Cache {
+                name: cache_name("target"),
+                target: "target".into(),
+            }]
+        );
+
+        let mut builder = LayerBuilder::new(Scope::Project, None);
+        builder.add(raw, Path::new("c.kdl"), WS).unwrap();
+        assert_eq!(
+            builder.build().caches[0].target,
+            "/workspace/test-slug/target"
+        );
+    }
+
+    #[test]
+    fn merged_caches_deduplicates_by_name() {
+        let cache = |name: &str, target: &str| Cache {
+            name: cache_name(name),
+            target: target.into(),
+        };
+        let user = ConfigLayer {
+            caches: vec![cache("target", "/root/target"), cache("uv", "/root/uv")],
+            ..layer(Scope::User, vec![])
+        };
+        let project = ConfigLayer {
+            caches: vec![cache("target", "/root/elsewhere")],
+            ..layer(Scope::Project, vec![])
+        };
+        let config = scoped(vec![user, project]);
+        let merged = config.merged_caches().unwrap();
+        assert_eq!(merged.len(), 2);
+        let target = merged
+            .iter()
+            .find(|sv| sv.value.name.as_str() == "target")
+            .unwrap();
+        assert_eq!(target.value.target, "/root/elsewhere");
+        assert_eq!(target.scope, Scope::Project);
+    }
+
+    #[test]
+    fn two_caches_at_one_target_is_an_error() {
+        let cache = |name: &str| Cache {
+            name: cache_name(name),
+            target: "/root/target".into(),
+        };
+        let user = ConfigLayer {
+            caches: vec![cache("a"), cache("b")],
+            ..layer(Scope::User, vec![])
+        };
+        let err = scoped(vec![user]).merged_caches().unwrap_err().to_string();
+        assert!(err.contains("both mount at /root/target"), "{err}");
+    }
+
+    #[test]
     fn scope_display() {
         assert_eq!(Scope::Binary.to_string(), "binary");
         assert_eq!(Scope::User.to_string(), "user");
@@ -1071,7 +1328,12 @@ mod tests {
             path: None,
             mounts,
             env: Vec::new(),
+            caches: Vec::new(),
         }
+    }
+
+    fn cache_name(name: &str) -> CacheName {
+        CacheName::parse(name).unwrap()
     }
 
     fn mount(source: &str, target: &str, writable: bool) -> ResolvedMount {
@@ -1262,6 +1524,7 @@ mod tests {
                     value: Some("user".into()),
                 },
             ],
+            caches: Vec::new(),
         };
         let project = ConfigLayer {
             scope: Scope::Project,
@@ -1271,6 +1534,7 @@ mod tests {
                 name: "FOO".into(),
                 value: Some("project".into()),
             }],
+            caches: Vec::new(),
         };
         let config = scoped(vec![user, project]);
         let merged = config.merged_env();
