@@ -1,0 +1,12 @@
+// Cargo's build directory, kept per repo across sessions. The relative
+// target resolves inside the workspace mount, so it shadows the host's
+// target/ — which holds a macOS build that the container would otherwise
+// rebuild from scratch every time it saw it (and rebuild again on the host
+// afterwards). Plain `cargo build` finds it; no CARGO_TARGET_DIR needed.
+//
+// Per repo rather than shared: cargo takes an exclusive lock on a build
+// directory for the duration of a build, and a differing rustc invalidates
+// every fingerprint in it.
+cache {
+  target
+}
