@@ -117,21 +117,32 @@ mounts {
 }
 ```
 
-A `mounts` block holds one child node per mount, mirroring `env`. The node name is the host source path (`~` expands to the home directory), with optional properties:
+A `mounts` block holds one child node per mount, mirroring `env`. The node name is the host source path (`~` expands to the home directory, and a relative path resolves against the workspace), with optional properties:
 
 | Property | Description |
 |---|---|
 | `target` | Container path; `~` expands to the container home, a relative path resolves against the workspace mount, and omitting it derives the target from the source |
 | `writable` | `#true` allows writes (read-only by default) |
 
-When two layers define a mount with the same container target, the higher layer wins wholesale. A `/dev/null` source *masks*: it removes a mount inherited from a lower layer (say, a staple or an agent-config entry this machine or project doesn't want), and where there's nothing to remove it stays a real bind, blanking a workspace file from the agent:
+When two layers define a mount with the same container target, the higher layer wins wholesale. A `/dev/null` source follows that same rule and binds nothing readable, which hides whatever the target would otherwise hold — a mount from a lower layer, a file the image ships, or a file in your own workspace. The path still exists in the container; only its contents are gone. Hiding a directory binds a session-scoped empty directory instead, so listing the path succeeds and comes back empty:
 
 ```kdl
 mounts {
-    // Remove the inherited skills mount
+    // Hide an agent-config entry this machine doesn't want
     "/dev/null" target="/root/.pi/agent/skills"
     // Hide the repo's .envrc from the agent
     "/dev/null" target=".envrc"
+    // Same spelling for a directory; the agent sees it empty
+    "/dev/null" target="secrets"
+}
+```
+
+Precedence runs the other way too, so a project can mount back a path the user layer hides:
+
+```kdl
+// <workspace>/.ramekin/config.kdl — this repo's .envrc is fine to read
+mounts {
+    ".envrc"
 }
 ```
 

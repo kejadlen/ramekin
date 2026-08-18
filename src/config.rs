@@ -134,6 +134,10 @@ impl Profile {
     }
 }
 
+/// Source that hides a target: binds nothing readable over whatever the
+/// image, the workspace, or a lower layer would have put there.
+pub const MASK_SOURCE: &str = "/dev/null";
+
 /// The profile selected in the binary when no layer or flag picks one.
 const DEFAULT_PROFILE: &str = "pi";
 
@@ -154,6 +158,13 @@ pub struct ResolvedMount {
 }
 
 impl ResolvedMount {
+    /// A mount that hides its target instead of binding anything readable.
+    /// Merging treats it like any other mount; only emission cares, because
+    /// what a mask binds depends on whether it hides a file or a directory.
+    pub fn is_mask(&self) -> bool {
+        self.source == Path::new(MASK_SOURCE)
+    }
+
     /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
     pub fn display_target(&self) -> String {
         if self.writable {
@@ -271,12 +282,6 @@ impl ScopedConfig {
     }
 }
 
-/// Mask source: a mount whose source is `/dev/null` *removes* an inherited
-/// mount at the same target instead of binding anything. With no inherited
-/// mount to remove, it stays a real `/dev/null` bind, which blanks a file
-/// that exists in the image or workspace.
-const MASK_SOURCE: &str = "/dev/null";
-
 impl ScopedConfig {
     /// Load all configuration layers for the given workspace.
     ///
@@ -335,7 +340,7 @@ impl ScopedConfig {
             if !files.is_empty() {
                 let mut builder = LayerBuilder::new(Scope::User, Some(config_dir.to_path_buf()));
                 for file in &files {
-                    builder.add_file(file, workspace_target)?;
+                    builder.add_file(file, workspace, workspace_target)?;
                 }
                 builders.push(builder);
             }
@@ -345,7 +350,7 @@ impl ScopedConfig {
         let project_path = workspace.join(".ramekin/config.kdl");
         if project_path.exists() {
             let mut builder = LayerBuilder::new(Scope::Project, Some(project_path.clone()));
-            builder.add_file(&project_path, workspace_target)?;
+            builder.add_file(&project_path, workspace, workspace_target)?;
             builders.push(builder);
         }
 
@@ -411,7 +416,7 @@ impl ScopedConfig {
             mounts: profile
                 .mounts
                 .iter()
-                .filter_map(|m| m.resolve(workspace_target))
+                .filter_map(|m| m.resolve(workspace, workspace_target))
                 .collect(),
             env: profile.env.clone(),
             caches: Vec::new(),
@@ -428,35 +433,43 @@ impl ScopedConfig {
 
     /// Return merged mounts from all layers, de-duplicated by container target.
     ///
-    /// Higher-precedence layers override mounts with the same target, and a
-    /// `/dev/null` source masks (removes) a mount inherited from a lower
-    /// layer. Output order is lexicographic by target, which puts parent
-    /// paths before any child path (`/root/.pi/agent` precedes
+    /// Higher-precedence layers override mounts with the same target,
+    /// including a `/dev/null` mount, which binds nothing readable over the
+    /// target and so hides whatever the image or the workspace has there. A
+    /// project wanting a path a lower layer hid mounts it back, like any
+    /// other override. Output order is lexicographic by target, which puts
+    /// parent paths before any child path (`/root/.pi/agent` precedes
     /// `/root/.pi/agent/AGENTS.md`). Docker processes mount declarations in
     /// order; a parent declared after its child would shadow the child. The
     /// deterministic ordering also keeps repeat runs identical.
     pub fn merged_mounts(&self) -> Vec<ScopedValue<&ResolvedMount>> {
-        let mut by_target: BTreeMap<&str, (ScopedValue<&ResolvedMount>, bool)> = BTreeMap::new();
+        let mut by_target: BTreeMap<&str, ScopedValue<&ResolvedMount>> = BTreeMap::new();
         for layer in &self.layers {
             for mount in &layer.mounts {
-                let inherited = by_target.contains_key(mount.target.as_str());
                 by_target.insert(
                     mount.target.as_str(),
-                    (
-                        ScopedValue {
-                            scope: layer.scope,
-                            value: mount,
-                        },
-                        inherited,
-                    ),
+                    ScopedValue {
+                        scope: layer.scope,
+                        value: mount,
+                    },
                 );
             }
         }
-        by_target
-            .into_values()
-            .filter(|(sv, inherited)| !(*inherited && sv.value.source == Path::new(MASK_SOURCE)))
-            .map(|(sv, _)| sv)
-            .collect()
+        by_target.into_values().collect()
+    }
+
+    /// The host source a mask at `target` hides, when a layer declared one.
+    ///
+    /// Emission needs the shape of what a mask covers, which the merged
+    /// output no longer carries: the mask won precedence, so the mount it
+    /// overrode is gone from the result.
+    pub fn overridden_source(&self, target: &str) -> Option<&Path> {
+        self.layers
+            .iter()
+            .rev()
+            .flat_map(|layer| layer.mounts.iter())
+            .find(|mount| mount.target == target && !mount.is_mask())
+            .map(|mount| mount.source.as_path())
     }
 
     /// Merge caches from all layers, de-duplicated by name, so a higher layer
@@ -553,16 +566,22 @@ impl LayerBuilder {
         }
     }
 
-    fn add_file(&mut self, file: &Path, workspace_target: &str) -> Result<()> {
+    fn add_file(&mut self, file: &Path, workspace: &Path, workspace_target: &str) -> Result<()> {
         let raw = parse_file(file)?;
-        self.add(raw, file, workspace_target)
+        self.add(raw, file, workspace, workspace_target)
     }
 
-    fn add(&mut self, raw: RawConfig, file: &Path, workspace_target: &str) -> Result<()> {
+    fn add(
+        &mut self,
+        raw: RawConfig,
+        file: &Path,
+        workspace: &Path,
+        workspace_target: &str,
+    ) -> Result<()> {
         for mount in &raw.mounts {
             // Mounts with a missing host source are skipped entirely, so
             // they don't participate in duplicate detection either.
-            let Some(resolved) = mount.resolve(workspace_target) else {
+            let Some(resolved) = mount.resolve(workspace, workspace_target) else {
                 continue;
             };
             ensure!(
@@ -946,13 +965,22 @@ fn binary_mounts(agent: Agent) -> Vec<ResolvedMount> {
 }
 
 impl Mount {
-    /// Expand tildes and derive the container target path.
+    /// Expand tildes and derive the host source and container target paths.
+    ///
+    /// A relative source resolves against the workspace directory, the way a
+    /// relative target resolves against the workspace mount, so a committed
+    /// project config can name a file in its own repo without a host path.
     ///
     /// Returns `None` if the source does not exist on the host. Files and
     /// devices (such as `/dev/null`) resolve like directories — Docker binds
     /// them all the same way.
-    pub fn resolve(&self, workspace_target: &str) -> Option<ResolvedMount> {
+    pub fn resolve(&self, workspace: &Path, workspace_target: &str) -> Option<ResolvedMount> {
         let expanded = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
+        let expanded = if expanded.is_relative() {
+            workspace.join(expanded)
+        } else {
+            expanded
+        };
         if !expanded.exists() {
             return None;
         }
@@ -996,6 +1024,9 @@ mod tests {
     use super::*;
 
     const WS: &str = "/workspace/test-slug";
+    /// Host workspace for tests that resolve mounts; only relative sources
+    /// touch it, and those tests point it at a temp dir instead.
+    const WS_HOST: &str = "/nonexistent-workspace";
 
     /// A ScopedConfig with the given layers and an inert trivial profile,
     /// for tests that only exercise merging.
@@ -1106,8 +1137,12 @@ mod tests {
         let mut builder = LayerBuilder::new(Scope::User, None);
         let a = parse_config(r#"env { FOO "1" }"#).unwrap();
         let b = parse_config(r#"env { FOO "2" }"#).unwrap();
-        builder.add(a, Path::new("a.kdl"), WS).unwrap();
-        let err = builder.add(b, Path::new("b.kdl"), WS).unwrap_err();
+        builder
+            .add(a, Path::new("a.kdl"), Path::new(WS_HOST), WS)
+            .unwrap();
+        let err = builder
+            .add(b, Path::new("b.kdl"), Path::new(WS_HOST), WS)
+            .unwrap_err();
         assert!(err.to_string().contains("FOO"), "{err}");
     }
 
@@ -1116,8 +1151,12 @@ mod tests {
         let mut builder = LayerBuilder::new(Scope::User, None);
         let a = parse_config(r#"mounts { "/tmp" target="/t" }"#).unwrap();
         let b = parse_config(r#"mounts { "/dev/null" target="/t" }"#).unwrap();
-        builder.add(a, Path::new("a.kdl"), WS).unwrap();
-        let err = builder.add(b, Path::new("b.kdl"), WS).unwrap_err();
+        builder
+            .add(a, Path::new("a.kdl"), Path::new(WS_HOST), WS)
+            .unwrap();
+        let err = builder
+            .add(b, Path::new("b.kdl"), Path::new(WS_HOST), WS)
+            .unwrap_err();
         assert!(err.to_string().contains("/t"), "{err}");
     }
 
@@ -1126,8 +1165,12 @@ mod tests {
         let mut builder = LayerBuilder::new(Scope::User, None);
         let a = parse_config(r#"mounts { "/nonexistent-a" target="/t" }"#).unwrap();
         let b = parse_config(r#"mounts { "/tmp" target="/t" }"#).unwrap();
-        builder.add(a, Path::new("a.kdl"), WS).unwrap();
-        builder.add(b, Path::new("b.kdl"), WS).unwrap();
+        builder
+            .add(a, Path::new("a.kdl"), Path::new(WS_HOST), WS)
+            .unwrap();
+        builder
+            .add(b, Path::new("b.kdl"), Path::new(WS_HOST), WS)
+            .unwrap();
         let layer = builder.build();
         assert_eq!(layer.mounts.len(), 1);
         assert_eq!(layer.mounts[0].source, PathBuf::from("/tmp"));
@@ -1166,7 +1209,7 @@ mod tests {
             target: None,
             writable: false,
         };
-        assert!(mount.resolve(WS).is_none());
+        assert!(mount.resolve(Path::new(WS_HOST), WS).is_none());
     }
 
     #[test]
@@ -1176,8 +1219,24 @@ mod tests {
             target: Some(".envrc".into()),
             writable: false,
         };
-        let resolved = mount.resolve(WS).unwrap();
+        let resolved = mount.resolve(Path::new(WS_HOST), WS).unwrap();
         assert_eq!(resolved.source, PathBuf::from("/dev/null"));
+        assert_eq!(resolved.target, "/workspace/test-slug/.envrc");
+    }
+
+    #[test]
+    fn relative_source_resolves_against_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs_err::write(workspace.path().join(".envrc"), "export FOO=1").unwrap();
+        let mount = Mount {
+            source: ".envrc".into(),
+            target: None,
+            writable: false,
+        };
+
+        let resolved = mount.resolve(workspace.path(), WS).unwrap();
+
+        assert_eq!(resolved.source, workspace.path().join(".envrc"));
         assert_eq!(resolved.target, "/workspace/test-slug/.envrc");
     }
 
@@ -1188,7 +1247,7 @@ mod tests {
             target: Some("~/downloads".into()),
             writable: true,
         };
-        let resolved = mount.resolve(WS).unwrap();
+        let resolved = mount.resolve(Path::new(WS_HOST), WS).unwrap();
         assert_eq!(resolved.target, "/root/downloads");
     }
 
@@ -1199,7 +1258,7 @@ mod tests {
             target: None,
             writable: true,
         };
-        let resolved = mount.resolve(WS).unwrap();
+        let resolved = mount.resolve(Path::new(WS_HOST), WS).unwrap();
         assert_eq!(resolved.target, "/tmp");
     }
 
@@ -1235,7 +1294,9 @@ mod tests {
     fn cache_target_resolves_against_the_workspace() {
         let raw = parse_config(r#"cache { target "target" }"#).unwrap();
         let mut builder = LayerBuilder::new(Scope::Project, None);
-        builder.add(raw, Path::new("c.kdl"), WS).unwrap();
+        builder
+            .add(raw, Path::new("c.kdl"), Path::new(WS_HOST), WS)
+            .unwrap();
         let layer = builder.build();
         assert_eq!(layer.caches[0].target, "/workspace/test-slug/target");
     }
@@ -1269,7 +1330,9 @@ mod tests {
         );
 
         let mut builder = LayerBuilder::new(Scope::Project, None);
-        builder.add(raw, Path::new("c.kdl"), WS).unwrap();
+        builder
+            .add(raw, Path::new("c.kdl"), Path::new(WS_HOST), WS)
+            .unwrap();
         assert_eq!(
             builder.build().caches[0].target,
             "/workspace/test-slug/target"
@@ -1415,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_null_mask_removes_inherited_mount() {
+    fn dev_null_overrides_an_inherited_mount() {
         let config = scoped(vec![
             layer(
                 Scope::Binary,
@@ -1427,7 +1490,33 @@ mod tests {
             ),
         ]);
         let merged = config.merged_mounts();
-        assert!(merged.is_empty(), "mask should remove the inherited mount");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].value.source, PathBuf::from("/dev/null"));
+        assert_eq!(merged[0].scope, Scope::Project);
+    }
+
+    #[test]
+    fn a_higher_layer_mounts_back_what_a_lower_one_hid() {
+        let config = scoped(vec![
+            layer(
+                Scope::User,
+                vec![mount("/dev/null", "/workspace/test-slug/.envrc", false)],
+            ),
+            layer(
+                Scope::Project,
+                vec![mount(
+                    "/host/workspace/.envrc",
+                    "/workspace/test-slug/.envrc",
+                    false,
+                )],
+            ),
+        ]);
+        let merged = config.merged_mounts();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].value.source,
+            PathBuf::from("/host/workspace/.envrc")
+        );
     }
 
     #[test]
@@ -1438,6 +1527,23 @@ mod tests {
         )]);
         let merged = config.merged_mounts();
         assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].value.source, PathBuf::from("/dev/null"));
+    }
+
+    #[test]
+    fn stacked_masks_still_blank_the_file() {
+        let config = scoped(vec![
+            layer(
+                Scope::User,
+                vec![mount("/dev/null", "/workspace/test-slug/.envrc", false)],
+            ),
+            layer(
+                Scope::Project,
+                vec![mount("/dev/null", "/workspace/test-slug/.envrc", false)],
+            ),
+        ]);
+        let merged = config.merged_mounts();
+        assert_eq!(merged.len(), 1, "stacked masks must not cancel each other");
         assert_eq!(merged[0].value.source, PathBuf::from("/dev/null"));
     }
 

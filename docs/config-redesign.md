@@ -211,7 +211,7 @@ Layers, lowest to highest precedence:
 Merging: `env` merges per variable, overlaying the active profile's env, so
 any layer can adjust one variable without redefining the profile; mounts
 dedupe by resolved target; profiles by name; scalars last-writer-wins;
-`/dev/null` masking removes an inherited mount. A project `Dockerfile`
+a `/dev/null` source hides a target through that same precedence. A project `Dockerfile`
 stays at `.ramekin/Dockerfile`, beside the KDL.
 
 ### Session model

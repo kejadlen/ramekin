@@ -572,6 +572,20 @@ impl Ramekin {
         mounts
     }
 
+    /// Host path a mask at `target` hides, when ramekin can name one: a
+    /// path inside the workspace maps back to the host repo, and anywhere
+    /// else the mount a lower layer declared is what the mask covers.
+    /// Neither exists for a path the image alone supplies.
+    fn hidden_host_path(&self, target: &str) -> Option<PathBuf> {
+        if let Some(rel) = target
+            .strip_prefix(&self.workspace_target)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            return Some(self.workspace.join(rel));
+        }
+        self.config.overridden_source(target).map(Path::to_path_buf)
+    }
+
     /// Merge config mounts with the forced ones (session plumbing and
     /// caches), ordered lexicographically by target so parents precede
     /// children.
@@ -643,14 +657,22 @@ impl Ramekin {
             println!();
             println!("Mounts");
             let scopes: BTreeSet<_> = merged_mounts.iter().map(|sv| sv.scope).collect();
+            // Masks over a directory bind a session-scoped empty dir, so show
+            // that rather than the /dev/null the config file spells.
+            let empty_placeholder = self.cache_dir.join("sessions/<session>/empty");
             for scope in scopes {
                 println!("  {}", scope_label(scope));
                 for sv in merged_mounts.iter().filter(|sv| sv.scope == scope) {
-                    println!(
-                        "    {} → {}",
-                        sv.value.source.display(),
-                        sv.value.display_target()
-                    );
+                    let hides_a_dir = sv.value.is_mask()
+                        && self
+                            .hidden_host_path(&sv.value.target)
+                            .is_some_and(|path| path.is_dir());
+                    let source = if hides_a_dir {
+                        &empty_placeholder
+                    } else {
+                        &sv.value.source
+                    };
+                    println!("    {} → {}", source.display(), sv.value.display_target());
                 }
             }
         }
@@ -816,7 +838,15 @@ impl Ramekin {
             fs_err::create_dir_all(&mount.source).into_diagnostic()?;
             forced_mounts.push(mount);
         }
-        let all_mounts = self.final_mounts(&forced_mounts);
+        // A mask over a directory needs an empty directory to bind, not
+        // /dev/null; the dir is session-scoped so nothing can write into it
+        // and have it outlive the run.
+        let empty_dir = session_dir.join("empty");
+        fs_err::create_dir_all(&empty_dir).into_diagnostic()?;
+        let emitted = elide_directory_masks(&self.final_mounts(&forced_mounts), &empty_dir, |t| {
+            self.hidden_host_path(t)
+        });
+        let all_mounts: Vec<&config::ResolvedMount> = emitted.iter().collect();
         let env_vars = self.config.merged_env();
         let compose = generate_compose(ComposeParams {
             dockerfile: &dockerfile,
@@ -1101,6 +1131,31 @@ struct ComposeParams<'a> {
     agent_args: &'a [String],
 }
 
+/// Bind an empty directory for masks that hide a directory.
+///
+/// `/dev/null` binds over a file and blanks it, but over a directory Docker
+/// refuses the mount and the run dies at startup. An empty directory elides
+/// the contents while keeping the target the shape callers expect, so
+/// listing it succeeds and comes back empty.
+fn elide_directory_masks(
+    mounts: &[&config::ResolvedMount],
+    empty_dir: &Path,
+    hidden_host_path: impl Fn(&str) -> Option<PathBuf>,
+) -> Vec<config::ResolvedMount> {
+    mounts
+        .iter()
+        .map(|mount| {
+            let mut mount = (*mount).clone();
+            let hides_a_dir = mount.is_mask()
+                && hidden_host_path(&mount.target).is_some_and(|path| path.is_dir());
+            if hides_a_dir {
+                mount.source = empty_dir.to_path_buf();
+            }
+            mount
+        })
+        .collect()
+}
+
 /// Generate a Docker Compose config with all volume mounts.
 fn generate_compose(params: ComposeParams) -> String {
     let ComposeParams {
@@ -1215,6 +1270,54 @@ mod tests {
             prompt < provider && provider < model,
             "expected prompt < profile arg < cli arg, got {yaml}"
         );
+    }
+
+    #[test]
+    fn directory_mask_binds_an_empty_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs_err::create_dir_all(workspace.path().join("node_modules")).unwrap();
+        let mask = config::ResolvedMount {
+            source: PathBuf::from(config::MASK_SOURCE),
+            target: "/workspace/slug/node_modules".to_string(),
+            writable: false,
+        };
+
+        let emitted = elide_directory_masks(&[&mask], Path::new("/session/empty"), |_| {
+            Some(workspace.path().join("node_modules"))
+        });
+
+        assert_eq!(emitted[0].source, PathBuf::from("/session/empty"));
+        assert_eq!(emitted[0].target, mask.target);
+    }
+
+    #[test]
+    fn file_mask_still_binds_dev_null() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs_err::write(workspace.path().join(".envrc"), "export FOO=1").unwrap();
+        let mask = config::ResolvedMount {
+            source: PathBuf::from(config::MASK_SOURCE),
+            target: "/workspace/slug/.envrc".to_string(),
+            writable: false,
+        };
+
+        let emitted = elide_directory_masks(&[&mask], Path::new("/session/empty"), |_| {
+            Some(workspace.path().join(".envrc"))
+        });
+
+        assert_eq!(emitted[0].source, PathBuf::from(config::MASK_SOURCE));
+    }
+
+    #[test]
+    fn a_mask_over_nothing_nameable_binds_dev_null() {
+        let mask = config::ResolvedMount {
+            source: PathBuf::from(config::MASK_SOURCE),
+            target: "/root/.config/nowhere".to_string(),
+            writable: false,
+        };
+
+        let emitted = elide_directory_masks(&[&mask], Path::new("/session/empty"), |_| None);
+
+        assert_eq!(emitted[0].source, PathBuf::from(config::MASK_SOURCE));
     }
 
     #[test]
