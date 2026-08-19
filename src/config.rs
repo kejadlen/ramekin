@@ -224,8 +224,8 @@ impl AsRef<Path> for CacheName {
 /// `$XDG_DATA_HOME/ramekin/repos/<slug>/caches/<name>`, created eagerly like
 /// the sessions and outbox dirs. That keeps caches per repo (build
 /// directories can't be shared: tools lock them, and a differing toolchain
-/// invalidates their contents) without a host path in config, and without
-/// the silent skip that a missing mount source gets.
+/// invalidates their contents) without a host path in config, and without a
+/// missing-source error — the directory is created before it's mounted.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Cache {
     /// Directory name on the host, under this repo's `caches/`.
@@ -297,8 +297,10 @@ impl ScopedConfig {
     /// `cli_profile` is the `-p` selection, which beats any layer's.
     ///
     /// Returns an error if a config file can't be parsed, if two files
-    /// within the user layer define the same key, or if the selected
-    /// profile isn't defined anywhere.
+    /// within the user layer define the same key, if the selected profile
+    /// isn't defined anywhere, or if a configured mount's source doesn't
+    /// exist on the host (unless a higher layer overrides or masks the
+    /// target).
     pub fn load(
         workspace: &Path,
         workspace_target: &str,
@@ -369,6 +371,10 @@ impl ScopedConfig {
                 )
             })
             .collect();
+        // Where each profile was defined, for error attribution: profile
+        // mounts resolve only once one is selected, far from the file it
+        // came from.
+        let mut profile_files: BTreeMap<String, PathBuf> = BTreeMap::new();
         let mut selection = (DEFAULT_PROFILE.to_string(), Some(Scope::Binary));
         for builder in &builders {
             for profile in &builder.profiles {
@@ -379,6 +385,9 @@ impl ScopedConfig {
                         value: profile.clone(),
                     },
                 );
+            }
+            for (name, file) in &builder.profile_files {
+                profile_files.insert(name.clone(), file.clone());
             }
             if let Some(name) = &builder.selection {
                 selection = (name.clone(), Some(builder.scope));
@@ -416,19 +425,21 @@ impl ScopedConfig {
             mounts: profile
                 .mounts
                 .iter()
-                .filter_map(|m| m.resolve(workspace, workspace_target))
+                .map(|m| m.resolve(workspace, workspace_target))
                 .collect(),
             env: profile.env.clone(),
             caches: Vec::new(),
         });
         layers.extend(builders.into_iter().map(LayerBuilder::build));
 
-        Ok(Self {
+        let config = Self {
             layers,
             profiles,
             selected_by,
             profile,
-        })
+        };
+        config.check_configured_mount_sources(&profile_files)?;
+        Ok(config)
     }
 
     /// Return merged mounts from all layers, de-duplicated by container target.
@@ -456,6 +467,48 @@ impl ScopedConfig {
             }
         }
         by_target.into_values().collect()
+    }
+
+    /// Error on configured mounts (profile and file layers) whose host
+    /// source doesn't exist: a mount that silently failed to bind looks
+    /// like a bug in the container, so a missing source is config the host
+    /// can't honor. Only merged winners are checked — a higher layer's
+    /// mount at the same target, including a `/dev/null` mask, supersedes
+    /// the missing one, which makes masking the opt-out. Binary-layer
+    /// mounts are exempt: staples and agent-config entries stay
+    /// skip-if-missing.
+    fn check_configured_mount_sources(
+        &self,
+        profile_files: &BTreeMap<String, PathBuf>,
+    ) -> Result<()> {
+        for sv in self.merged_mounts() {
+            if sv.scope == Scope::Binary || sv.value.source.exists() {
+                continue;
+            }
+            let origin = match sv.scope {
+                Scope::Profile => format!(
+                    "profile `{}` (defined in {})",
+                    self.profile.name,
+                    profile_files
+                        .get(&self.profile.name)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "an unknown file".to_string()),
+                ),
+                scope => self
+                    .layers
+                    .iter()
+                    .find(|l| l.scope == scope)
+                    .and_then(|l| l.path.as_ref())
+                    .map(|p| format!("{scope} layer ({})", p.display()))
+                    .unwrap_or_else(|| format!("{scope} layer")),
+            };
+            bail!(
+                "{origin}: mount source {} does not exist on the host; create it, or hide the \
+                 target with a /dev/null mount",
+                sv.value.source.display(),
+            );
+        }
+        Ok(())
     }
 
     /// The host source a mask at `target` hides, when a layer declared one.
@@ -544,6 +597,9 @@ struct LayerBuilder {
     env_names: BTreeSet<String>,
     profiles: Vec<Profile>,
     profile_names: BTreeSet<String>,
+    /// File each profile was defined in, for error attribution when the
+    /// profile is selected and one of its mounts is missing on the host.
+    profile_files: BTreeMap<String, PathBuf>,
     caches: Vec<Cache>,
     cache_names: BTreeSet<CacheName>,
     selection: Option<String>,
@@ -560,6 +616,7 @@ impl LayerBuilder {
             env_names: BTreeSet::new(),
             profiles: Vec::new(),
             profile_names: BTreeSet::new(),
+            profile_files: BTreeMap::new(),
             caches: Vec::new(),
             cache_names: BTreeSet::new(),
             selection: None,
@@ -579,11 +636,9 @@ impl LayerBuilder {
         workspace_target: &str,
     ) -> Result<()> {
         for mount in &raw.mounts {
-            // Mounts with a missing host source are skipped entirely, so
-            // they don't participate in duplicate detection either.
-            let Some(resolved) = mount.resolve(workspace, workspace_target) else {
-                continue;
-            };
+            // Existence is checked after merging, so a higher layer's
+            // override or mask can still rescue a missing source.
+            let resolved = mount.resolve(workspace, workspace_target);
             ensure!(
                 self.mount_targets.insert(resolved.target.clone()),
                 "{}: mount target {} is defined twice in the {} layer",
@@ -611,6 +666,7 @@ impl LayerBuilder {
                 profile.name,
                 self.scope,
             );
+            self.profile_files.insert(profile.name.clone(), file.to_path_buf());
             self.profiles.push(profile);
         }
         for cache in raw.caches {
@@ -971,30 +1027,28 @@ impl Mount {
     /// relative target resolves against the workspace mount, so a committed
     /// project config can name a file in its own repo without a host path.
     ///
-    /// Returns `None` if the source does not exist on the host. Files and
-    /// devices (such as `/dev/null`) resolve like directories — Docker binds
-    /// them all the same way.
-    pub fn resolve(&self, workspace: &Path, workspace_target: &str) -> Option<ResolvedMount> {
+    /// Existence isn't checked here — a missing source is layer policy
+    /// (file layers error on the merged winner, the binary layer skips).
+    /// Files and devices (such as `/dev/null`) resolve like directories —
+    /// Docker binds them all the same way.
+    pub fn resolve(&self, workspace: &Path, workspace_target: &str) -> ResolvedMount {
         let expanded = PathBuf::from(shellexpand::tilde(&self.source).as_ref());
         let expanded = if expanded.is_relative() {
             workspace.join(expanded)
         } else {
             expanded
         };
-        if !expanded.exists() {
-            return None;
-        }
 
         let target = match &self.target {
             Some(t) => resolve_container_target(t, workspace_target),
             None => resolve_container_target(&self.source, workspace_target),
         };
 
-        Some(ResolvedMount {
+        ResolvedMount {
             source: expanded,
             target,
             writable: self.writable,
-        })
+        }
     }
 }
 
@@ -1161,19 +1215,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_source_skips_duplicate_detection() {
+    fn missing_source_participates_in_duplicate_detection() {
+        // A mount with a missing source still claims its target, so a second
+        // mount at the same target is a duplicate however missing the first
+        // source is.
         let mut builder = LayerBuilder::new(Scope::User, None);
         let a = parse_config(r#"mounts { "/nonexistent-a" target="/t" }"#).unwrap();
         let b = parse_config(r#"mounts { "/tmp" target="/t" }"#).unwrap();
         builder
             .add(a, Path::new("a.kdl"), Path::new(WS_HOST), WS)
             .unwrap();
-        builder
+        let err = builder
             .add(b, Path::new("b.kdl"), Path::new(WS_HOST), WS)
-            .unwrap();
-        let layer = builder.build();
-        assert_eq!(layer.mounts.len(), 1);
-        assert_eq!(layer.mounts[0].source, PathBuf::from("/tmp"));
+            .unwrap_err();
+        assert!(err.to_string().contains("/t"), "{err}");
     }
 
     #[test]
@@ -1203,13 +1258,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_skips_nonexistent_source() {
+    fn resolve_stays_total_for_a_nonexistent_source() {
+        // Existence is layer policy, not path math: resolution returns the
+        // paths either way.
         let mount = Mount {
             source: "/nonexistent/path/that/does/not/exist".into(),
             target: None,
             writable: false,
         };
-        assert!(mount.resolve(Path::new(WS_HOST), WS).is_none());
+        let resolved = mount.resolve(Path::new(WS_HOST), WS);
+        assert_eq!(resolved.source, PathBuf::from("/nonexistent/path/that/does/not/exist"));
+        assert_eq!(resolved.target, "/nonexistent/path/that/does/not/exist");
     }
 
     #[test]
@@ -1219,7 +1278,7 @@ mod tests {
             target: Some(".envrc".into()),
             writable: false,
         };
-        let resolved = mount.resolve(Path::new(WS_HOST), WS).unwrap();
+        let resolved = mount.resolve(Path::new(WS_HOST), WS);
         assert_eq!(resolved.source, PathBuf::from("/dev/null"));
         assert_eq!(resolved.target, "/workspace/test-slug/.envrc");
     }
@@ -1234,7 +1293,7 @@ mod tests {
             writable: false,
         };
 
-        let resolved = mount.resolve(workspace.path(), WS).unwrap();
+        let resolved = mount.resolve(workspace.path(), WS);
 
         assert_eq!(resolved.source, workspace.path().join(".envrc"));
         assert_eq!(resolved.target, "/workspace/test-slug/.envrc");
@@ -1247,7 +1306,7 @@ mod tests {
             target: Some("~/downloads".into()),
             writable: true,
         };
-        let resolved = mount.resolve(Path::new(WS_HOST), WS).unwrap();
+        let resolved = mount.resolve(Path::new(WS_HOST), WS);
         assert_eq!(resolved.target, "/root/downloads");
     }
 
@@ -1258,7 +1317,7 @@ mod tests {
             target: None,
             writable: true,
         };
-        let resolved = mount.resolve(Path::new(WS_HOST), WS).unwrap();
+        let resolved = mount.resolve(Path::new(WS_HOST), WS);
         assert_eq!(resolved.target, "/tmp");
     }
 
@@ -1592,6 +1651,145 @@ mod tests {
         assert_eq!(project.mounts[0].target, "/container/tmp");
         assert_eq!(project.env.len(), 1);
         assert_eq!(project.env[0].name, "FOO");
+    }
+
+    #[test]
+    fn missing_project_mount_source_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.kdl"),
+            r#"mounts { "/nonexistent/path/xyz" target="/root/thing" }"#,
+        )
+        .unwrap();
+
+        let err = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap_err().to_string();
+        assert!(err.contains("project layer"), "{err}");
+        assert!(err.contains("config.kdl"), "{err}");
+        assert!(err.contains("/nonexistent/path/xyz"), "{err}");
+        assert!(err.contains("/dev/null"), "{err}");
+    }
+
+    #[test]
+    fn missing_user_mount_source_is_an_error() {
+        let config_home = tempfile::tempdir().unwrap();
+        fs_err::write(
+            config_home.path().join("config.kdl"),
+            r#"mounts { "/nonexistent/path/xyz" target="/root/thing" }"#,
+        )
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let err = ScopedConfig::load_from(Some(config_home.path()), workspace.path(), WS, None)
+            .unwrap_err()
+            .to_string();
+        let home = config_home.path().display().to_string();
+        assert!(err.contains("user layer"), "{err}");
+        assert!(err.contains(&home), "{err}");
+        assert!(err.contains("/nonexistent/path/xyz"), "{err}");
+    }
+
+    #[test]
+    fn missing_profile_mount_source_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.kdl"),
+            r#"
+            profile "work" {
+                agent "pi"
+                mounts { "/nonexistent/path/xyz" target="/root/thing" }
+            }
+            profile "work"
+            "#,
+        )
+        .unwrap();
+
+        let err = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap_err().to_string();
+        assert!(err.contains("profile `work`"), "{err}");
+        assert!(err.contains("config.kdl"), "{err}");
+        assert!(err.contains("/nonexistent/path/xyz"), "{err}");
+    }
+
+    #[test]
+    fn a_higher_layer_mask_opts_out_of_the_missing_source_error() {
+        // The mask wins the target, so the missing source beneath it is moot.
+        let config_home = tempfile::tempdir().unwrap();
+        fs_err::write(
+            config_home.path().join("config.kdl"),
+            r#"mounts { "/nonexistent/path/xyz" target="/root/thing" }"#,
+        )
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let ramekin_dir = workspace.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.kdl"),
+            r#"mounts { "/dev/null" target="/root/thing" }"#,
+        )
+        .unwrap();
+
+        let config =
+            ScopedConfig::load_from(Some(config_home.path()), workspace.path(), WS, None).unwrap();
+        let merged = config.merged_mounts();
+        let winner = merged
+            .iter()
+            .find(|sv| sv.value.target == "/root/thing")
+            .unwrap();
+        assert!(winner.value.is_mask());
+        assert_eq!(winner.scope, Scope::Project);
+    }
+
+    #[test]
+    fn a_higher_layer_override_opts_out_of_the_missing_source_error() {
+        let config_home = tempfile::tempdir().unwrap();
+        fs_err::write(
+            config_home.path().join("config.kdl"),
+            r#"mounts { "/nonexistent/path/xyz" target="/root/thing" }"#,
+        )
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let ramekin_dir = workspace.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.kdl"),
+            r#"mounts { "/tmp" target="/root/thing" }"#,
+        )
+        .unwrap();
+
+        let config =
+            ScopedConfig::load_from(Some(config_home.path()), workspace.path(), WS, None).unwrap();
+        let merged = config.merged_mounts();
+        let winner = merged
+            .iter()
+            .find(|sv| sv.value.target == "/root/thing")
+            .unwrap();
+        assert_eq!(winner.value.source, PathBuf::from("/tmp"));
+        assert_eq!(winner.scope, Scope::Project);
+    }
+
+    #[test]
+    fn an_unselected_profile_with_a_missing_source_is_fine() {
+        // Profile mounts resolve only when selected; a profile meant for
+        // another machine doesn't constrain this one.
+        let dir = tempfile::tempdir().unwrap();
+        let ramekin_dir = dir.path().join(".ramekin");
+        fs_err::create_dir_all(&ramekin_dir).unwrap();
+        fs_err::write(
+            ramekin_dir.join("config.kdl"),
+            r#"
+            profile "work" {
+                agent "pi"
+                mounts { "/nonexistent/path/xyz" target="/root/thing" }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap();
+        assert_eq!(config.profile.name, "pi");
     }
 
     #[test]

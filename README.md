@@ -106,7 +106,7 @@ Mount configuration merges across layers, lowest to highest precedence:
 3. **User** — every `*.kdl` in `$XDG_CONFIG_HOME/ramekin/`, merged as one layer (defining the same key twice within the layer is an error; per-file symlinking into dotfiles is a dotfiles decision)
 4. **Project** — `<workspace>/.ramekin/config.kdl`, committed
 
-Additional host paths can be mounted into the container via the KDL layers. Directories, files, and devices (such as `/dev/null`) all work. Mounts whose source doesn't exist on the host are silently skipped.
+Additional host paths can be mounted into the container via the KDL layers. Directories, files, and devices (such as `/dev/null`) all work. A configured mount whose source doesn't exist on the host is an error, not a silent skip — a mount that quietly failed to bind looks like a bug in the container. Create the path, or hide the target with a `/dev/null` mount if it isn't wanted. Only the mount that survives merging is checked, so a higher layer's override or mask also covers a lower layer's missing source.
 
 ```kdl
 mounts {
@@ -164,7 +164,7 @@ cache {
 
 Each child node names a directory under `$XDG_DATA_HOME/ramekin/repos/<slug>/caches/`; its argument is the container path, resolved like a mount target (`~` is the container home, a relative path resolves against the workspace mount). Omit the argument and the name serves as the path — a bare `target` is the whole declaration for a build directory the tool already looks for in the workspace. Caches merge by name across layers, so a higher layer can retarget one, and two names claiming the same container path is an error.
 
-Unlike `mounts`, the host side isn't configurable and the directory is created rather than skipped when missing — a cache that silently failed to mount would look like nothing but slow builds. Caches are per repo because build directories can't be shared: tools take an exclusive lock on them for the duration of a build, and a toolchain change invalidates their contents wholesale. Download caches have the opposite shape — keyed by name and version, safe to share — so those belong in `mounts`:
+Unlike `mounts`, the host side isn't configurable and the directory is created when missing instead of erroring — a cache that silently failed to mount would look like nothing but slow builds. Caches are per repo because build directories can't be shared: tools take an exclusive lock on them for the duration of a build, and a toolchain change invalidates their contents wholesale. Download caches have the opposite shape — keyed by name and version, safe to share — so those belong in `mounts`:
 
 ```kdl
 mounts {
