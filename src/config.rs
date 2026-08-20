@@ -666,7 +666,8 @@ impl LayerBuilder {
                 profile.name,
                 self.scope,
             );
-            self.profile_files.insert(profile.name.clone(), file.to_path_buf());
+            self.profile_files
+                .insert(profile.name.clone(), file.to_path_buf());
             self.profiles.push(profile);
         }
         for cache in raw.caches {
@@ -1267,7 +1268,10 @@ mod tests {
             writable: false,
         };
         let resolved = mount.resolve(Path::new(WS_HOST), WS);
-        assert_eq!(resolved.source, PathBuf::from("/nonexistent/path/that/does/not/exist"));
+        assert_eq!(
+            resolved.source,
+            PathBuf::from("/nonexistent/path/that/does/not/exist")
+        );
         assert_eq!(resolved.target, "/nonexistent/path/that/does/not/exist");
     }
 
@@ -1664,7 +1668,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap_err().to_string();
+        let err = ScopedConfig::load_from(None, dir.path(), WS, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("project layer"), "{err}");
         assert!(err.contains("config.kdl"), "{err}");
         assert!(err.contains("/nonexistent/path/xyz"), "{err}");
@@ -1707,7 +1713,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap_err().to_string();
+        let err = ScopedConfig::load_from(None, dir.path(), WS, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("profile `work`"), "{err}");
         assert!(err.contains("config.kdl"), "{err}");
         assert!(err.contains("/nonexistent/path/xyz"), "{err}");
