@@ -607,7 +607,7 @@ impl Ramekin {
 
     fn config(&self) -> Result<()> {
         println!("Workspace");
-        println!("  {} → {}", self.workspace.display(), self.workspace_target);
+        println!("  {} ← {}", self.workspace_target, self.workspace.display());
 
         println!();
         println!("Profile");
@@ -672,7 +672,7 @@ impl Ramekin {
                     } else {
                         &sv.value.source
                     };
-                    println!("    {} → {}", source.display(), sv.value.display_target());
+                    println!("    {} ← {}", sv.value.display_target(), source.display());
                 }
             }
         }
@@ -686,9 +686,9 @@ impl Ramekin {
         println!("Session mounts");
         for mount in self.session_mounts(&placeholder, &outbox_placeholder) {
             println!(
-                "    {} → {}",
-                mount.source.display(),
-                mount.display_target()
+                "    {} ← {}",
+                mount.display_target(),
+                mount.source.display()
             );
         }
 
@@ -703,9 +703,9 @@ impl Ramekin {
                 println!("  {}", scope_label(scope));
                 for sv in caches.iter().filter(|sv| sv.scope == scope) {
                     println!(
-                        "    {} → {}",
-                        base.join(&sv.value.name).display(),
-                        sv.value.target
+                        "    {} ← {}",
+                        sv.value.target,
+                        base.join(&sv.value.name).display()
                     );
                 }
             }
