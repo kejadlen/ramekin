@@ -164,15 +164,6 @@ impl ResolvedMount {
     pub fn is_mask(&self) -> bool {
         self.source == Path::new(MASK_SOURCE)
     }
-
-    /// Label for display in `config` output (target, with ` (ro)` suffix when read-only).
-    pub fn display_target(&self) -> String {
-        if self.writable {
-            self.target.clone()
-        } else {
-            format!("{} (ro)", self.target)
-        }
-    }
 }
 
 /// A cache's name, checked to be a single path component.

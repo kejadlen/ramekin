@@ -605,11 +605,40 @@ impl Ramekin {
         by_target.into_values().collect()
     }
 
-    fn config(&self) -> Result<()> {
-        println!("Workspace");
-        println!("  {} ← {}", self.workspace_target, self.workspace.display());
+    /// Host source in display form: paths under ramekin's data or cache
+    /// directory shorten to `…`, since the sections above name those roots.
+    fn shorten_source(&self, path: &Path) -> String {
+        for home in [&self.data_home, &self.cache_dir] {
+            if let Ok(rest) = path.strip_prefix(home) {
+                return format!("…/{}", rest.display());
+            }
+        }
+        path.display().to_string()
+    }
 
-        println!();
+    /// Layer tag for the mount tree, e.g. `[binary]`, `[profile pi]`,
+    /// `[user ~/.config/ramekin]`.
+    fn layer_tag(&self, scope: config::Scope) -> String {
+        match scope {
+            config::Scope::Binary => "[binary]".to_string(),
+            config::Scope::Profile => format!("[profile {}]", self.config.profile.name),
+            scope => {
+                let path = self
+                    .config
+                    .layers
+                    .iter()
+                    .find(|l| l.scope == scope)
+                    .and_then(|l| l.path.as_ref())
+                    .map(|p| p.display().to_string());
+                match path {
+                    Some(path) => format!("[{scope} {path}]"),
+                    None => format!("[{scope}]"),
+                }
+            }
+        }
+    }
+
+    fn config(&self) -> Result<()> {
         println!("Profile");
         let selected_by = self
             .config
@@ -635,10 +664,11 @@ impl Ramekin {
             println!("  {label} {}", path.display());
         }
         println!("  cache    {}", self.cache_dir.display());
-        let outbox_dir = self.data_home.join(format!("repos/{}/outbox", self.repo_slug));
+        let outbox_dir = self
+            .data_home
+            .join(format!("repos/{}/outbox", self.repo_slug));
         println!("  outbox   {}", outbox_dir.display());
 
-        let merged_mounts = self.config.merged_mounts();
         let merged_env = self.config.merged_env();
 
         let scope_label = |scope: config::Scope| -> String {
@@ -654,62 +684,61 @@ impl Ramekin {
                 .unwrap_or_else(|| scope.to_string())
         };
 
-        // Mounts
-        if !merged_mounts.is_empty() {
-            println!();
-            println!("Mounts");
-            let scopes: BTreeSet<_> = merged_mounts.iter().map(|sv| sv.scope).collect();
-            // Masks over a directory bind a session-scoped empty dir, so show
-            // that rather than the /dev/null the config file spells.
-            let empty_placeholder = self.cache_dir.join("sessions/<session>/empty");
-            for scope in scopes {
-                println!("  {}", scope_label(scope));
-                for sv in merged_mounts.iter().filter(|sv| sv.scope == scope) {
-                    let hides_a_dir = sv.value.is_mask()
-                        && self
-                            .hidden_host_path(&sv.value.target)
-                            .is_some_and(|path| path.is_dir());
-                    let source = if hides_a_dir {
-                        &empty_placeholder
-                    } else {
-                        &sv.value.source
-                    };
-                    println!("    {} ← {}", sv.value.display_target(), source.display());
-                }
-            }
-        }
-
-        // Session mounts (sources materialize per run; shown with a placeholder)
+        // Mounts: config layers, caches, and session plumbing as one tree
+        // over the container filesystem, with later insertions winning a
+        // shared target just as they do in `final_mounts`. Sources
+        // materialize per run; the placeholders show where they land.
         let placeholder = self.cache_dir.join("sessions/<session>");
         let outbox_placeholder = outbox_dir.join("<session>");
-        println!();
-        println!("Session mounts");
-        for mount in self.session_mounts(&placeholder, &outbox_placeholder) {
-            println!(
-                "    {} ← {}",
-                mount.display_target(),
-                mount.source.display()
+        let mut rows: BTreeMap<String, MountRow> = BTreeMap::new();
+        for sv in self.config.merged_mounts() {
+            let hides = if sv.value.is_mask() {
+                self.hidden_host_path(&sv.value.target)
+                    .map(|path| path.display().to_string())
+            } else {
+                None
+            };
+            rows.insert(
+                sv.value.target.clone(),
+                MountRow {
+                    source: self.shorten_source(&sv.value.source),
+                    writable: sv.value.writable,
+                    tag: self.layer_tag(sv.scope),
+                    hides,
+                },
             );
         }
-
-        // Caches
-        let caches = self.config.merged_caches()?;
-        if !caches.is_empty() {
-            println!();
-            println!("Caches");
-            let base = self.repo_caches_dir();
-            let scopes: BTreeSet<_> = caches.iter().map(|sv| sv.scope).collect();
-            for scope in scopes {
-                println!("  {}", scope_label(scope));
-                for sv in caches.iter().filter(|sv| sv.scope == scope) {
-                    println!(
-                        "    {} ← {}",
-                        sv.value.target,
-                        base.join(&sv.value.name).display()
-                    );
-                }
-            }
+        for mount in self.session_mounts(&placeholder, &outbox_placeholder) {
+            rows.insert(
+                mount.target.clone(),
+                MountRow {
+                    source: self.shorten_source(&mount.source),
+                    writable: mount.writable,
+                    tag: "[session]".to_string(),
+                    hides: None,
+                },
+            );
         }
+        // Insertion order mirrors `final_mounts`' forced list (session
+        // mounts, then caches), so a cache retargeting a session path wins
+        // here too.
+        for sv in self.config.merged_caches()? {
+            rows.insert(
+                sv.value.target.clone(),
+                MountRow {
+                    source: self.shorten_source(&self.repo_caches_dir().join(&sv.value.name)),
+                    writable: true,
+                    tag: format!("[cache {}]", sv.scope),
+                    hides: None,
+                },
+            );
+        }
+        println!();
+        println!(
+            "Mounts  {} writable · {} read-only · {} masked · … = a ramekin data/cache dir",
+            GLYPH_WRITABLE, GLYPH_READ_ONLY, GLYPH_MASK
+        );
+        print!("{}", render_mount_tree(&rows));
 
         // Environment
         if !merged_env.is_empty() {
@@ -1069,6 +1098,154 @@ fn repo_slug(workspace: &Path) -> String {
 /// lowercase.
 fn project_image_name(repo_slug: &str) -> String {
     format!("ramekin-{repo_slug}").to_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// Mount tree for `ramekin config`
+//
+// One tree per top-level container path, siblings in bind order (parents
+// precede children). A mount's children are mounts bound on top of it, so
+// the shape of the tree shows stacking — pi's writable ephemeral agent dir
+// with read-only config and persistent state bound inside it.
+
+/// Glyphs for the mount tree. The pencil carries U+FE0F (variation
+/// selector-16) so it renders as a double-width emoji like the lock, keeping
+/// the two markers visually equal where terminals honor it.
+const GLYPH_WRITABLE: &str = "\u{270f}\u{fe0f}"; // ✏️
+const GLYPH_READ_ONLY: &str = "\u{1f512}"; // 🔒
+const GLYPH_MASK: &str = "\u{2205}"; // ∅
+
+/// One mount as a line of the tree: the source bound at the target, its
+/// writability, and the layer it came from.
+#[derive(Clone, Debug)]
+struct MountRow {
+    source: String,
+    writable: bool,
+    /// Layer tag rendered after the source, e.g. `[session]`.
+    tag: String,
+    /// Host path a mask at this target hides; `None` for real binds.
+    hides: Option<String>,
+}
+
+/// A node of the container-path tree: an optional mount plus the mounts
+/// nested under it.
+struct MountNode {
+    /// Full container path, leading components included.
+    path: String,
+    row: Option<MountRow>,
+    /// Keyed by path component, so siblings render lexicographically.
+    children: BTreeMap<String, MountNode>,
+}
+
+impl MountNode {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            row: None,
+            children: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, target: &str, row: MountRow) {
+        let mut node = self;
+        let mut path = String::new();
+        for component in target.split('/').filter(|c| !c.is_empty()) {
+            path.push('/');
+            path.push_str(component);
+            node = node
+                .children
+                .entry(component.to_string())
+                .or_insert_with(|| Self::new(path.clone()));
+        }
+        node.row = Some(row);
+    }
+}
+
+/// Merge chains of non-mount nodes into their single child, so unmounted
+/// path prefixes don't add tree levels: `/root/.local/share/ranger` with
+/// nothing else under it renders as one line. Applied to every node except
+/// the implicit filesystem root, whose children become forest roots.
+fn collapse_unmounted_chains(node: &mut MountNode) {
+    for child in node.children.values_mut() {
+        collapse_unmounted_chains(child);
+    }
+    if node.row.is_none() && node.children.len() == 1 {
+        let Some((_, child)) = node.children.pop_first() else {
+            unreachable!("length checked above");
+        };
+        node.path = child.path;
+        node.row = child.row;
+        node.children = child.children;
+    }
+}
+
+/// Render the mount rows as a forest, one tree per top-level container path.
+fn render_mount_tree(rows: &BTreeMap<String, MountRow>) -> String {
+    let mut root = MountNode::new(String::new());
+    for (target, row) in rows {
+        root.insert(target, row.clone());
+    }
+    for child in root.children.values_mut() {
+        collapse_unmounted_chains(child);
+    }
+
+    // A depth-1 non-mount prefix such as `/root` would own nearly the whole
+    // tree as a bare root line, so expand it into its children instead.
+    let mut roots = Vec::new();
+    for child in std::mem::take(&mut root.children).into_values() {
+        if child.row.is_none() && child.path.matches('/').count() == 1 {
+            roots.extend(child.children.into_values());
+        } else {
+            roots.push(child);
+        }
+    }
+
+    let mut out = String::new();
+    for root in &roots {
+        out.push_str(&node_line(root, 0));
+        out.push('\n');
+        render_subtree(root, root.path.len(), "", &mut out);
+    }
+    out
+}
+
+/// A node's own line: its path relative to the forest root (`base` is the
+/// root's path length, 0 for the root itself) plus its mount, or just the
+/// path for a bare grouping node several mounts share as a prefix.
+fn node_line(node: &MountNode, base: usize) -> String {
+    // Roots (`base` 0) keep their absolute path; descendants drop the
+    // root's prefix and the `/` separator, rendering `sessions/xyz` style.
+    let path = if base == 0 {
+        node.path.as_str()
+    } else {
+        &node.path[base + 1..]
+    };
+    let Some(row) = &node.row else {
+        return path.to_string();
+    };
+    if let Some(hides) = &row.hides {
+        format!("{path} {GLYPH_MASK} hides {hides}  {}", row.tag)
+    } else {
+        let glyph = if row.writable {
+            GLYPH_WRITABLE
+        } else {
+            GLYPH_READ_ONLY
+        };
+        format!("{path} {glyph} ← {}  {}", row.source, row.tag)
+    }
+}
+
+fn render_subtree(node: &MountNode, base: usize, prefix: &str, out: &mut String) {
+    let children: Vec<_> = node.children.values().collect();
+    for (i, child) in children.iter().enumerate() {
+        let last = i + 1 == children.len();
+        out.push_str(prefix);
+        out.push_str(if last { "└── " } else { "├── " });
+        out.push_str(&node_line(child, base));
+        out.push('\n');
+        let continuation = if last { "    " } else { "│   " };
+        render_subtree(child, base, &format!("{prefix}{continuation}"), out);
+    }
 }
 
 #[derive(Serialize)]
@@ -1453,5 +1630,125 @@ mod tests {
 
         let sessions = target("/root/.pi/agent/sessions").expect("sessions mount");
         assert_eq!(sessions.source, PathBuf::from("/data/repos/x-1/sessions"));
+    }
+
+    fn row(source: &str, writable: bool, tag: &str) -> MountRow {
+        MountRow {
+            source: source.into(),
+            writable,
+            tag: tag.into(),
+            hides: None,
+        }
+    }
+
+    fn mask_row(hides: &str, tag: &str) -> MountRow {
+        MountRow {
+            source: String::new(),
+            writable: false,
+            tag: tag.into(),
+            hides: Some(hides.into()),
+        }
+    }
+
+    #[test]
+    fn mount_tree_renders_stacked_mounts_with_glyphs_and_masks() {
+        let rows = BTreeMap::from([
+            (
+                "/root/.config/git".to_string(),
+                row("/home/me/.config/git", false, "[binary]"),
+            ),
+            (
+                "/root/.config/jj".to_string(),
+                row("/home/me/.config/jj", false, "[binary]"),
+            ),
+            (
+                "/root/.pi/agent".to_string(),
+                row("…/sessions/<s>/agent", true, "[session]"),
+            ),
+            (
+                "/root/.pi/agent/AGENTS.md".to_string(),
+                row("/home/me/.config/pi/AGENTS.md", false, "[binary]"),
+            ),
+            (
+                "/root/.pi/agent/extensions".to_string(),
+                mask_row(
+                    "/home/me/.config/pi/extensions",
+                    "[project .ramekin/config.kdl]",
+                ),
+            ),
+            (
+                "/workspace/repo-abc123".to_string(),
+                row("/home/me/src/repo", true, "[session]"),
+            ),
+        ]);
+
+        let expected = "\
+/root/.config
+├── git 🔒 ← /home/me/.config/git  [binary]
+└── jj 🔒 ← /home/me/.config/jj  [binary]
+/root/.pi/agent ✏️ ← …/sessions/<s>/agent  [session]
+├── AGENTS.md 🔒 ← /home/me/.config/pi/AGENTS.md  [binary]
+└── extensions ∅ hides /home/me/.config/pi/extensions  [project .ramekin/config.kdl]
+/workspace/repo-abc123 ✏️ ← /home/me/src/repo  [session]
+";
+        assert_eq!(render_mount_tree(&rows), expected);
+    }
+
+    #[test]
+    fn mount_tree_collapses_unmounted_single_child_chains() {
+        let rows = BTreeMap::from([(
+            "/root/.local/share/ranger".to_string(),
+            row(
+                "/home/me/.local/share/ranger",
+                true,
+                "[project .ramekin/config.kdl]",
+            ),
+        )]);
+
+        let expected = "\
+/root/.local/share/ranger ✏️ ← /home/me/.local/share/ranger  [project .ramekin/config.kdl]
+";
+        assert_eq!(render_mount_tree(&rows), expected);
+    }
+
+    #[test]
+    fn mount_tree_renders_bare_root_for_a_shared_prefix() {
+        let rows = BTreeMap::from([
+            (
+                "/root/.cache/cargo".to_string(),
+                row("…/repos/r/caches/cargo", true, "[cache user]"),
+            ),
+            (
+                "/root/.cache/sccache".to_string(),
+                row("…/repos/r/caches/sccache", true, "[cache user]"),
+            ),
+        ]);
+
+        let expected = "\
+/root/.cache
+├── cargo ✏️ ← …/repos/r/caches/cargo  [cache user]
+└── sccache ✏️ ← …/repos/r/caches/sccache  [cache user]
+";
+        assert_eq!(render_mount_tree(&rows), expected);
+    }
+
+    #[test]
+    fn mount_tree_collapses_chains_below_a_mounted_parent() {
+        let rows = BTreeMap::from([
+            (
+                "/root/.pi/agent".to_string(),
+                row("…/sessions/<s>/agent", true, "[session]"),
+            ),
+            (
+                "/root/.pi/agent/sessions/xyz".to_string(),
+                row("…/repos/r/sessions", false, "[binary]"),
+            ),
+        ]);
+
+        let expected = "\
+/root/.pi/agent ✏️ ← …/sessions/<s>/agent  [session]
+└── sessions/xyz 🔒 ← …/repos/r/sessions  [binary]
+";
+        assert_eq!(render_mount_tree(&rows), expected);
     }
 }
