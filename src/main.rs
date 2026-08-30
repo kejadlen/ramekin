@@ -735,8 +735,8 @@ impl Ramekin {
         }
         println!();
         println!(
-            "Mounts  {} writable · {} read-only · {} masked · … = a ramekin data/cache dir",
-            GLYPH_WRITABLE, GLYPH_READ_ONLY, GLYPH_MASK
+            "Mounts  {} read-only · {} masked · … = a ramekin data/cache dir",
+            GLYPH_READ_ONLY, GLYPH_MASK
         );
         print!("{}", render_mount_tree(&rows));
 
@@ -1108,10 +1108,8 @@ fn project_image_name(repo_slug: &str) -> String {
 // the shape of the tree shows stacking — pi's writable ephemeral agent dir
 // with read-only config and persistent state bound inside it.
 
-/// Glyphs for the mount tree. The pencil carries U+FE0F (variation
-/// selector-16) so it renders as a double-width emoji like the lock, keeping
-/// the two markers visually equal where terminals honor it.
-const GLYPH_WRITABLE: &str = "\u{270f}\u{fe0f}"; // ✏️
+/// Glyphs for the mount tree. Writable mounts are unmarked, matching the
+/// old `(ro)` suffix convention where read-only is the exception.
 const GLYPH_READ_ONLY: &str = "\u{1f512}"; // 🔒
 const GLYPH_MASK: &str = "\u{2205}"; // ∅
 
@@ -1225,13 +1223,10 @@ fn node_line(node: &MountNode, base: usize) -> String {
     };
     if let Some(hides) = &row.hides {
         format!("{path} {GLYPH_MASK} hides {hides}  {}", row.tag)
+    } else if row.writable {
+        format!("{path} ← {}  {}", row.source, row.tag)
     } else {
-        let glyph = if row.writable {
-            GLYPH_WRITABLE
-        } else {
-            GLYPH_READ_ONLY
-        };
-        format!("{path} {glyph} ← {}  {}", row.source, row.tag)
+        format!("{path} {GLYPH_READ_ONLY} ← {}  {}", row.source, row.tag)
     }
 }
 
@@ -1686,10 +1681,10 @@ mod tests {
 /root/.config
 ├── git 🔒 ← /home/me/.config/git  [binary]
 └── jj 🔒 ← /home/me/.config/jj  [binary]
-/root/.pi/agent ✏️ ← …/sessions/<s>/agent  [session]
+/root/.pi/agent ← …/sessions/<s>/agent  [session]
 ├── AGENTS.md 🔒 ← /home/me/.config/pi/AGENTS.md  [binary]
 └── extensions ∅ hides /home/me/.config/pi/extensions  [project .ramekin/config.kdl]
-/workspace/repo-abc123 ✏️ ← /home/me/src/repo  [session]
+/workspace/repo-abc123 ← /home/me/src/repo  [session]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
     }
@@ -1706,7 +1701,7 @@ mod tests {
         )]);
 
         let expected = "\
-/root/.local/share/ranger ✏️ ← /home/me/.local/share/ranger  [project .ramekin/config.kdl]
+/root/.local/share/ranger ← /home/me/.local/share/ranger  [project .ramekin/config.kdl]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
     }
@@ -1726,8 +1721,8 @@ mod tests {
 
         let expected = "\
 /root/.cache
-├── cargo ✏️ ← …/repos/r/caches/cargo  [cache user]
-└── sccache ✏️ ← …/repos/r/caches/sccache  [cache user]
+├── cargo ← …/repos/r/caches/cargo  [cache user]
+└── sccache ← …/repos/r/caches/sccache  [cache user]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
     }
@@ -1746,7 +1741,7 @@ mod tests {
         ]);
 
         let expected = "\
-/root/.pi/agent ✏️ ← …/sessions/<s>/agent  [session]
+/root/.pi/agent ← …/sessions/<s>/agent  [session]
 └── sessions/xyz 🔒 ← …/repos/r/sessions  [binary]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
