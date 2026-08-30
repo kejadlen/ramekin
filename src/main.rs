@@ -1179,9 +1179,13 @@ fn collapse_unmounted_chains(node: &mut MountNode) {
 enum TreeLine {
     /// A bare grouping node: just its path.
     Bare(String),
-    /// A mount: the name part (glyph beside the name included) and what
-    /// follows the aligned source column.
-    Mount { left: String, right: String },
+    /// A mount split into columns: the name part (glyph beside the name
+    /// included), the source (`← …` or `∅ hides …`), and the tag.
+    Mount {
+        left: String,
+        source: String,
+        tag: String,
+    },
 }
 
 /// Display width for aligning the source column: every character is one
@@ -1190,8 +1194,9 @@ fn display_width(text: &str) -> usize {
     text.chars().count() + text.matches(GLYPH_READ_ONLY).count()
 }
 
-/// Render the mount rows as a forest, one tree per top-level container path,
-/// with every source aligned behind the longest name.
+/// Render the mount rows as a forest, one tree per top-level container
+/// path, with sources aligned behind the longest name and tags behind the
+/// longest source.
 fn render_mount_tree(rows: &BTreeMap<String, MountRow>) -> String {
     let mut root = MountNode::new(String::new());
     for (target, row) in rows {
@@ -1218,8 +1223,9 @@ fn render_mount_tree(rows: &BTreeMap<String, MountRow>) -> String {
         collect_subtree(root, root.path.len(), "", &mut lines);
     }
 
-    // One column for every source, one space past the longest name.
-    let column = lines
+    // Column per field: one space past the longest name, two past the
+    // longest source (matching the inline form's separator).
+    let name_column = lines
         .iter()
         .filter_map(|line| match line {
             TreeLine::Mount { left, .. } => Some(display_width(left)),
@@ -1228,15 +1234,26 @@ fn render_mount_tree(rows: &BTreeMap<String, MountRow>) -> String {
         .max()
         .unwrap_or(0)
         + 1;
+    let tag_column = lines
+        .iter()
+        .filter_map(|line| match line {
+            TreeLine::Mount { source, .. } => Some(display_width(source)),
+            TreeLine::Bare(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+        + 2;
 
     let mut out = String::new();
     for line in &lines {
         match line {
             TreeLine::Bare(text) => out.push_str(text),
-            TreeLine::Mount { left, right } => {
+            TreeLine::Mount { left, source, tag } => {
                 out.push_str(left);
-                out.push_str(&" ".repeat(column - display_width(left)));
-                out.push_str(right);
+                out.push_str(&" ".repeat(name_column - display_width(left)));
+                out.push_str(source);
+                out.push_str(&" ".repeat(tag_column - display_width(source)));
+                out.push_str(tag);
             }
         }
         out.push('\n');
@@ -1264,12 +1281,16 @@ fn tree_line(node: &MountNode, base: usize, prefix: &str, connector: &str) -> Tr
     } else {
         format!("{prefix}{connector}{path} {GLYPH_READ_ONLY}")
     };
-    let right = if let Some(hides) = &row.hides {
-        format!("{GLYPH_MASK} hides {hides}  {}", row.tag)
+    let source = if let Some(hides) = &row.hides {
+        format!("{GLYPH_MASK} hides {hides}")
     } else {
-        format!("← {}  {}", row.source, row.tag)
+        format!("← {}", row.source)
     };
-    TreeLine::Mount { left, right }
+    TreeLine::Mount {
+        left,
+        source,
+        tag: row.tag.clone(),
+    }
 }
 
 fn collect_subtree(node: &MountNode, base: usize, prefix: &str, lines: &mut Vec<TreeLine>) {
@@ -1719,12 +1740,12 @@ mod tests {
 
         let expected = "\
 /root/.config
-├── git 🔒             ← /home/me/.config/git  [binary]
-└── jj 🔒              ← /home/me/.config/jj  [binary]
-/root/.pi/agent        ← …/sessions/<s>/agent  [session]
-├── AGENTS.md 🔒       ← /home/me/.config/pi/AGENTS.md  [binary]
+├── git 🔒             ← /home/me/.config/git                  [binary]
+└── jj 🔒              ← /home/me/.config/jj                   [binary]
+/root/.pi/agent        ← …/sessions/<s>/agent                  [session]
+├── AGENTS.md 🔒       ← /home/me/.config/pi/AGENTS.md         [binary]
 └── extensions         ∅ hides /home/me/.config/pi/extensions  [project .ramekin/config.kdl]
-/workspace/repo-abc123 ← /home/me/src/repo  [session]
+/workspace/repo-abc123 ← /home/me/src/repo                     [session]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
     }
@@ -1761,7 +1782,7 @@ mod tests {
 
         let expected = "\
 /root/.cache
-├── cargo   ← …/repos/r/caches/cargo  [cache user]
+├── cargo   ← …/repos/r/caches/cargo    [cache user]
 └── sccache ← …/repos/r/caches/sccache  [cache user]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
@@ -1782,7 +1803,7 @@ mod tests {
 
         let expected = "\
 /root/.pi/agent     ← …/sessions/<s>/agent  [session]
-└── sessions/xyz 🔒 ← …/repos/r/sessions  [binary]
+└── sessions/xyz 🔒 ← …/repos/r/sessions    [binary]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
     }
