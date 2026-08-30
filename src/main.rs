@@ -617,24 +617,22 @@ impl Ramekin {
     }
 
     /// Layer tag for the mount tree, e.g. `[binary]`, `[profile pi]`,
-    /// `[user ~/.config/ramekin]`.
+    /// `[project .ramekin/config.kdl]`. The user layer's home is fixed, so
+    /// it carries no path; the project path is relative to the workspace.
     fn layer_tag(&self, scope: config::Scope) -> String {
         match scope {
             config::Scope::Binary => "[binary]".to_string(),
             config::Scope::Profile => format!("[profile {}]", self.config.profile.name),
-            scope => {
-                let path = self
-                    .config
-                    .layers
-                    .iter()
-                    .find(|l| l.scope == scope)
-                    .and_then(|l| l.path.as_ref())
-                    .map(|p| p.display().to_string());
-                match path {
-                    Some(path) => format!("[{scope} {path}]"),
-                    None => format!("[{scope}]"),
-                }
-            }
+            config::Scope::User => "[user]".to_string(),
+            config::Scope::Project => self
+                .config
+                .layers
+                .iter()
+                .find(|l| l.scope == scope)
+                .and_then(|l| l.path.as_ref())
+                .and_then(|p| p.strip_prefix(&self.workspace).ok())
+                .map(|p| format!("[project {}]", p.display()))
+                .unwrap_or_else(|| "[project]".to_string()),
         }
     }
 
