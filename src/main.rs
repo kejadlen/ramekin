@@ -635,6 +635,8 @@ impl Ramekin {
             println!("  {label} {}", path.display());
         }
         println!("  cache    {}", self.cache_dir.display());
+        let outbox_dir = self.data_home.join(format!("repos/{}/outbox", self.repo_slug));
+        println!("  outbox   {}", outbox_dir.display());
 
         let merged_mounts = self.config.merged_mounts();
         let merged_env = self.config.merged_env();
@@ -679,9 +681,7 @@ impl Ramekin {
 
         // Session mounts (sources materialize per run; shown with a placeholder)
         let placeholder = self.cache_dir.join("sessions/<session>");
-        let outbox_placeholder = self
-            .data_home
-            .join(format!("repos/{}/outbox/<session>", self.repo_slug));
+        let outbox_placeholder = outbox_dir.join("<session>");
         println!();
         println!("Session mounts");
         for mount in self.session_mounts(&placeholder, &outbox_placeholder) {
