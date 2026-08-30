@@ -1177,7 +1177,23 @@ fn collapse_unmounted_chains(node: &mut MountNode) {
     }
 }
 
-/// Render the mount rows as a forest, one tree per top-level container path.
+/// A rendered line before source-column alignment.
+enum TreeLine {
+    /// A bare grouping node: just its path.
+    Bare(String),
+    /// A mount: the name part (glyph beside the name included) and what
+    /// follows the aligned source column.
+    Mount { left: String, right: String },
+}
+
+/// Display width for aligning the source column: every character is one
+/// cell except the lock, which emoji-aware terminals render double-width.
+fn display_width(text: &str) -> usize {
+    text.chars().count() + text.matches(GLYPH_READ_ONLY).count()
+}
+
+/// Render the mount rows as a forest, one tree per top-level container path,
+/// with every source aligned behind the longest name.
 fn render_mount_tree(rows: &BTreeMap<String, MountRow>) -> String {
     let mut root = MountNode::new(String::new());
     for (target, row) in rows {
@@ -1198,19 +1214,42 @@ fn render_mount_tree(rows: &BTreeMap<String, MountRow>) -> String {
         }
     }
 
-    let mut out = String::new();
+    let mut lines = Vec::new();
     for root in &roots {
-        out.push_str(&node_line(root, 0));
+        lines.push(tree_line(root, 0, "", ""));
+        collect_subtree(root, root.path.len(), "", &mut lines);
+    }
+
+    // One column for every source, one space past the longest name.
+    let column = lines
+        .iter()
+        .filter_map(|line| match line {
+            TreeLine::Mount { left, .. } => Some(display_width(left)),
+            TreeLine::Bare(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    let mut out = String::new();
+    for line in &lines {
+        match line {
+            TreeLine::Bare(text) => out.push_str(text),
+            TreeLine::Mount { left, right } => {
+                out.push_str(left);
+                out.push_str(&" ".repeat(column - display_width(left)));
+                out.push_str(right);
+            }
+        }
         out.push('\n');
-        render_subtree(root, root.path.len(), "", &mut out);
     }
     out
 }
 
 /// A node's own line: its path relative to the forest root (`base` is the
-/// root's path length, 0 for the root itself) plus its mount, or just the
-/// path for a bare grouping node several mounts share as a prefix.
-fn node_line(node: &MountNode, base: usize) -> String {
+/// root's path length, 0 for the root itself), the read-only glyph beside
+/// the name, and the source (or mask) as the aligned right half.
+fn tree_line(node: &MountNode, base: usize, prefix: &str, connector: &str) -> TreeLine {
     // Roots (`base` 0) keep their absolute path; descendants drop the
     // root's prefix and the `/` separator, rendering `sessions/xyz` style.
     let path = if base == 0 {
@@ -1219,27 +1258,30 @@ fn node_line(node: &MountNode, base: usize) -> String {
         &node.path[base + 1..]
     };
     let Some(row) = &node.row else {
-        return path.to_string();
+        return TreeLine::Bare(format!("{prefix}{connector}{path}"));
     };
-    if let Some(hides) = &row.hides {
-        format!("{path} {GLYPH_MASK} hides {hides}  {}", row.tag)
-    } else if row.writable {
-        format!("{path} ← {}  {}", row.source, row.tag)
+    // Masks are hiding, not binding, so they carry no writability glyph.
+    let left = if row.writable || row.hides.is_some() {
+        format!("{prefix}{connector}{path}")
     } else {
-        format!("{path} {GLYPH_READ_ONLY} ← {}  {}", row.source, row.tag)
-    }
+        format!("{prefix}{connector}{path} {GLYPH_READ_ONLY}")
+    };
+    let right = if let Some(hides) = &row.hides {
+        format!("{GLYPH_MASK} hides {hides}  {}", row.tag)
+    } else {
+        format!("← {}  {}", row.source, row.tag)
+    };
+    TreeLine::Mount { left, right }
 }
 
-fn render_subtree(node: &MountNode, base: usize, prefix: &str, out: &mut String) {
+fn collect_subtree(node: &MountNode, base: usize, prefix: &str, lines: &mut Vec<TreeLine>) {
     let children: Vec<_> = node.children.values().collect();
     for (i, child) in children.iter().enumerate() {
         let last = i + 1 == children.len();
-        out.push_str(prefix);
-        out.push_str(if last { "└── " } else { "├── " });
-        out.push_str(&node_line(child, base));
-        out.push('\n');
+        let connector = if last { "└── " } else { "├── " };
+        lines.push(tree_line(child, base, prefix, connector));
         let continuation = if last { "    " } else { "│   " };
-        render_subtree(child, base, &format!("{prefix}{continuation}"), out);
+        collect_subtree(child, base, &format!("{prefix}{continuation}"), lines);
     }
 }
 
@@ -1679,11 +1721,11 @@ mod tests {
 
         let expected = "\
 /root/.config
-├── git 🔒 ← /home/me/.config/git  [binary]
-└── jj 🔒 ← /home/me/.config/jj  [binary]
-/root/.pi/agent ← …/sessions/<s>/agent  [session]
-├── AGENTS.md 🔒 ← /home/me/.config/pi/AGENTS.md  [binary]
-└── extensions ∅ hides /home/me/.config/pi/extensions  [project .ramekin/config.kdl]
+├── git 🔒             ← /home/me/.config/git  [binary]
+└── jj 🔒              ← /home/me/.config/jj  [binary]
+/root/.pi/agent        ← …/sessions/<s>/agent  [session]
+├── AGENTS.md 🔒       ← /home/me/.config/pi/AGENTS.md  [binary]
+└── extensions         ∅ hides /home/me/.config/pi/extensions  [project .ramekin/config.kdl]
 /workspace/repo-abc123 ← /home/me/src/repo  [session]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
@@ -1721,7 +1763,7 @@ mod tests {
 
         let expected = "\
 /root/.cache
-├── cargo ← …/repos/r/caches/cargo  [cache user]
+├── cargo   ← …/repos/r/caches/cargo  [cache user]
 └── sccache ← …/repos/r/caches/sccache  [cache user]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
@@ -1741,7 +1783,7 @@ mod tests {
         ]);
 
         let expected = "\
-/root/.pi/agent ← …/sessions/<s>/agent  [session]
+/root/.pi/agent     ← …/sessions/<s>/agent  [session]
 └── sessions/xyz 🔒 ← …/repos/r/sessions  [binary]
 ";
         assert_eq!(render_mount_tree(&rows), expected);
