@@ -20,7 +20,9 @@ RUN --mount=type=cache,target=/tmp/downloads \
     && curl -fsSL "https://github.com/facebook/dotslash/releases/latest/download/dotslash-linux-musl.aarch64.tar.gz" \
       | tar xz -C /usr/local/bin dotslash \
     && curl -fsSL "https://github.com/kejadlen/ranger/releases/latest/download/ranger-aarch64-unknown-linux-gnu.tar.gz" \
-      | tar xz -C /usr/local/bin ranger
+      | tar xz -C /usr/local/bin ranger \
+    && curl -fsSL "https://github.com/zizmorcore/zizmor/releases/latest/download/zizmor-aarch64-unknown-linux-gnu.tar.gz" \
+      | tar xz -C /usr/local/bin zizmor
 
 RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
     if [ -s /run/secrets/github-token ]; then \
