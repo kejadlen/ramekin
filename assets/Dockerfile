@@ -14,8 +14,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ripgrep \
     && ln -sf /usr/bin/fdfind /usr/bin/fd
 
+# difftastic 0.71.0 started stamping the version into its asset names, so
+# /releases/latest/download/ no longer resolves and the tag has to be looked up.
 RUN --mount=type=cache,target=/tmp/downloads \
-    curl -fsSL "https://github.com/Wilfred/difftastic/releases/latest/download/difft-aarch64-unknown-linux-gnu.tar.gz" \
+    --mount=type=secret,id=github-token,target=/run/secrets/github-token \
+    if [ -s /run/secrets/github-token ]; then \
+      DIFFT_VERSION=$(curl -s -H "Authorization: Bearer $(cat /run/secrets/github-token)" \
+        https://api.github.com/repos/Wilfred/difftastic/releases/latest | jq -r .tag_name); \
+    else \
+      DIFFT_VERSION=$(curl -s https://api.github.com/repos/Wilfred/difftastic/releases/latest | jq -r .tag_name); \
+    fi \
+    && curl -fsSL "https://github.com/Wilfred/difftastic/releases/download/${DIFFT_VERSION}/difft-${DIFFT_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
       | tar xz -C /usr/local/bin difft \
     && curl -fsSL "https://github.com/facebook/dotslash/releases/latest/download/dotslash-linux-musl.aarch64.tar.gz" \
       | tar xz -C /usr/local/bin dotslash \
