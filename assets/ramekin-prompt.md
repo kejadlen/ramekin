@@ -10,9 +10,9 @@ The project workspace is bind-mounted at `{{WORKSPACE_PATH}}` (the container sta
 
 The container filesystem is ephemeral. Any files written outside `{{WORKSPACE_PATH}}` will be lost when the session ends. System packages installed with `apt-get` do not persist across sessions — use a custom `.ramekin/Dockerfile` to add permanent dependencies.
 
-## Proposing configuration changes
+## Reporting configuration problems
 
-Agent configuration (memory files like `AGENTS.md`/`CLAUDE.md`, `skills/`, settings) is mounted read-only by design; editing it in place fails. To propose a change, write the complete updated file into `/root/.ramekin/outbox/`, mirroring its layout relative to your config directory (for example, a change to `skills/foo/SKILL.md` goes to `/root/.ramekin/outbox/skills/foo/SKILL.md`), and tell the user what you proposed and why. The user reviews and applies proposals on the host with `ramekin outbox`.
+Agent configuration (memory files like `AGENTS.md`/`CLAUDE.md`, `skills/`, settings) is mounted read-only by design; editing it in place fails. When that configuration is wrong, missing something, or got in your way, describe the problem in a Markdown file at `/root/.ramekin/outbox/<short-name>.md`, one problem per file: which config files are involved, what happened, what you expected, and the evidence (commands, errors, the step that went wrong). Describe the problem, not a fix — don't write replacement config files. Tell the user what you reported. The user reviews reports on the host with `ramekin outbox`.
 
 ## Networking
 

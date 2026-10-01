@@ -185,7 +185,7 @@ env {
 
 ### Outbox
 
-Shared config is read-only in the container, so the outbox is the one reviewed path for changing it. Each session mounts a fresh, empty dir at `/root/.ramekin/outbox` (host: `$XDG_DATA_HOME/ramekin/repos/<slug>/outbox/<session-id>/`), and the system prompt tells the agent to write complete updated files there, mirroring the agent config layout. Empty outboxes vanish at teardown; anything left becomes a pending proposal.
+Shared config is read-only in the container, so the outbox is the one reviewed path for changing it. Each session mounts a fresh, empty dir at `/root/.ramekin/outbox` (host: `$XDG_DATA_HOME/ramekin/repos/<slug>/outbox/<session-id>/`), and the system prompt tells the agent to write a Markdown file there describing each config problem it hits, rather than a fix. Empty outboxes vanish at teardown; anything left becomes a pending proposal.
 
 ```sh
 ramekin outbox list                          # pending proposals across sessions
