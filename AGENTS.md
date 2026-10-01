@@ -11,7 +11,7 @@ Cargo.toml              # Single-crate workspace
 src/
   main.rs               # CLI: agent state, image builds, compose generation, outbox commands
   config.rs             # KDL parsing, config layers, profiles, mount resolution and merging
-  outbox.rs             # Pending config proposals: scan, map to host sources, apply/discard
+  outbox.rs             # Pending config problem reports: scan, show, discard
 build.rs                # Sets RAMEKIN_VERSION from env or git rev
 assets/
   Dockerfile            # Base image: both agents (+ claude managed settings, IS_SANDBOX)
@@ -51,7 +51,7 @@ just           # All four
 - Each workspace mounts at `/workspace/<slug>` (slug is `<dirname>-<hash>`, never a shared `/workspace`) so cwd-keyed agent state stays distinct per repo; compose's `working_dir` puts the agent there on start.
 - Docker compose config is generated at runtime via `serde_yaml` over a typed `ComposeConfig` struct, not a static file. Volume mounts use the long-form bind syntax (`{type: bind, source, target, read_only}`), ordered lexicographically by target so parents precede children. Passthrough env vars render as bare names in the environment list.
 - One base image (`ramekin-agent`) carries both agents; it has no ENTRYPOINT, and the generated compose config sets `entrypoint` to `pi` or `claude` per session. A project `.ramekin/Dockerfile` builds `FROM ramekin-agent` with a repo-specific tag. Image builds forward a host GitHub token (env vars or `gh auth token`) as a BuildKit secret for API calls.
-- The outbox (`src/outbox.rs`) is the only write path for shared config: each session mounts a fresh dir at `/root/.ramekin/outbox`; proposals map back to host sources via the agent allowlist plus an `.agent` sidecar written outside the mount; `ramekin outbox list|diff|apply|discard` reviews them.
+- The outbox (`src/outbox.rs`) is the agent's only channel back to shared config: each session mounts a fresh dir at `/root/.ramekin/outbox` where the agent writes Markdown problem reports (not fixes); an `.agent` sidecar written outside the mount records whose config they concern; `ramekin outbox list|show|discard` reviews them.
 - `Ramekin::resolve` is side-effect free (so `ramekin config` never mutates state); materialization happens in `run` via `AgentState::prepare`/`prepare_session`.
 - The `ramekin-prompt.md` template is rendered per session (`{{WORKSPACE_PATH}}` → the workspace target), mounted read-only at `/root/.ramekin/ramekin-prompt.md`, and passed via `--append-system-prompt` (pi) / `--append-system-prompt-file` (Claude — its plain flag takes a literal string).
 - Version is set at build time via the `RAMEKIN_VERSION` env var (used by CI) or falls back to `dev+<short-sha>`.

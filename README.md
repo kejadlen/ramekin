@@ -22,7 +22,7 @@ A Rust CLI orchestrates a Docker Compose stack. On each run it:
 2. Builds the base image (`ramekin-agent`, carrying both agents), and a project-specific layer if one exists
 3. Generates a compose config, renders the system prompt, and creates fresh agent dirs, all in a session-scoped cache directory
 4. Starts the agent container with the workspace mounted at `/workspace/<slug>` (where `<slug>` is `<dirname>-<hash>`, so cwd-keyed agent state never collides across repos)
-5. Attaches interactively, then tears down on exit — logging any state the agent wrote to its session-scoped dirs before discarding it, and keeping any config proposals the agent left in its outbox
+5. Attaches interactively, then tears down on exit — logging any state the agent wrote to its session-scoped dirs before discarding it, and keeping any config problem reports the agent left in its outbox
 
 Concurrent sessions don't interfere: everything a run touches is either read-only config, session-scoped plumbing under a random session id, or agent state the agent itself manages concurrently.
 
@@ -32,7 +32,7 @@ Concurrent sessions don't interfere: everything a run touches is either read-onl
 
 `config` prints the active profile, resolved paths, volume mounts, and Dockerfile status without starting (or mutating) anything — useful for debugging mount issues.
 
-`outbox` reviews config changes proposed by agents — see [Outbox](#outbox).
+`outbox` reviews config problems reported by agents — see [Outbox](#outbox).
 
 `completions <shell>` generates shell completions for bash, zsh, fish, elvish, or powershell. Pipe the output to a file sourced by your shell:
 
@@ -80,7 +80,7 @@ Agent config comes from the host's own dirs — the agents are also used locally
 
 Ramekin keeps no parallel copy — edit the host files (or the dotfiles they symlink to) and the next session sees the changes. The rest of each host dir is runtime state (credentials, transcripts) and never enters the container. Project-level agent config (`.claude/`, `CLAUDE.md`, `AGENTS.md` in the repo) rides the workspace mount; the agents layer it themselves.
 
-Config is immutable from inside the container by design: in-container edits fail loudly, and the [outbox](#outbox) is the write path.
+Config is immutable from inside the container by design: in-container edits fail loudly, and the [outbox](#outbox) is where the agent reports problems with it.
 
 ### Persistence
 
@@ -185,16 +185,15 @@ env {
 
 ### Outbox
 
-Shared config is read-only in the container, so the outbox is the one reviewed path for changing it. Each session mounts a fresh, empty dir at `/root/.ramekin/outbox` (host: `$XDG_DATA_HOME/ramekin/repos/<slug>/outbox/<session-id>/`), and the system prompt tells the agent to write a Markdown file there describing each config problem it hits, rather than a fix. Empty outboxes vanish at teardown; anything left becomes a pending proposal.
+Shared config is read-only in the container, so the outbox is how an agent reports problems with it. Each session mounts a fresh, empty dir at `/root/.ramekin/outbox` (host: `$XDG_DATA_HOME/ramekin/repos/<slug>/outbox/<session-id>/`), and the system prompt tells the agent to write a Markdown file there describing each config problem it hits, rather than a fix. Empty outboxes vanish at teardown; anything left becomes a pending report.
 
 ```sh
-ramekin outbox list                          # pending proposals across sessions
-ramekin outbox diff [<slug>/<session>/<path>] # diff against the host source
-ramekin outbox apply <slug>/<session>/<path>  # copy over the host source, after confirmation
-ramekin outbox discard <slug>/<session>       # drop proposals
+ramekin outbox list                           # pending reports across sessions
+ramekin outbox show [<slug>/<session>/<path>] # print reports
+ramekin outbox discard <slug>/<session>       # drop reports
 ```
 
-`apply` shows the diff, asks for confirmation, and writes through dotfiles symlinks so the change lands in the working copy. Proposals that don't map back to an allowlisted agent-config entry need an explicit `--to` destination.
+Fixing the config is up to you on the host, for example by handing a report to an agent running there.
 
 ### Container environment context
 

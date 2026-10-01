@@ -1,14 +1,12 @@
-//! The outbox: the one reviewed path for stateful modification of shared
-//! config.
+//! The outbox: the one channel from an agent back to its host config.
 //!
-//! Config is read-only inside the container by design. When an agent wants
-//! a config change, it writes the changed file into its session's outbox
-//! dir (mounted writable at [`OUTBOX_TARGET`]), mirroring the agent config
-//! layout. Host side, `ramekin outbox` lists pending proposals, diffs them
-//! against the host source each entry was mounted from, and applies or
-//! discards them. Nothing reaches host config without an explicit apply.
+//! Config is read-only inside the container by design. When an agent hits
+//! a config problem, it writes a Markdown report describing it into its
+//! session's outbox dir (mounted writable at [`OUTBOX_TARGET`]). Host side,
+//! `ramekin outbox` lists, shows, and discards pending reports; any fix to
+//! host config happens there, outside the container.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, Result, bail};
 
@@ -19,8 +17,8 @@ use crate::config::Agent;
 pub const OUTBOX_TARGET: &str = "/root/.ramekin/outbox";
 
 /// Host paths for one session's outbox: the mounted dir and its sidecar
-/// metadata file recording which agent the session ran (the same relative
-/// path maps to different host config dirs per agent).
+/// metadata file recording which agent the session ran, i.e. whose config
+/// the reports are about.
 fn session_paths(data_home: &Path, slug: &str, session_id: &str) -> (PathBuf, PathBuf) {
     let outbox = data_home.join(format!("repos/{slug}/outbox"));
     (
@@ -31,7 +29,7 @@ fn session_paths(data_home: &Path, slug: &str, session_id: &str) -> (PathBuf, Pa
 
 /// Create a fresh, empty outbox dir for a session, plus its agent sidecar.
 /// The sidecar sits *beside* the mounted dir, out of the agent's reach, so
-/// a confused or malicious proposal can't redirect where apply maps it.
+/// a report can't misstate which agent filed it.
 pub fn create_session(
     data_home: &Path,
     slug: &str,
@@ -57,51 +55,33 @@ pub fn finish_session(data_home: &Path, slug: &str, session_id: &str) -> Result<
     Ok(files.len())
 }
 
-/// One proposed file in some session's outbox.
+/// One report in some session's outbox.
 #[derive(Debug)]
-pub struct Proposal {
+pub struct Report {
     pub slug: String,
     pub session: String,
-    /// Path relative to the session outbox dir, mirroring the agent config
-    /// layout.
+    /// Path relative to the session outbox dir.
     pub rel: PathBuf,
     /// The agent the session ran, from the sidecar. `None` if the sidecar
     /// is missing or unparseable.
     pub agent: Option<Agent>,
-    /// Absolute host path of the proposal file.
+    /// Absolute host path of the report file.
     pub file: PathBuf,
 }
 
-impl Proposal {
+impl Report {
     /// The address `ramekin outbox` commands take: `<slug>/<session>/<rel>`.
     pub fn entry(&self) -> String {
         format!("{}/{}/{}", self.slug, self.session, self.rel.display())
     }
-
-    /// The host config file this proposal maps back to: the agent's host
-    /// config dir plus the relative path — but only when the path's first
-    /// component is an allowlisted entry, i.e. something that was actually
-    /// mounted. Anything else needs an explicit destination to apply.
-    pub fn host_target(&self) -> Option<PathBuf> {
-        let agent = self.agent?;
-        let first = match self.rel.components().next()? {
-            Component::Normal(name) => name.to_str()?.to_string(),
-            _ => return None,
-        };
-        if !agent.config_allowlist().contains(&first.as_str()) {
-            return None;
-        }
-        let base = PathBuf::from(shellexpand::tilde(agent.host_config_dir()).as_ref());
-        Some(base.join(&self.rel))
-    }
 }
 
-/// All pending proposals across every repo and session, oldest path first.
-pub fn scan(data_home: &Path) -> Result<Vec<Proposal>> {
-    let mut proposals = Vec::new();
+/// All pending reports across every repo and session, sorted by path.
+pub fn scan(data_home: &Path) -> Result<Vec<Report>> {
+    let mut reports = Vec::new();
     let repos = data_home.join("repos");
     if !repos.is_dir() {
-        return Ok(proposals);
+        return Ok(reports);
     }
     for repo in sorted_dir(&repos)? {
         let Some(slug) = dir_name(&repo) else {
@@ -124,7 +104,7 @@ pub fn scan(data_home: &Path) -> Result<Vec<Proposal>> {
             let mut files = Vec::new();
             collect_files(&session_dir, &session_dir, &mut files)?;
             for rel in files {
-                proposals.push(Proposal {
+                reports.push(Report {
                     slug: slug.clone(),
                     session: session.clone(),
                     file: session_dir.join(&rel),
@@ -134,13 +114,13 @@ pub fn scan(data_home: &Path) -> Result<Vec<Proposal>> {
             }
         }
     }
-    Ok(proposals)
+    Ok(reports)
 }
 
-/// Proposals matching an entry: either one file (`<slug>/<session>/<rel>`)
+/// Reports matching an entry: either one file (`<slug>/<session>/<rel>`)
 /// or a whole session (`<slug>/<session>`).
-pub fn find(data_home: &Path, entry: &str) -> Result<Vec<Proposal>> {
-    let matches: Vec<Proposal> = scan(data_home)?
+pub fn find(data_home: &Path, entry: &str) -> Result<Vec<Report>> {
+    let matches: Vec<Report> = scan(data_home)?
         .into_iter()
         .filter(|p| {
             let session_prefix = format!("{}/{}", p.slug, p.session);
@@ -153,20 +133,20 @@ pub fn find(data_home: &Path, entry: &str) -> Result<Vec<Proposal>> {
     Ok(matches)
 }
 
-/// Remove a proposal file and prune its session outbox if now empty.
-pub fn remove(data_home: &Path, proposal: &Proposal) -> Result<()> {
-    fs_err::remove_file(&proposal.file).into_diagnostic()?;
+/// Remove a report file and prune its session outbox if now empty.
+pub fn remove(data_home: &Path, report: &Report) -> Result<()> {
+    fs_err::remove_file(&report.file).into_diagnostic()?;
     // Prune now-empty parent dirs up to (and including, via finish) the
     // session dir.
-    let (session_dir, _) = session_paths(data_home, &proposal.slug, &proposal.session);
-    let mut dir = proposal.file.parent().map(Path::to_path_buf);
+    let (session_dir, _) = session_paths(data_home, &report.slug, &report.session);
+    let mut dir = report.file.parent().map(Path::to_path_buf);
     while let Some(d) = dir {
         if d == session_dir || fs_err::remove_dir(&d).is_err() {
             break;
         }
         dir = d.parent().map(Path::to_path_buf);
     }
-    finish_session(data_home, &proposal.slug, &proposal.session)?;
+    finish_session(data_home, &report.slug, &report.session)?;
     Ok(())
 }
 
@@ -206,11 +186,11 @@ fn dir_name(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn write_proposal(data_home: &Path, slug: &str, session: &str, agent: &str, rel: &str) {
+    fn write_report(data_home: &Path, slug: &str, session: &str, agent: &str, rel: &str) {
         let (dir, meta) = session_paths(data_home, slug, session);
         let file = dir.join(rel);
         fs_err::create_dir_all(file.parent().unwrap()).unwrap();
-        fs_err::write(&file, "proposed").unwrap();
+        fs_err::write(&file, "reported").unwrap();
         fs_err::write(&meta, agent).unwrap();
     }
 
@@ -230,7 +210,7 @@ mod tests {
     fn finish_keeps_nonempty_session() {
         let data_home = tempfile::tempdir().unwrap();
         let dir = create_session(data_home.path(), "repo-1", "abc", Agent::Pi).unwrap();
-        fs_err::write(dir.join("AGENTS.md"), "new").unwrap();
+        fs_err::write(dir.join("report.md"), "new").unwrap();
 
         let pending = finish_session(data_home.path(), "repo-1", "abc").unwrap();
         assert_eq!(pending, 1);
@@ -238,75 +218,38 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_proposals_with_agent() {
+    fn scan_finds_reports_with_agent() {
         let data_home = tempfile::tempdir().unwrap();
-        write_proposal(
-            data_home.path(),
-            "repo-1",
-            "abc",
-            "pi",
-            "skills/foo/SKILL.md",
-        );
+        write_report(data_home.path(), "repo-1", "abc", "pi", "skill-gap.md");
 
-        let proposals = scan(data_home.path()).unwrap();
-        assert_eq!(proposals.len(), 1);
-        let p = &proposals[0];
-        assert_eq!(p.slug, "repo-1");
-        assert_eq!(p.session, "abc");
-        assert_eq!(p.agent, Some(Agent::Pi));
-        assert_eq!(p.entry(), "repo-1/abc/skills/foo/SKILL.md");
-        let target = p.host_target().unwrap();
-        assert!(
-            target.ends_with(".pi/agent/skills/foo/SKILL.md"),
-            "got {}",
-            target.display()
-        );
+        let reports = scan(data_home.path()).unwrap();
+        assert_eq!(reports.len(), 1);
+        let r = &reports[0];
+        assert_eq!(r.slug, "repo-1");
+        assert_eq!(r.session, "abc");
+        assert_eq!(r.agent, Some(Agent::Pi));
+        assert_eq!(r.entry(), "repo-1/abc/skill-gap.md");
     }
 
     #[test]
-    fn claude_proposal_maps_to_claude_dir() {
-        let data_home = tempfile::tempdir().unwrap();
-        write_proposal(data_home.path(), "repo-1", "abc", "claude", "CLAUDE.md");
-
-        let proposals = scan(data_home.path()).unwrap();
-        let target = proposals[0].host_target().unwrap();
-        assert!(
-            target.ends_with(".claude/CLAUDE.md"),
-            "got {}",
-            target.display()
-        );
-    }
-
-    #[test]
-    fn unallowlisted_proposal_has_no_host_target() {
-        let data_home = tempfile::tempdir().unwrap();
-        write_proposal(data_home.path(), "repo-1", "abc", "pi", "auth.json");
-
-        let proposals = scan(data_home.path()).unwrap();
-        // auth.json is pi runtime state, never config, so it's unallowlisted.
-        assert_eq!(proposals[0].host_target(), None);
-    }
-
-    #[test]
-    fn missing_sidecar_means_no_target() {
+    fn missing_sidecar_means_no_agent() {
         let data_home = tempfile::tempdir().unwrap();
         let (dir, _) = session_paths(data_home.path(), "repo-1", "abc");
         fs_err::create_dir_all(&dir).unwrap();
-        fs_err::write(dir.join("AGENTS.md"), "x").unwrap();
+        fs_err::write(dir.join("report.md"), "x").unwrap();
 
-        let proposals = scan(data_home.path()).unwrap();
-        assert_eq!(proposals.len(), 1);
-        assert_eq!(proposals[0].agent, None);
-        assert_eq!(proposals[0].host_target(), None);
+        let reports = scan(data_home.path()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].agent, None);
     }
 
     #[test]
     fn find_matches_file_and_session() {
         let data_home = tempfile::tempdir().unwrap();
-        write_proposal(data_home.path(), "repo-1", "abc", "pi", "AGENTS.md");
-        write_proposal(data_home.path(), "repo-1", "abc", "pi", "skills/x.md");
+        write_report(data_home.path(), "repo-1", "abc", "pi", "a.md");
+        write_report(data_home.path(), "repo-1", "abc", "pi", "nested/b.md");
 
-        let by_file = find(data_home.path(), "repo-1/abc/AGENTS.md").unwrap();
+        let by_file = find(data_home.path(), "repo-1/abc/a.md").unwrap();
         assert_eq!(by_file.len(), 1);
 
         let by_session = find(data_home.path(), "repo-1/abc").unwrap();
@@ -318,16 +261,10 @@ mod tests {
     #[test]
     fn remove_prunes_empty_dirs_and_session() {
         let data_home = tempfile::tempdir().unwrap();
-        write_proposal(
-            data_home.path(),
-            "repo-1",
-            "abc",
-            "pi",
-            "skills/foo/SKILL.md",
-        );
+        write_report(data_home.path(), "repo-1", "abc", "pi", "nested/deep/a.md");
 
-        let proposals = scan(data_home.path()).unwrap();
-        remove(data_home.path(), &proposals[0]).unwrap();
+        let reports = scan(data_home.path()).unwrap();
+        remove(data_home.path(), &reports[0]).unwrap();
 
         let (dir, meta) = session_paths(data_home.path(), "repo-1", "abc");
         assert!(!dir.exists());

@@ -72,7 +72,7 @@ enum Cmd {
     },
     /// Show resolved paths and mount configuration
     Config,
-    /// Review config changes proposed by agents
+    /// Review config problems reported by agents
     Outbox {
         #[command(subcommand)]
         command: OutboxCmd,
@@ -86,26 +86,17 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum OutboxCmd {
-    /// List pending proposals across all repos and sessions
+    /// List pending reports across all repos and sessions
     List,
-    /// Diff proposals against the host config they were mounted from
-    Diff {
-        /// A single proposal (`<slug>/<session>/<path>`) or session
-        /// (`<slug>/<session>`); all proposals when omitted
+    /// Print reports
+    Show {
+        /// A single report (`<slug>/<session>/<path>`) or session
+        /// (`<slug>/<session>`); all reports when omitted
         entry: Option<String>,
     },
-    /// Copy a proposal over its host source, after confirmation
-    Apply {
-        /// The proposal to apply (`<slug>/<session>/<path>`)
-        entry: String,
-        /// Destination for proposals that don't map back to an allowlisted
-        /// agent-config entry
-        #[arg(long)]
-        to: Option<PathBuf>,
-    },
-    /// Drop proposals without applying them
+    /// Drop reports once they're dealt with
     Discard {
-        /// A single proposal (`<slug>/<session>/<path>`) or a whole session
+        /// A single report (`<slug>/<session>/<path>`) or a whole session
         /// (`<slug>/<session>`)
         entry: String,
     },
@@ -160,104 +151,37 @@ fn run_outbox(command: OutboxCmd) -> Result<()> {
 
     match command {
         OutboxCmd::List => {
-            let proposals = outbox::scan(&data_home)?;
-            if proposals.is_empty() {
-                println!("no pending proposals");
+            let reports = outbox::scan(&data_home)?;
+            if reports.is_empty() {
+                println!("no pending reports");
                 return Ok(());
             }
-            for p in proposals {
-                match p.host_target() {
-                    Some(target) => println!("{} → {}", p.entry(), target.display()),
-                    None => println!("{} (no mapped target; apply needs --to)", p.entry()),
-                }
+            for r in reports {
+                println!("{} ({})", r.entry(), agent_label(&r));
             }
         }
-        OutboxCmd::Diff { entry } => {
-            let proposals = match entry {
+        OutboxCmd::Show { entry } => {
+            let reports = match entry {
                 Some(entry) => outbox::find(&data_home, &entry)?,
                 None => outbox::scan(&data_home)?,
             };
-            for p in proposals {
-                diff_proposal(&p, p.host_target().as_deref())?;
+            for r in reports {
+                let body = fs_err::read_to_string(&r.file).into_diagnostic()?;
+                println!("--- {} ({})\n{body}", r.entry(), agent_label(&r));
             }
-        }
-        OutboxCmd::Apply { entry, to } => {
-            let proposals = outbox::find(&data_home, &entry)?;
-            let [proposal] = proposals.as_slice() else {
-                bail!(
-                    "`{entry}` matches {} proposals; apply one file at a time",
-                    proposals.len()
-                );
-            };
-            let target = to.or_else(|| proposal.host_target()).ok_or_else(|| {
-                miette!(
-                    "`{entry}` doesn't map back to an allowlisted agent-config entry; \
-                     pass an explicit destination with --to"
-                )
-            })?;
-
-            diff_proposal(proposal, Some(&target))?;
-            if !confirm(&format!("apply to {}?", target.display()))? {
-                println!("not applied");
-                return Ok(());
-            }
-
-            // Write through a symlinked host source (dotfiles), so the
-            // change lands in the dotfiles working copy, not over the link.
-            let dest = if target.exists() {
-                target.canonicalize().into_diagnostic()?
-            } else {
-                if let Some(parent) = target.parent() {
-                    fs_err::create_dir_all(parent).into_diagnostic()?;
-                }
-                target
-            };
-            fs_err::copy(&proposal.file, &dest).into_diagnostic()?;
-            outbox::remove(&data_home, proposal)?;
-            println!("applied to {}", dest.display());
         }
         OutboxCmd::Discard { entry } => {
-            for proposal in outbox::find(&data_home, &entry)? {
-                outbox::remove(&data_home, &proposal)?;
-                println!("discarded {}", proposal.entry());
+            for report in outbox::find(&data_home, &entry)? {
+                outbox::remove(&data_home, &report)?;
+                println!("discarded {}", report.entry());
             }
         }
     }
     Ok(())
 }
 
-/// Show a proposal's diff against its host source (difftastic when
-/// available, `diff -u` otherwise). A missing host source diffs against
-/// /dev/null, i.e. shows the whole proposal as new.
-fn diff_proposal(proposal: &outbox::Proposal, target: Option<&Path>) -> Result<()> {
-    println!("--- {}", proposal.entry());
-    let host: &Path = match target {
-        Some(t) if t.exists() => t,
-        _ => Path::new("/dev/null"),
-    };
-    let difft = Command::new("difft").arg(host).arg(&proposal.file).status();
-    if difft.is_err() {
-        // difftastic not installed; plain diff. Exit code 1 just means the
-        // files differ.
-        Command::new("diff")
-            .arg("-u")
-            .arg(host)
-            .arg(&proposal.file)
-            .status()
-            .into_diagnostic()
-            .wrap_err("failed to run diff")?;
-    }
-    Ok(())
-}
-
-/// Ask the user to confirm on stdin. Anything but `y`/`yes` is a no.
-fn confirm(prompt: &str) -> Result<bool> {
-    print!("{prompt} [y/N] ");
-    std::io::stdout().flush().into_diagnostic()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer).into_diagnostic()?;
-    let answer = answer.trim().to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
+fn agent_label(report: &outbox::Report) -> &'static str {
+    report.agent.map_or("unknown agent", |a| a.name())
 }
 
 // ---------------------------------------------------------------------------
@@ -976,11 +900,11 @@ impl Ramekin {
             }
         }
 
-        // A non-empty outbox survives teardown as pending proposals.
+        // A non-empty outbox survives teardown as pending reports.
         match outbox::finish_session(&self.data_home, &self.repo_slug, &session_id) {
             Ok(0) => {}
             Ok(pending) => {
-                info!("{pending} config proposal(s) pending — review with `ramekin outbox list`");
+                info!("{pending} config report(s) pending — review with `ramekin outbox list`");
             }
             Err(e) => error!("failed to finalize session outbox: {e}"),
         }
