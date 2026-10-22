@@ -7,3 +7,6 @@ FROM ${BASE}
 ENV PRIME_AGENT_KERNEL_VENV=/opt/prime-agent/kernel-venv
 RUN curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \
       | PRIME_AGENT_RUST_PREFIX=/usr/local PRIME_AGENT_UV_BIN_DIR=/usr/local/bin sh
+
+# prime-agent's telemetry is on by default; the env var outranks settings.json.
+ENV PRIME_AGENT_TELEMETRY=0
