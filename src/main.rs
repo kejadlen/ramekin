@@ -877,7 +877,7 @@ impl Ramekin {
             .iter()
             .filter_map(|m| {
                 m.target
-                    .strip_prefix(&format!("{}/", config::PI_AGENT_DIR))
+                    .strip_prefix(&format!("{}/", agent.container_config_dir()))
                     .map(PathBuf::from)
             })
             .collect();
