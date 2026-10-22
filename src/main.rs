@@ -44,8 +44,15 @@ const PI_PERSISTENT_FILES: &[&str] = &["auth.json", "models-store.json"];
 /// because re-cloning every package on every session start is pure latency.
 const PI_PACKAGES_DIR: &str = "git";
 
+/// prime-agent's counterpart to `PI_PERSISTENT_FILES`: its credentials. The
+/// rest of its agent dir is caches, logs, and daemon bookkeeping.
+const PRIME_PERSISTENT_FILES: &[&str] = &["auth.json"];
+
+/// Where prime-agent clones the git packages named in its `settings.json`.
+const PRIME_PACKAGES_DIR: &str = "git";
+
 #[derive(Parser)]
-#[command(about = "Run a coding agent (pi or Claude Code) in a containerized environment", version = VERSION)]
+#[command(about = "Run a coding agent (pi, Claude Code, or prime-agent) in a containerized environment", version = VERSION)]
 struct Cli {
     /// Workspace directory to mount (defaults to current directory)
     #[arg(global = true, default_value = ".")]
@@ -267,10 +274,10 @@ fn confirm(prompt: &str) -> Result<bool> {
 
 /// Host-side persistent state for the active agent, and how it mounts.
 ///
-/// The two agents get opposite persistence policies, chosen by failure mode:
-/// pi is ephemeral by default with an allowlist of what persists (its
-/// persistent surface is small and stable); claude persists by default with
-/// a denylist of known junk (an unclassified new state file should rot, not
+/// The agents get opposite persistence policies, chosen by failure mode:
+/// pi and prime-agent are ephemeral by default with an allowlist of what
+/// persists (their persistent surfaces are small and stable); claude persists
+/// by default with a denylist of known junk (an unclassified new state file should rot, not
 /// vanish along with auth or onboarding state).
 enum AgentState {
     Pi {
@@ -292,6 +299,14 @@ enum AgentState {
         /// file itself stays global.
         state_file: PathBuf,
     },
+    Prime {
+        /// `$XDG_DATA_HOME/ramekin/agents/prime-agent/`; holds
+        /// `PRIME_PERSISTENT_FILES` and the checkouts under
+        /// `PRIME_PACKAGES_DIR`.
+        state_dir: PathBuf,
+        /// `$XDG_DATA_HOME/ramekin/repos/<slug>/prime-agent-sessions/`.
+        repo_sessions_dir: PathBuf,
+    },
 }
 
 impl AgentState {
@@ -304,6 +319,11 @@ impl AgentState {
             config::Agent::Claude => Self::Claude {
                 data_dir: data_home.join("agents/claude"),
                 state_file: data_home.join("agents/claude.json"),
+            },
+            config::Agent::Prime => Self::Prime {
+                state_dir: data_home.join("agents/prime-agent"),
+                repo_sessions_dir: data_home
+                    .join(format!("repos/{repo_slug}/prime-agent-sessions")),
             },
         }
     }
@@ -346,6 +366,17 @@ impl AgentState {
                 fs_err::create_dir_all(data_dir).into_diagnostic()?;
                 init_json_file(state_file)?;
             }
+            Self::Prime {
+                state_dir,
+                repo_sessions_dir,
+            } => {
+                fs_err::create_dir_all(state_dir).into_diagnostic()?;
+                fs_err::create_dir_all(repo_sessions_dir).into_diagnostic()?;
+                fs_err::create_dir_all(state_dir.join(PRIME_PACKAGES_DIR)).into_diagnostic()?;
+                for name in PRIME_PERSISTENT_FILES {
+                    init_json_file(&state_dir.join(name))?;
+                }
+            }
         }
         Ok(())
     }
@@ -361,6 +392,9 @@ impl AgentState {
                     fs_err::create_dir_all(session_dir.join("claude").join(name))
                         .into_diagnostic()?;
                 }
+            }
+            Self::Prime { .. } => {
+                fs_err::create_dir_all(session_dir.join("prime-agent")).into_diagnostic()?;
             }
         }
         Ok(())
@@ -416,18 +450,44 @@ impl AgentState {
                 }));
                 mounts
             }
+            Self::Prime {
+                state_dir,
+                repo_sessions_dir,
+            } => {
+                let mut mounts = vec![rw(
+                    session_dir.join("prime-agent"),
+                    config::PRIME_AGENT_DIR.into(),
+                )];
+                mounts.extend(PRIME_PERSISTENT_FILES.iter().map(|name| {
+                    rw(
+                        state_dir.join(name),
+                        format!("{}/{name}", config::PRIME_AGENT_DIR),
+                    )
+                }));
+                mounts.push(rw(
+                    state_dir.join(PRIME_PACKAGES_DIR),
+                    format!("{}/{PRIME_PACKAGES_DIR}", config::PRIME_AGENT_DIR),
+                ));
+                mounts.push(rw(
+                    repo_sessions_dir.clone(),
+                    format!("{}/sessions", config::PRIME_AGENT_DIR),
+                ));
+                mounts
+            }
         }
     }
 
     /// The session-scoped dir whose discarded writes the teardown report
-    /// inspects. Only pi has one: its whole agent dir is ephemeral, so a
-    /// novel write there is a candidate for the persistent allowlist.
+    /// inspects. Pi and prime-agent have one: their whole agent dirs are
+    /// ephemeral, so a novel write there is a candidate for the persistent
+    /// allowlist.
     /// Claude's session-scoped dirs are the ephemeral denylist — already
     /// classified junk, not worth reporting every run.
     fn report_dir(&self, session_dir: &Path) -> Option<PathBuf> {
         match self {
             Self::Pi { .. } => Some(session_dir.join("agent")),
             Self::Claude { .. } => None,
+            Self::Prime { .. } => Some(session_dir.join("prime-agent")),
         }
     }
 
@@ -442,6 +502,10 @@ impl AgentState {
                 data_dir,
                 state_file,
             } => vec![("claude  ", data_dir), ("state   ", state_file)],
+            Self::Prime {
+                state_dir,
+                repo_sessions_dir,
+            } => vec![("prime   ", state_dir), ("sessions", repo_sessions_dir)],
         }
     }
 }
@@ -858,10 +922,10 @@ impl Ramekin {
             // The image has no ENTRYPOINT; the compose config picks the agent.
             entrypoint: agent.name(),
             prompt_flag: match agent {
-                // Pi's --append-system-prompt accepts a file path; Claude's
-                // takes a literal string, so it needs the -file variant to
-                // read the file rather than append the literal path.
-                config::Agent::Pi => "--append-system-prompt",
+                // Pi's and prime-agent's --append-system-prompt accept a file
+                // path; Claude's takes a literal string, so it needs the -file
+                // variant to read the file rather than append the literal path.
+                config::Agent::Pi | config::Agent::Prime => "--append-system-prompt",
                 config::Agent::Claude => "--append-system-prompt-file",
             },
             profile_args: &self.config.profile.args,
@@ -1248,13 +1312,17 @@ mod tests {
 
     #[test]
     fn agent_image_names_are_distinct_per_agent_and_base() {
-        let agents = [config::Agent::Pi, config::Agent::Claude];
+        let agents = [
+            config::Agent::Pi,
+            config::Agent::Claude,
+            config::Agent::Prime,
+        ];
         let project = project_image_name("lit-rs-deadbeef");
         let names: BTreeSet<String> = [BASE_IMAGE, project.as_str()]
             .into_iter()
             .flat_map(|base| agents.map(|agent| agent_image_name(base, agent)))
             .collect();
-        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(names.len(), 6, "{names:?}");
         assert!(!names.contains(BASE_IMAGE) && !names.contains(&project));
     }
 
@@ -1473,5 +1541,43 @@ mod tests {
 
         let sessions = target("/root/.pi/agent/sessions").expect("sessions mount");
         assert_eq!(sessions.source, PathBuf::from("/data/repos/x-1/sessions"));
+    }
+
+    #[test]
+    fn prime_state_mounts_allowlist_persistence() {
+        let state = AgentState::Prime {
+            state_dir: PathBuf::from("/data/agents/prime-agent"),
+            repo_sessions_dir: PathBuf::from("/data/repos/x-1/prime-agent-sessions"),
+        };
+        let mounts = state.mounts(Path::new("/cache/sessions/abc"));
+        let target = |t: &str| mounts.iter().find(|m| m.target == t);
+
+        let agent_dir = target("/root/.prime/agent").expect("session agent dir mount");
+        assert_eq!(
+            agent_dir.source,
+            PathBuf::from("/cache/sessions/abc/prime-agent")
+        );
+
+        for name in PRIME_PERSISTENT_FILES {
+            let m = target(&format!("/root/.prime/agent/{name}"))
+                .unwrap_or_else(|| panic!("{name} mount"));
+            assert_eq!(
+                m.source,
+                PathBuf::from(format!("/data/agents/prime-agent/{name}"))
+            );
+            assert!(m.writable);
+        }
+
+        let packages = target("/root/.prime/agent/git").expect("packages mount");
+        assert_eq!(
+            packages.source,
+            PathBuf::from("/data/agents/prime-agent/git")
+        );
+
+        let sessions = target("/root/.prime/agent/sessions").expect("sessions mount");
+        assert_eq!(
+            sessions.source,
+            PathBuf::from("/data/repos/x-1/prime-agent-sessions")
+        );
     }
 }
