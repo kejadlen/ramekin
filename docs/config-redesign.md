@@ -58,7 +58,7 @@ and the GitHub-token BuildKit secret. Anti-lesson: one shared image tag
 over two *different* Dockerfiles silently redefines `FROM ramekin-agent`.
 Resolved by collapsing to a single Dockerfile carrying both agents — one
 tag, one definition, entrypoint chosen per session — rather than per-agent
-images.
+images. (Since superseded: see the amendment under the image section below.)
 
 ## Design
 
@@ -289,6 +289,17 @@ session. A project `.ramekin/Dockerfile` builds `FROM ramekin-agent` with
 a repo-specific tag, so one project image serves both agents too.
 Concurrent builds of the same tag are idempotent, and a single Dockerfile
 means there is no pi/claude tag race to avoid.
+
+**Amendment: one image per agent, agent last.** A third agent on the way
+(prime-agent, with its own Python kernel) would have made the everything-image
+heavier, and it already forced Node.js on every project. The images now build as a chain: `ramekin-base`
+(tooling, no agent), then the optional project image `FROM ramekin-base`,
+then the agent's own Dockerfile `FROM` whichever came last, tagged
+`<base>-<agent>`. The race from the anti-lesson stays fixed, since a tag
+still names exactly one Dockerfile. Putting the agent last rather than
+first keeps `.ramekin/Dockerfile` agent-agnostic and shares its usually
+heavier layers across agents. The cost is that a project Dockerfile change
+reinstalls the agent on top.
 
 ### Outbox
 

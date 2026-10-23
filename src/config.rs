@@ -89,6 +89,15 @@ impl Agent {
         }
     }
 
+    /// The Dockerfile that layers this agent onto a base image, passed in as
+    /// `ARG BASE`.
+    pub fn dockerfile(&self) -> &'static str {
+        match self {
+            Self::Pi => include_str!("../assets/agents/pi.Dockerfile"),
+            Self::Claude => include_str!("../assets/agents/claude.Dockerfile"),
+        }
+    }
+
     /// The agent's config dir inside the container.
     pub fn container_config_dir(&self) -> &'static str {
         match self {

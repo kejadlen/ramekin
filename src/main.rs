@@ -13,15 +13,16 @@ use serde::Serialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-const DOCKERFILE: &str = include_str!("../assets/Dockerfile");
+const BASE_DOCKERFILE: &str = include_str!("../assets/base.Dockerfile");
 const RAMEKIN_PROMPT: &str = include_str!("../assets/ramekin-prompt.md");
 
 const VERSION: &str = env!("RAMEKIN_VERSION");
 
-/// Tag of the base image. One image carries both agents — the generated
-/// compose config picks the entrypoint per session — so concurrent sessions
-/// of different agents build the same idempotent tag.
-const BASE_IMAGE: &str = "ramekin-agent";
+/// Tag of the base image: common tooling, no agent. Agents layer on top of it
+/// (or of a project image built from it) under their own tags, so concurrent
+/// sessions of different agents never build different Dockerfiles under one
+/// tag.
+const BASE_IMAGE: &str = "ramekin-base";
 
 /// Container path of the rendered per-session system prompt.
 const PROMPT_TARGET: &str = "/root/.ramekin/ramekin-prompt.md";
@@ -550,7 +551,18 @@ impl Ramekin {
             .collect())
     }
 
-    /// Session plumbing mounts shared by both agents: the rendered prompt,
+    /// The image the agent layer builds `FROM`: the project image when the
+    /// workspace has a `.ramekin/Dockerfile`, otherwise the base. Agent last
+    /// keeps the project Dockerfile agent-agnostic and shares its layers
+    /// across agents.
+    fn agent_base_image(&self) -> String {
+        match &self.custom_dockerfile {
+            Some(_) => project_image_name(&self.repo_slug),
+            None => BASE_IMAGE.to_string(),
+        }
+    }
+
+    /// Session plumbing mounts shared by every agent: the rendered prompt,
     /// the outbox, and the workspace.
     fn session_mounts(&self, session_dir: &Path, outbox_dir: &Path) -> Vec<config::ResolvedMount> {
         let mut mounts = self.agent_state.mounts(session_dir);
@@ -728,17 +740,24 @@ impl Ramekin {
         }
 
         println!();
-        println!("Dockerfile");
+        println!("Images");
+        println!("  {BASE_IMAGE} (embedded base)");
         match &self.custom_dockerfile {
-            Some(path) => println!("  ✓ {} (FROM {BASE_IMAGE})", path.display()),
-            None => {
-                println!("  embedded ({BASE_IMAGE})");
-                println!(
-                    "  ✗ {} (not found)",
-                    self.workspace.join(".ramekin/Dockerfile").display()
-                );
-            }
+            Some(path) => println!(
+                "  {} ← {} (FROM {BASE_IMAGE})",
+                project_image_name(&self.repo_slug),
+                path.display()
+            ),
+            None => println!(
+                "  ✗ {} (not found)",
+                self.workspace.join(".ramekin/Dockerfile").display()
+            ),
         }
+        let agent = self.config.agent();
+        println!(
+            "  {} (embedded {agent} layer)",
+            agent_image_name(&self.agent_base_image(), agent)
+        );
 
         Ok(())
     }
@@ -756,9 +775,10 @@ impl Ramekin {
         fs_err::create_dir_all(&self.cache_dir).into_diagnostic()?;
         self.agent_state.prepare(&self.xdg)?;
 
-        // Write the embedded Dockerfile to the cache directory
-        let base_dockerfile = self.cache_dir.join("Dockerfile");
-        fs_err::write(&base_dockerfile, DOCKERFILE).into_diagnostic()?;
+        let base_dockerfile = self.cache_dir.join("base.Dockerfile");
+        fs_err::write(&base_dockerfile, BASE_DOCKERFILE).into_diagnostic()?;
+        let agent_dockerfile = self.cache_dir.join(format!("{agent}.Dockerfile"));
+        fs_err::write(&agent_dockerfile, agent.dockerfile()).into_diagnostic()?;
 
         // The base image fetches release metadata from the GitHub API at
         // build time. Pass a host token so the build doesn't get rate-limited.
@@ -766,52 +786,34 @@ impl Ramekin {
         if gh_token.is_some() {
             info!("authenticated GitHub API for image build");
         }
-
-        if rebuild {
-            info!("rebuilding base image (no cache)");
-        } else {
-            info!("building base image");
-        }
-        let mut build_cmd = Command::new("docker");
-        build_cmd
-            .args(["build", "-t", BASE_IMAGE, "-f"])
-            .arg(&base_dockerfile);
-        if let Some(token) = &gh_token {
-            build_cmd
-                .env("RAMEKIN_GH_TOKEN", token)
-                .args(["--secret", "id=github-token,env=RAMEKIN_GH_TOKEN"]);
-        }
-        if rebuild {
-            build_cmd.args(["--no-cache", "--pull"]);
-        }
-        build_cmd.arg(&self.cache_dir);
-        let status = build_cmd
-            .status()
-            .into_diagnostic()
-            .wrap_err("failed to build base image")?;
-        if !status.success() {
-            bail!("base image build failed ({})", status);
-        }
-
-        // Determine the final dockerfile, build context, and image tag. A
-        // custom Dockerfile gets a repo-specific tag so it doesn't collide
-        // with the base image it builds `FROM`; sharing the tag would make
-        // `docker compose up` reuse the base instead of the project layer.
-        let (dockerfile, build_context, image) = match &self.custom_dockerfile {
-            Some(custom) => {
-                info!("building project image from .ramekin/Dockerfile");
-                (
-                    custom.clone(),
-                    self.workspace.clone(),
-                    project_image_name(&self.repo_slug),
-                )
-            }
-            None => (
-                base_dockerfile,
-                self.cache_dir.clone(),
-                BASE_IMAGE.to_string(),
-            ),
+        let build = |tag: &str, dockerfile: &Path, context: &Path, base: Option<&str>| {
+            docker_build(DockerBuild {
+                tag,
+                dockerfile,
+                context,
+                base,
+                github_token: gh_token.as_deref(),
+                rebuild,
+            })
         };
+
+        info!(rebuild, "building base image");
+        build(BASE_IMAGE, &base_dockerfile, &self.cache_dir, None)?;
+
+        let agent_base = self.agent_base_image();
+        if let Some(custom) = &self.custom_dockerfile {
+            info!("building project image from .ramekin/Dockerfile");
+            build(&agent_base, custom, &self.workspace, None)?;
+        }
+
+        let image = agent_image_name(&agent_base, agent);
+        info!(%image, "building agent image");
+        build(
+            &image,
+            &agent_dockerfile,
+            &self.cache_dir,
+            Some(&agent_base),
+        )?;
 
         // Session-scoped: compose file, rendered prompt, and fresh agent
         // dirs, all under a random session id so concurrent runs don't
@@ -849,8 +851,6 @@ impl Ramekin {
         let all_mounts: Vec<&config::ResolvedMount> = emitted.iter().collect();
         let env_vars = self.config.merged_env();
         let compose = generate_compose(ComposeParams {
-            dockerfile: &dockerfile,
-            build_context: &build_context,
             mounts: &all_mounts,
             env_vars: &env_vars,
             image: &image,
@@ -891,24 +891,6 @@ impl Ramekin {
                 .args(args);
             Ok(cmd)
         };
-
-        // Build the project image when a custom Dockerfile is present. `up`
-        // alone only builds when the image is missing, which would serve a stale
-        // layer after the Dockerfile changes. Layer caching keeps this cheap
-        // unless `--rebuild` forces a clean build.
-        if self.custom_dockerfile.is_some() || rebuild {
-            let mut args = vec!["build"];
-            if rebuild {
-                args.push("--no-cache");
-            }
-            let status = docker_compose(&args)?
-                .status()
-                .into_diagnostic()
-                .wrap_err("failed to run docker compose build")?;
-            if !status.success() {
-                bail!("docker compose build failed ({})", status);
-            }
-        }
 
         let status = docker_compose(&["up", "-d"])?
             .status()
@@ -1063,12 +1045,57 @@ fn repo_slug(workspace: &Path) -> String {
 }
 
 /// Docker image tag for a workspace's project image, built from its
-/// `.ramekin/Dockerfile`. Kept distinct from the base tag so `docker compose
-/// up` builds the project layer instead of reusing the base image that
-/// shares the tag. Lowercased because Docker repository names must be
-/// lowercase.
+/// `.ramekin/Dockerfile`. Kept distinct from the base tag, which it builds
+/// `FROM` and would otherwise overwrite. Lowercased because Docker
+/// repository names must be lowercase.
 fn project_image_name(repo_slug: &str) -> String {
     format!("ramekin-{repo_slug}").to_lowercase()
+}
+
+/// Docker image tag for an agent layered on `base`. Distinct per agent, so
+/// no tag ever names two different Dockerfiles.
+fn agent_image_name(base: &str, agent: config::Agent) -> String {
+    format!("{base}-{agent}")
+}
+
+/// One `docker build`. `base` fills the agent Dockerfiles' `ARG BASE`.
+struct DockerBuild<'a> {
+    tag: &'a str,
+    dockerfile: &'a Path,
+    context: &'a Path,
+    base: Option<&'a str>,
+    github_token: Option<&'a str>,
+    rebuild: bool,
+}
+
+fn docker_build(build: DockerBuild) -> Result<()> {
+    let mut cmd = Command::new("docker");
+    cmd.args(["build", "-t", build.tag, "-f"])
+        .arg(build.dockerfile);
+    if let Some(base) = build.base {
+        cmd.args(["--build-arg", &format!("BASE={base}")]);
+    }
+    if let Some(token) = build.github_token {
+        cmd.env("RAMEKIN_GH_TOKEN", token)
+            .args(["--secret", "id=github-token,env=RAMEKIN_GH_TOKEN"]);
+    }
+    if build.rebuild {
+        cmd.arg("--no-cache");
+        // Only the base pulls: every other image builds `FROM` a local tag
+        // no registry has.
+        if build.tag == BASE_IMAGE {
+            cmd.arg("--pull");
+        }
+    }
+    cmd.arg(build.context);
+    let status = cmd
+        .status()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to build {}", build.tag))?;
+    if !status.success() {
+        bail!("image build for {} failed ({status})", build.tag);
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1083,7 +1110,6 @@ struct Services {
 
 #[derive(Serialize)]
 struct AgentService {
-    build: BuildConfig,
     image: String,
     stdin_open: bool,
     tty: bool,
@@ -1092,12 +1118,6 @@ struct AgentService {
     environment: Vec<String>,
     volumes: Vec<VolumeBind>,
     command: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct BuildConfig {
-    context: String,
-    dockerfile: String,
 }
 
 /// Long-form compose bind mount. Avoids the `source:target[:ro]` short form,
@@ -1115,14 +1135,11 @@ struct VolumeBind {
 /// mounts, environment, and build context travel together instead of as a
 /// long positional argument list.
 struct ComposeParams<'a> {
-    dockerfile: &'a Path,
-    build_context: &'a Path,
     mounts: &'a [&'a config::ResolvedMount],
     env_vars: &'a [config::ScopedValue<&'a config::EnvVar>],
     image: &'a str,
     working_dir: &'a str,
-    /// The agent binary to run — the image carries both, with no ENTRYPOINT
-    /// of its own.
+    /// The agent binary to run; the image has no ENTRYPOINT of its own.
     entrypoint: &'a str,
     prompt_flag: &'a str,
     /// CLI flags the active profile pins for the agent binary. Placed before
@@ -1159,8 +1176,6 @@ fn elide_directory_masks(
 /// Generate a Docker Compose config with all volume mounts.
 fn generate_compose(params: ComposeParams) -> String {
     let ComposeParams {
-        dockerfile,
-        build_context,
         mounts,
         env_vars,
         image,
@@ -1203,10 +1218,6 @@ fn generate_compose(params: ComposeParams) -> String {
     let config = ComposeConfig {
         services: Services {
             agent: AgentService {
-                build: BuildConfig {
-                    context: build_context.display().to_string(),
-                    dockerfile: dockerfile.display().to_string(),
-                },
                 image: image.to_string(),
                 stdin_open: true,
                 tty: true,
@@ -1229,11 +1240,22 @@ mod tests {
     #[test]
     fn project_image_name_is_repo_specific_and_distinct_from_base() {
         let name = project_image_name("lit-rs-deadbeef");
-        // Must not collide with the base image tag, or `docker compose up`
-        // reuses the base instead of building the project Dockerfile.
+        // Must not collide with the base image tag it builds `FROM`.
         assert_ne!(name, BASE_IMAGE);
         // Docker repository names must be lowercase.
         assert_eq!(name, name.to_lowercase(), "got: {name}");
+    }
+
+    #[test]
+    fn agent_image_names_are_distinct_per_agent_and_base() {
+        let agents = [config::Agent::Pi, config::Agent::Claude];
+        let project = project_image_name("lit-rs-deadbeef");
+        let names: BTreeSet<String> = [BASE_IMAGE, project.as_str()]
+            .into_iter()
+            .flat_map(|base| agents.map(|agent| agent_image_name(base, agent)))
+            .collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(!names.contains(BASE_IMAGE) && !names.contains(&project));
     }
 
     fn compose_params<'a>(
@@ -1241,8 +1263,6 @@ mod tests {
         env_vars: &'a [config::ScopedValue<&'a config::EnvVar>],
     ) -> ComposeParams<'a> {
         ComposeParams {
-            dockerfile: Path::new("/cache/Dockerfile"),
-            build_context: Path::new("/cache"),
             mounts,
             env_vars,
             image: BASE_IMAGE,
@@ -1367,7 +1387,7 @@ mod tests {
         params.entrypoint = "claude";
         params.prompt_flag = "--append-system-prompt-file";
         let yaml = generate_compose(params);
-        // One image carries both agents; the compose entrypoint picks one.
+        // The image has no ENTRYPOINT; the compose config names the agent.
         assert!(yaml.contains("entrypoint:\n    - claude"), "{yaml}");
         // Claude needs the -file variant: the plain flag would append the
         // literal path string instead of the prompt contents.

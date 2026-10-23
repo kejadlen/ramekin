@@ -19,7 +19,7 @@ Ramekin builds a Docker image with the agent and its dependencies, starts it via
 A Rust CLI orchestrates a Docker Compose stack. On each run it:
 
 1. Resolves the active profile (which picks the agent) and merges config layers
-2. Builds the base image (`ramekin-agent`, carrying both agents), and a project-specific layer if one exists
+2. Builds the base image (`ramekin-base`, no agent), a project-specific layer if one exists, and the active agent's layer on top
 3. Generates a compose config, renders the system prompt, and creates fresh agent dirs, all in a session-scoped cache directory
 4. Starts the agent container with the workspace mounted at `/workspace/<slug>` (where `<slug>` is `<dirname>-<hash>`, so cwd-keyed agent state never collides across repos)
 5. Attaches interactively, then tears down on exit — logging any state the agent wrote to its session-scoped dirs before discarding it, and keeping any config proposals the agent left in its outbox
@@ -204,12 +204,12 @@ For Claude, the base image bakes in yolo mode: managed settings set `permissions
 
 ### Custom Dockerfile
 
-Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base agent image. Use `FROM ramekin-agent` to layer on top — the base image carries both agents (the compose config picks the entrypoint per session) plus Node.js, git, jj, ripgrep, fd, just, jq, difftastic, dotslash, and ranger.
+Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base image. Use `FROM ramekin-base` to layer on top. The base carries Node.js, git, jj, ripgrep, fd, just, jq, difftastic, dotslash, and ranger, but no agent: ramekin installs the active agent in a layer on top of your project image, so one project Dockerfile serves every agent.
 
 The workspace is used as the build context, so `COPY` instructions work relative to the project root.
 
 ```dockerfile
-FROM ramekin-agent
+FROM ramekin-base
 RUN apt-get update && apt-get install -y ruby && rm -rf /var/lib/apt/lists/*
 ```
 

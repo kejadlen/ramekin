@@ -2,7 +2,7 @@
 
 ## Project
 
-Ramekin is a containerized harness for running coding agents — the [pi coding agent](https://github.com/badlogic/pi-mono) or Claude Code, selected via profiles. A Rust CLI builds a Docker image carrying both agents, generates a compose config at runtime, and attaches the user's terminal to the agent container. Network restriction via a firewall sidecar is planned but not yet implemented.
+Ramekin is a containerized harness for running coding agents — the [pi coding agent](https://github.com/badlogic/pi-mono) or Claude Code, selected via profiles. A Rust CLI builds a Docker image per agent, generates a compose config at runtime, and attaches the user's terminal to the agent container. Network restriction via a firewall sidecar is planned but not yet implemented.
 
 ## Repository layout
 
@@ -14,7 +14,8 @@ src/
   outbox.rs             # Pending config proposals: scan, map to host sources, apply/discard
 build.rs                # Sets RAMEKIN_VERSION from env or git rev
 assets/
-  Dockerfile            # Base image: both agents (+ claude managed settings, IS_SANDBOX)
+  base.Dockerfile       # Base image: common tooling, no agent
+  agents/               # One Dockerfile per agent, layered on the base or project image
   ramekin-prompt.md     # System prompt template appended inside the container
 clippy.toml             # Disallows std::fs in favor of fs-err
 justfile                # Local dev tasks (check, fmt, clippy, test, install)
@@ -50,7 +51,7 @@ just           # All four
 - Persistence is per-agent, opposite policies: pi is ephemeral-by-default (fresh session dir at `/root/.pi/agent`; allowlisted `auth.json` from `$XDG_DATA_HOME/ramekin/agents/pi/` and per-repo `sessions/` bound on top; teardown logs discarded writes). Claude is persist-by-default (`~/.claude` + `~/.claude.json` from `$XDG_DATA_HOME/ramekin/agents/`, shared across repos; session-scoped dirs bound over the `CLAUDE_EPHEMERAL` denylist).
 - Each workspace mounts at `/workspace/<slug>` (slug is `<dirname>-<hash>`, never a shared `/workspace`) so cwd-keyed agent state stays distinct per repo; compose's `working_dir` puts the agent there on start.
 - Docker compose config is generated at runtime via `serde_yaml` over a typed `ComposeConfig` struct, not a static file. Volume mounts use the long-form bind syntax (`{type: bind, source, target, read_only}`), ordered lexicographically by target so parents precede children. Passthrough env vars render as bare names in the environment list.
-- One base image (`ramekin-agent`) carries both agents; it has no ENTRYPOINT, and the generated compose config sets `entrypoint` to `pi` or `claude` per session. A project `.ramekin/Dockerfile` builds `FROM ramekin-agent` with a repo-specific tag. Image builds forward a host GitHub token (env vars or `gh auth token`) as a BuildKit secret for API calls.
+- Images build as a chain: `ramekin-base` (no agent), then an optional project image (`ramekin-<slug>`, from `.ramekin/Dockerfile`, `FROM ramekin-base`), then the agent layer (`<that tag>-<agent>`, from `Agent::dockerfile()` via `ARG BASE`). Agent last keeps project Dockerfiles agent-agnostic; a tag per agent avoids two Dockerfiles racing on one tag. Ramekin runs every `docker build` itself, and the generated compose config names the finished image with no `build:` section. No image has an ENTRYPOINT; compose sets it to `pi` or `claude`. Image builds forward a host GitHub token (env vars or `gh auth token`) as a BuildKit secret for API calls.
 - The outbox (`src/outbox.rs`) is the only write path for shared config: each session mounts a fresh dir at `/root/.ramekin/outbox`; proposals map back to host sources via the agent allowlist plus an `.agent` sidecar written outside the mount; `ramekin outbox list|diff|apply|discard` reviews them.
 - `Ramekin::resolve` is side-effect free (so `ramekin config` never mutates state); materialization happens in `run` via `AgentState::prepare`/`prepare_session`.
 - The `ramekin-prompt.md` template is rendered per session (`{{WORKSPACE_PATH}}` → the workspace target), mounted read-only at `/root/.ramekin/ramekin-prompt.md`, and passed via `--append-system-prompt` (pi) / `--append-system-prompt-file` (Claude — its plain flag takes a literal string).

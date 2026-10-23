@@ -38,32 +38,7 @@ RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
     curl -fsSL "https://github.com/Wilfred/difftastic/releases/download/${DIFFT_VERSION}/difft-${DIFFT_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
       | tar xz -C /usr/local/bin difft
 
-# pi publishes under @earendil-works. The older @mariozechner scope still
-# resolves and still carries the `latest` tag, so it looks current, but it's
-# abandoned at 0.73.1 — far enough behind that host extensions fail to load
-# against it (no ./compat export in its pi-ai).
-RUN --mount=type=cache,target=/root/.npm \
-    npm install -g @earendil-works/pi-coding-agent @anthropic-ai/claude-code
-
-# Claude Code refuses --dangerously-skip-permissions when running as root
-# unless IS_SANDBOX=1 acknowledges the sandbox. The container is the sandbox.
-# Pi ignores this.
-ENV IS_SANDBOX=1
-
-# Run Claude in bypass-permissions mode and skip the bypass dialog. Managed
-# settings is the highest tier, so this overrides whatever's in the user's
-# mounted ~/.claude. defaultMode replaces the --dangerously-skip-permissions
-# CLI flag; skipDangerousModePermissionPrompt suppresses the once-per-machine
-# acceptance dialog. The container is already a sandbox (see IS_SANDBOX), so
-# prompting is redundant.
-RUN mkdir -p /etc/claude-code && cat > /etc/claude-code/managed-settings.json <<'EOF'
-{
-  "permissions": { "defaultMode": "bypassPermissions" },
-  "skipDangerousModePermissionPrompt": true
-}
-EOF
-
 WORKDIR /workspace
 
-# No ENTRYPOINT: one image carries both agents, and the generated compose
-# config picks `pi` or `claude` per session.
+# No agent here: each agent installs in its own layer on top of this image,
+# or on top of a project image built from it. See assets/agents/.
