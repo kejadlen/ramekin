@@ -1,8 +1,17 @@
 ARG BASE
 FROM ${BASE}
 
-RUN --mount=type=cache,target=/root/.npm \
-    npm install -g @anthropic-ai/claude-code
+# The standalone binary, so Claude doesn't need Node. Checked against the
+# release manifest the way the official installer does. The auto-updater
+# would only rewrite the container's throwaway filesystem.
+ENV DISABLE_AUTOUPDATER=1
+RUN base=https://downloads.claude.ai/claude-code-releases \
+    && version=$(curl -fsSL "$base/latest") \
+    && checksum=$(curl -fsSL "$base/$version/manifest.json" \
+      | jq -er '.platforms["linux-arm64"].checksum') \
+    && curl -fsSL -o /usr/local/bin/claude "$base/$version/linux-arm64/claude" \
+    && echo "$checksum  /usr/local/bin/claude" | sha256sum -c - \
+    && chmod +x /usr/local/bin/claude
 
 # Claude Code refuses --dangerously-skip-permissions when running as root
 # unless IS_SANDBOX=1 acknowledges the sandbox. The container is the sandbox.

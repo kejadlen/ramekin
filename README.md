@@ -204,7 +204,7 @@ For Claude, the base image bakes in yolo mode: managed settings set `permissions
 
 ### Custom Dockerfile
 
-Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base image. Use `FROM ramekin-base` to layer on top. The base carries Node.js, git, jj, ripgrep, fd, just, jq, difftastic, dotslash, and ranger, but no agent: ramekin installs the active agent in a layer on top of your project image, so one project Dockerfile serves every agent.
+Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base image. Use `FROM ramekin-base` to layer on top. The base carries git, jj, ripgrep, fd, just, jq, difftastic, dotslash, and ranger, but no agent and no Node.js (pi's layer brings its own): ramekin installs the active agent in a layer on top of your project image, so one project Dockerfile serves every agent.
 
 The workspace is used as the build context, so `COPY` instructions work relative to the project root.
 
