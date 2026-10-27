@@ -1,12 +1,13 @@
 # Ramekin
 
-Containerized harness for running coding agents: the [pi coding agent](https://github.com/badlogic/pi-mono) or [Claude Code](https://github.com/anthropics/claude-code).
+Containerized harness for running coding agents: the [pi coding agent](https://github.com/badlogic/pi-mono), [Claude Code](https://github.com/anthropics/claude-code), or [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent).
 
 ## Quick start
 
 ```sh
 ramekin                # run the default profile (pi) against the current directory
 ramekin -p claude      # run Claude Code instead
+ramekin -p prime-agent # or prime-agent
 ramekin /some/path     # mount a specific workspace
 ramekin run --rebuild  # force a full image rebuild
 ramekin -- --model X   # forward extra args to the agent
@@ -43,7 +44,7 @@ ramekin completions bash > ~/.local/share/bash-completion/completions/ramekin
 
 ### Profiles
 
-A profile is a named bundle of agent + provider plumbing: which agent to run, env vars (with host passthrough for credentials), and extra mounts. The binary ships two trivial profiles — `pi` and `claude`, bare agents with no provider plumbing — so ramekin runs with zero config. Everything richer is defined in KDL:
+A profile is a named bundle of agent + provider plumbing: which agent to run, env vars (with host passthrough for credentials), and extra mounts. The binary ships three trivial profiles — `pi`, `claude`, and `prime-agent`, bare agents with no provider plumbing — so ramekin runs with zero config. Everything richer is defined in KDL:
 
 ```kdl
 // e.g. ~/.config/ramekin/profiles.kdl — symlinked from dotfiles, shared
@@ -77,6 +78,7 @@ Agent config comes from the host's own dirs — the agents are also used locally
 
 - pi: `~/.pi/agent/` — `AGENTS.md`, `settings.json`, `models.json`, `keybindings.json`, `extensions/`, `skills/`
 - claude: `~/.claude/` — `CLAUDE.md`, `settings.json`, `skills/`, `agents/`, `commands/`, `hooks/`
+- prime-agent: `~/.prime/agent/` — `AGENTS.md`, `SYSTEM.md`, `settings.json`, `models.json`, `keybindings.json`, `skills/`, `prompts/`, `themes/`
 
 Ramekin keeps no parallel copy — edit the host files (or the dotfiles they symlink to) and the next session sees the changes. The rest of each host dir is runtime state (credentials, transcripts) and never enters the container. Project-level agent config (`.claude/`, `CLAUDE.md`, `AGENTS.md` in the repo) rides the workspace mount; the agents layer it themselves.
 
@@ -84,7 +86,7 @@ Config is immutable from inside the container by design: in-container edits fail
 
 ### Persistence
 
-The two agents get opposite persistence policies, chosen by failure mode.
+The agents get opposite persistence policies, chosen by failure mode.
 
 **Pi: ephemeral by default, allowlist what persists.** Each session gets a fresh, empty writable dir at `/root/.pi/agent`, discarded on teardown, with the persistent pieces bound on top:
 
@@ -94,6 +96,8 @@ The two agents get opposite persistence policies, chosen by failure mode.
 - `sessions/` — per-repo, at `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`
 
 On teardown, ramekin logs anything else the agent wrote to its session dir before discarding it, so a path that deserves persistence gets noticed rather than silently vanishing.
+
+**prime-agent: the same policy as pi.** A fresh dir at `/root/.prime/agent` gets `auth.json` and `git/` from `$XDG_DATA_HOME/ramekin/agents/prime-agent/` and `sessions/` from `$XDG_DATA_HOME/ramekin/repos/<slug>/prime-agent-sessions/`. Its Python kernel venv lives in the image (`PRIME_AGENT_KERNEL_VENV`), not in the agent dir, so it isn't rebuilt every session. Model selection is written to `settings.json`, which doesn't persist, so it resets each session. The image sets `PRIME_AGENT_TELEMETRY=0`, which turns off prime-agent's default-on usage telemetry regardless of `settings.json`.
 
 **Claude: persist by default, denylist the junk.** `~/.claude` and `~/.claude.json` mount from `$XDG_DATA_HOME/ramekin/agents/`, shared across repos — auth, identity, onboarding state, and transcripts all survive. Fresh session-scoped dirs bind over the known ephemeral subdirs (`statsig/`, `todos/`, `shell-snapshots/`, `debug/`). Per-repo isolation of Claude's cwd-keyed `projects` map comes from the `/workspace/<slug>` mount, not from splitting the state file. If Claude grows an unclassified state file, it persists (worst case: rot) rather than vanishing (worst case: lost auth).
 

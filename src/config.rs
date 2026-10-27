@@ -35,6 +35,7 @@ impl fmt::Display for Scope {
 pub enum Agent {
     Pi,
     Claude,
+    Prime,
 }
 
 impl Agent {
@@ -42,8 +43,9 @@ impl Agent {
         match s {
             "pi" => Ok(Self::Pi),
             "claude" => Ok(Self::Claude),
+            "prime-agent" => Ok(Self::Prime),
             other => {
-                bail!("unknown agent `{other}` (expected `pi` or `claude`)");
+                bail!("unknown agent `{other}` (expected `pi`, `claude`, or `prime-agent`)");
             }
         }
     }
@@ -52,6 +54,7 @@ impl Agent {
         match self {
             Self::Pi => "pi",
             Self::Claude => "claude",
+            Self::Prime => "prime-agent",
         }
     }
 
@@ -61,6 +64,7 @@ impl Agent {
         match self {
             Self::Pi => "~/.pi/agent",
             Self::Claude => "~/.claude",
+            Self::Prime => "~/.prime/agent",
         }
     }
 
@@ -86,6 +90,16 @@ impl Agent {
                 "commands",
                 "hooks",
             ],
+            Self::Prime => &[
+                "AGENTS.md",
+                "SYSTEM.md",
+                "settings.json",
+                "models.json",
+                "keybindings.json",
+                "skills",
+                "prompts",
+                "themes",
+            ],
         }
     }
 
@@ -95,6 +109,7 @@ impl Agent {
         match self {
             Self::Pi => include_str!("../assets/agents/pi.Dockerfile"),
             Self::Claude => include_str!("../assets/agents/claude.Dockerfile"),
+            Self::Prime => include_str!("../assets/agents/prime-agent.Dockerfile"),
         }
     }
 
@@ -103,6 +118,7 @@ impl Agent {
         match self {
             Self::Pi => PI_AGENT_DIR,
             Self::Claude => "/root/.claude",
+            Self::Prime => PRIME_AGENT_DIR,
         }
     }
 }
@@ -130,7 +146,7 @@ impl Profile {
     /// provider plumbing, so ramekin runs with zero config. Everything
     /// richer is defined in KDL.
     fn builtin() -> Vec<Self> {
-        [Agent::Pi, Agent::Claude]
+        [Agent::Pi, Agent::Claude, Agent::Prime]
             .into_iter()
             .map(|agent| Self {
                 name: agent.name().to_string(),
@@ -998,6 +1014,9 @@ const STAPLES: &[&str] = &["~/.config/git", "~/.config/jj"];
 
 /// Pi's agent dir inside the container.
 pub const PI_AGENT_DIR: &str = "/root/.pi/agent";
+
+/// prime-agent's agent dir inside the container.
+pub const PRIME_AGENT_DIR: &str = "/root/.prime/agent";
 
 /// Mounts compiled into the binary: staples plus the host's agent config for
 /// the active agent.
@@ -2084,5 +2103,14 @@ mod tests {
         assert!(Agent::Claude.config_allowlist().contains(&"CLAUDE.md"));
         assert!(Agent::Claude.config_allowlist().contains(&"hooks"));
         assert_eq!(Agent::Claude.container_config_dir(), "/root/.claude");
+        assert!(Agent::Prime.config_allowlist().contains(&"AGENTS.md"));
+        assert_eq!(Agent::Prime.container_config_dir(), "/root/.prime/agent");
+    }
+
+    #[test]
+    fn agent_names_round_trip() {
+        for agent in [Agent::Pi, Agent::Claude, Agent::Prime] {
+            assert_eq!(Agent::parse(agent.name()).unwrap(), agent);
+        }
     }
 }
