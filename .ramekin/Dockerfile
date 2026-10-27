@@ -1,4 +1,4 @@
-FROM ramekin-agent
+FROM ramekin-base
 
 ENV RANGER_DEFAULT_BACKLOG="ramekin"
 
