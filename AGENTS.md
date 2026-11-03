@@ -15,7 +15,7 @@ src/
   runtime.rs            # Container runtimes (Docker, Apple): image builds, session runs, compose generation
 build.rs                # Sets RAMEKIN_VERSION from env or git rev
 assets/
-  Dockerfile            # Base image: both agents (+ claude managed settings, IS_SANDBOX)
+  Dockerfile            # Base image: both agents (+ claude managed settings, IS_SANDBOX, RAMEKIN)
   ramekin-prompt.md     # System prompt template appended inside the container
 clippy.toml             # Disallows std::fs in favor of fs-err
 justfile                # Local dev tasks (check, fmt, clippy, test, install)

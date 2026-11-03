@@ -56,6 +56,10 @@ RUN --mount=type=cache,target=/root/.npm \
 # Pi ignores this.
 ENV IS_SANDBOX=1
 
+# Tells host config mounted into the container (extensions, hooks) that it's
+# inside ramekin. Docker's /.dockerenv doesn't exist under the apple runtime.
+ENV RAMEKIN=1
+
 # Run Claude in bypass-permissions mode and skip the bypass dialog. Managed
 # settings is the highest tier, so this overrides whatever's in the user's
 # mounted ~/.claude. defaultMode replaces the --dangerously-skip-permissions

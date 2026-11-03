@@ -212,6 +212,8 @@ A built-in system prompt (`ramekin-prompt.md`) is rendered per session, mounted 
 
 For Claude, the base image bakes in yolo mode: managed settings set `permissions.defaultMode = bypassPermissions` and `IS_SANDBOX=1` acknowledges the container as the sandbox.
 
+The base image also sets `RAMEKIN=1`, so host config mounted into the container, such as a pi extension or a Claude hook, can check for it to detect a ramekin session under any runtime.
+
 ### Custom Dockerfile
 
 Place a `Dockerfile` at `.ramekin/Dockerfile` in your workspace to extend the base agent image. Use `FROM ramekin-agent` to layer on top — the base image carries both agents (the compose config picks the entrypoint per session) plus Node.js, git, jj, ripgrep, fd, just, jq, difftastic, dotslash, and ranger.
