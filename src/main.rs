@@ -1,15 +1,15 @@
 mod config;
 mod outbox;
+mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use miette::{Context, IntoDiagnostic, Result, bail, miette};
-use serde::Serialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -718,53 +718,41 @@ impl Ramekin {
             info!("authenticated GitHub API for image build");
         }
 
+        let runtime = runtime::Runtime::Docker;
         if rebuild {
             info!("rebuilding base image (no cache)");
         } else {
             info!("building base image");
         }
-        let mut build_cmd = Command::new("docker");
-        build_cmd
-            .args(["build", "-t", BASE_IMAGE, "-f"])
-            .arg(&base_dockerfile);
-        if let Some(token) = &gh_token {
-            build_cmd
-                .env("RAMEKIN_GH_TOKEN", token)
-                .args(["--secret", "id=github-token,env=RAMEKIN_GH_TOKEN"]);
-        }
-        if rebuild {
-            build_cmd.args(["--no-cache", "--pull"]);
-        }
-        build_cmd.arg(&self.cache_dir);
-        let status = build_cmd
-            .status()
-            .into_diagnostic()
-            .wrap_err("failed to build base image")?;
-        if !status.success() {
-            bail!("base image build failed ({})", status);
-        }
+        runtime.build(&runtime::Build {
+            tag: BASE_IMAGE,
+            dockerfile: &base_dockerfile,
+            context: &self.cache_dir,
+            no_cache: rebuild,
+            pull: rebuild,
+            github_token: gh_token.as_deref(),
+        })?;
 
-        // Determine the final dockerfile, build context, and image tag. A
-        // custom Dockerfile gets a repo-specific tag so it doesn't collide
-        // with the base image it builds `FROM`; sharing the tag would make
-        // `docker compose up` reuse the base instead of the project layer.
-        let (dockerfile, build_context, image) = match &self.custom_dockerfile {
+        // Rebuilt every run rather than only when missing, so a changed
+        // Dockerfile never serves a stale layer; layer caching keeps it cheap.
+        let image = match &self.custom_dockerfile {
             Some(custom) => {
                 info!("building project image from .ramekin/Dockerfile");
-                (
-                    custom.clone(),
-                    self.workspace.clone(),
-                    project_image_name(&self.repo_slug),
-                )
+                let image = project_image_name(&self.repo_slug);
+                runtime.build(&runtime::Build {
+                    tag: &image,
+                    dockerfile: custom,
+                    context: &self.workspace,
+                    no_cache: rebuild,
+                    pull: false,
+                    github_token: None,
+                })?;
+                image
             }
-            None => (
-                base_dockerfile,
-                self.cache_dir.clone(),
-                BASE_IMAGE.to_string(),
-            ),
+            None => BASE_IMAGE.to_string(),
         };
 
-        // Session-scoped: compose file, rendered prompt, and fresh agent
+        // Session-scoped: runtime files, rendered prompt, and fresh agent
         // dirs, all under a random session id so concurrent runs don't
         // interfere.
         let session_id = session_id();
@@ -789,42 +777,12 @@ impl Ramekin {
             fs_err::create_dir_all(&mount.source).into_diagnostic()?;
             forced_mounts.push(mount);
         }
-        // A mask over a directory needs an empty directory to bind, not
-        // /dev/null; the dir is session-scoped so nothing can write into it
-        // and have it outlive the run.
-        let empty_dir = session_dir.join("empty");
-        fs_err::create_dir_all(&empty_dir).into_diagnostic()?;
-        let emitted = elide_directory_masks(&self.final_mounts(&forced_mounts), &empty_dir, |t| {
-            self.hidden_host_path(t)
-        });
-        let all_mounts: Vec<&config::ResolvedMount> = emitted.iter().collect();
-        let env_vars = self.config.merged_env();
-        let compose = generate_compose(ComposeParams {
-            dockerfile: &dockerfile,
-            build_context: &build_context,
-            mounts: &all_mounts,
-            env_vars: &env_vars,
-            image: &image,
-            working_dir: &self.workspace_target,
-            // The image has no ENTRYPOINT; the compose config picks the agent.
-            entrypoint: agent.name(),
-            prompt_flag: match agent {
-                // Pi's --append-system-prompt accepts a file path; Claude's
-                // takes a literal string, so it needs the -file variant to
-                // read the file rather than append the literal path.
-                config::Agent::Pi => "--append-system-prompt",
-                config::Agent::Claude => "--append-system-prompt-file",
-            },
-            profile_args: &self.config.profile.args,
-            agent_args,
-        });
-        let compose_file = session_dir.join("compose.yml");
-        fs_err::write(&compose_file, &compose).into_diagnostic()?;
+        let mounts = self.final_mounts(&forced_mounts);
 
         // Mount targets inside the agent dir show up on the host as empty
-        // artifacts Docker creates to serve as mount points; the teardown
-        // report has to know to skip them.
-        let agent_dir_mountpoints: BTreeSet<PathBuf> = all_mounts
+        // artifacts the runtime creates to serve as mount points; the
+        // teardown report has to know to skip them.
+        let agent_dir_mountpoints: BTreeSet<PathBuf> = mounts
             .iter()
             .filter_map(|m| {
                 m.target
@@ -833,58 +791,30 @@ impl Ramekin {
             })
             .collect();
 
-        let project_name = format!("ramekin-{session_id}");
-        let docker_compose = |args: &[&str]| -> Result<Command> {
-            let mut cmd = Command::new("docker");
-            cmd.args(["compose", "-f"])
-                .arg(&compose_file)
-                .args(["--project-name", &project_name])
-                .args(args);
-            Ok(cmd)
-        };
-
-        // Build the project image when a custom Dockerfile is present. `up`
-        // alone only builds when the image is missing, which would serve a stale
-        // layer after the Dockerfile changes. Layer caching keeps this cheap
-        // unless `--rebuild` forces a clean build.
-        if self.custom_dockerfile.is_some() || rebuild {
-            let mut args = vec!["build"];
-            if rebuild {
-                args.push("--no-cache");
-            }
-            let status = docker_compose(&args)?
-                .status()
-                .into_diagnostic()
-                .wrap_err("failed to run docker compose build")?;
-            if !status.success() {
-                bail!("docker compose build failed ({})", status);
-            }
-        }
-
-        let status = docker_compose(&["up", "-d"])?
-            .status()
-            .into_diagnostic()
-            .wrap_err("failed to run docker compose up")?;
-        if !status.success() {
-            bail!("docker compose up failed ({})", status);
-        }
-
-        let status = docker_compose(&["attach", "agent"])?
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .into_diagnostic()
-            .wrap_err("failed to attach to agent")?;
-
-        // Always tear down, regardless of attach exit status
-        let down_status = docker_compose(&["down"])?
-            .status()
-            .into_diagnostic()
-            .wrap_err("failed to run docker compose down")?;
-        if !down_status.success() {
-            error!("docker compose down failed ({})", down_status);
-        }
+        let (masks, binds): (Vec<_>, Vec<_>) = mounts.into_iter().partition(|m| m.is_mask());
+        let binds: Vec<config::ResolvedMount> = binds.into_iter().cloned().collect();
+        let masks: Vec<runtime::Mask> = masks
+            .into_iter()
+            .map(|m| runtime::Mask {
+                target: m.target.clone(),
+                over_dir: self
+                    .hidden_host_path(&m.target)
+                    .is_some_and(|path| path.is_dir()),
+                writable: m.writable,
+            })
+            .collect();
+        let command = agent_command(agent, &self.config.profile.args, agent_args);
+        let status = runtime.run(&runtime::Session {
+            name: &format!("ramekin-{session_id}"),
+            dir: &session_dir,
+            image: &image,
+            working_dir: &self.workspace_target,
+            entrypoint: agent.name(),
+            command: &command,
+            binds: &binds,
+            masks: &masks,
+            env: &self.config.merged_env(),
+        })?;
 
         // Anything the agent wrote to its session-scoped dir is about to be
         // discarded; log it so a path that deserves persistence gets noticed
@@ -1228,155 +1158,26 @@ fn collect_subtree(node: &MountNode, base: usize, prefix: &str, lines: &mut Vec<
     }
 }
 
-#[derive(Serialize)]
-struct ComposeConfig {
-    services: Services,
-}
-
-#[derive(Serialize)]
-struct Services {
-    agent: AgentService,
-}
-
-#[derive(Serialize)]
-struct AgentService {
-    build: BuildConfig,
-    image: String,
-    stdin_open: bool,
-    tty: bool,
-    working_dir: String,
-    entrypoint: Vec<String>,
-    environment: Vec<String>,
-    volumes: Vec<VolumeBind>,
-    command: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct BuildConfig {
-    context: String,
-    dockerfile: String,
-}
-
-/// Long-form compose bind mount. Avoids the `source:target[:ro]` short form,
-/// which can't represent paths containing colons.
-#[derive(Serialize)]
-struct VolumeBind {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    source: String,
-    target: String,
-    read_only: bool,
-}
-
-/// Inputs for [`generate_compose`], grouped so the container command,
-/// mounts, environment, and build context travel together instead of as a
-/// long positional argument list.
-struct ComposeParams<'a> {
-    dockerfile: &'a Path,
-    build_context: &'a Path,
-    mounts: &'a [&'a config::ResolvedMount],
-    env_vars: &'a [config::ScopedValue<&'a config::EnvVar>],
-    image: &'a str,
-    working_dir: &'a str,
-    /// The agent binary to run — the image carries both, with no ENTRYPOINT
-    /// of its own.
-    entrypoint: &'a str,
-    prompt_flag: &'a str,
-    /// CLI flags the active profile pins for the agent binary. Placed before
-    /// the per-run trailing args so a `ramekin -- ...` flag still wins.
-    profile_args: &'a [String],
-    agent_args: &'a [String],
-}
-
-/// Bind an empty directory for masks that hide a directory.
-///
-/// `/dev/null` binds over a file and blanks it, but over a directory Docker
-/// refuses the mount and the run dies at startup. An empty directory elides
-/// the contents while keeping the target the shape callers expect, so
-/// listing it succeeds and comes back empty.
-fn elide_directory_masks(
-    mounts: &[&config::ResolvedMount],
-    empty_dir: &Path,
-    hidden_host_path: impl Fn(&str) -> Option<PathBuf>,
-) -> Vec<config::ResolvedMount> {
-    mounts
-        .iter()
-        .map(|mount| {
-            let mut mount = (*mount).clone();
-            let hides_a_dir = mount.is_mask()
-                && hidden_host_path(&mount.target).is_some_and(|path| path.is_dir());
-            if hides_a_dir {
-                mount.source = empty_dir.to_path_buf();
-            }
-            mount
-        })
-        .collect()
-}
-
-/// Generate a Docker Compose config with all volume mounts.
-fn generate_compose(params: ComposeParams) -> String {
-    let ComposeParams {
-        dockerfile,
-        build_context,
-        mounts,
-        env_vars,
-        image,
-        working_dir,
-        entrypoint,
-        prompt_flag,
-        profile_args,
-        agent_args,
-    } = params;
-
-    let volumes: Vec<VolumeBind> = mounts
-        .iter()
-        .map(|m| VolumeBind {
-            kind: "bind",
-            source: m.source.display().to_string(),
-            target: m.target.clone(),
-            read_only: !m.writable,
-        })
-        .collect();
-
-    // A bare name (no value) is compose's passthrough form: the variable is
-    // forwarded from the environment ramekin runs in, and stays unset in the
-    // container when the host doesn't have it either.
-    let environment: Vec<String> = env_vars
-        .iter()
-        .map(|sv| match &sv.value.value {
-            Some(value) => format!("{}={value}", sv.value.name),
-            None => sv.value.name.clone(),
-        })
-        .collect();
-
-    // Always pass the prompt flag for the ramekin container context.
-    // Profile args come next; user-supplied CLI args come last so they win.
-    let command: Vec<String> = [prompt_flag.to_string(), PROMPT_TARGET.to_string()]
+/// Arguments for the agent binary: the ramekin prompt, then the profile's
+/// pinned args, then the per-run trailing args, so a `ramekin -- ...` flag
+/// still wins.
+fn agent_command(
+    agent: config::Agent,
+    profile_args: &[String],
+    agent_args: &[String],
+) -> Vec<String> {
+    // Pi's --append-system-prompt accepts a file path; Claude's takes a
+    // literal string, so it needs the -file variant to read the file rather
+    // than append the literal path.
+    let prompt_flag = match agent {
+        config::Agent::Pi => "--append-system-prompt",
+        config::Agent::Claude => "--append-system-prompt-file",
+    };
+    [prompt_flag.to_string(), PROMPT_TARGET.to_string()]
         .into_iter()
         .chain(profile_args.iter().cloned())
         .chain(agent_args.iter().cloned())
-        .collect();
-
-    let config = ComposeConfig {
-        services: Services {
-            agent: AgentService {
-                build: BuildConfig {
-                    context: build_context.display().to_string(),
-                    dockerfile: dockerfile.display().to_string(),
-                },
-                image: image.to_string(),
-                stdin_open: true,
-                tty: true,
-                working_dir: working_dir.to_string(),
-                entrypoint: vec![entrypoint.to_string()],
-                environment,
-                volumes,
-                command,
-            },
-        },
-    };
-
-    serde_yaml::to_string(&config).expect("failed to serialize compose config")
+        .collect()
 }
 
 #[cfg(test)]
@@ -1386,150 +1187,35 @@ mod tests {
     #[test]
     fn project_image_name_is_repo_specific_and_distinct_from_base() {
         let name = project_image_name("lit-rs-deadbeef");
-        // Must not collide with the base image tag, or `docker compose up`
-        // reuses the base instead of building the project Dockerfile.
+        // Building under the base tag would overwrite the base the project
+        // Dockerfile builds `FROM`.
         assert_ne!(name, BASE_IMAGE);
         // Docker repository names must be lowercase.
         assert_eq!(name, name.to_lowercase(), "got: {name}");
     }
 
-    fn compose_params<'a>(
-        mounts: &'a [&'a config::ResolvedMount],
-        env_vars: &'a [config::ScopedValue<&'a config::EnvVar>],
-    ) -> ComposeParams<'a> {
-        ComposeParams {
-            dockerfile: Path::new("/cache/Dockerfile"),
-            build_context: Path::new("/cache"),
-            mounts,
-            env_vars,
-            image: BASE_IMAGE,
-            working_dir: "/workspace/x-1",
-            entrypoint: "pi",
-            prompt_flag: "--append-system-prompt",
-            profile_args: &[],
-            agent_args: &[],
-        }
-    }
-
     #[test]
-    fn generate_compose_places_profile_args_before_cli_args() {
+    fn agent_command_places_profile_args_before_cli_args() {
         let profile_args = vec!["--provider".to_string(), "amazon-bedrock".to_string()];
         let cli_args = vec!["--model".to_string(), "override".to_string()];
-        let mut params = compose_params(&[], &[]);
-        params.profile_args = &profile_args;
-        params.agent_args = &cli_args;
-        let yaml = generate_compose(params);
-
-        let prompt = yaml.find(PROMPT_TARGET).expect("prompt target missing");
-        let provider = yaml.find("amazon-bedrock").expect("profile arg missing");
-        let model = yaml.find("override").expect("cli arg missing");
-        assert!(
-            prompt < provider && provider < model,
-            "expected prompt < profile arg < cli arg, got {yaml}"
+        let command = agent_command(config::Agent::Pi, &profile_args, &cli_args);
+        assert_eq!(
+            command,
+            [
+                "--append-system-prompt",
+                PROMPT_TARGET,
+                "--provider",
+                "amazon-bedrock",
+                "--model",
+                "override"
+            ]
         );
     }
 
     #[test]
-    fn directory_mask_binds_an_empty_dir() {
-        let workspace = tempfile::tempdir().unwrap();
-        fs_err::create_dir_all(workspace.path().join("node_modules")).unwrap();
-        let mask = config::ResolvedMount {
-            source: PathBuf::from(config::MASK_SOURCE),
-            target: "/workspace/slug/node_modules".to_string(),
-            writable: false,
-        };
-
-        let emitted = elide_directory_masks(&[&mask], Path::new("/session/empty"), |_| {
-            Some(workspace.path().join("node_modules"))
-        });
-
-        assert_eq!(emitted[0].source, PathBuf::from("/session/empty"));
-        assert_eq!(emitted[0].target, mask.target);
-    }
-
-    #[test]
-    fn file_mask_still_binds_dev_null() {
-        let workspace = tempfile::tempdir().unwrap();
-        fs_err::write(workspace.path().join(".envrc"), "export FOO=1").unwrap();
-        let mask = config::ResolvedMount {
-            source: PathBuf::from(config::MASK_SOURCE),
-            target: "/workspace/slug/.envrc".to_string(),
-            writable: false,
-        };
-
-        let emitted = elide_directory_masks(&[&mask], Path::new("/session/empty"), |_| {
-            Some(workspace.path().join(".envrc"))
-        });
-
-        assert_eq!(emitted[0].source, PathBuf::from(config::MASK_SOURCE));
-    }
-
-    #[test]
-    fn a_mask_over_nothing_nameable_binds_dev_null() {
-        let mask = config::ResolvedMount {
-            source: PathBuf::from(config::MASK_SOURCE),
-            target: "/root/.config/nowhere".to_string(),
-            writable: false,
-        };
-
-        let emitted = elide_directory_masks(&[&mask], Path::new("/session/empty"), |_| None);
-
-        assert_eq!(emitted[0].source, PathBuf::from(config::MASK_SOURCE));
-    }
-
-    #[test]
-    fn generate_compose_long_form_binds() {
-        let mount = config::ResolvedMount {
-            source: PathBuf::from("/host/.config/git"),
-            target: "/root/.config/git".into(),
-            writable: false,
-        };
-        let yaml = generate_compose(compose_params(&[&mount], &[]));
-        assert!(yaml.contains("type: bind"), "{yaml}");
-        assert!(yaml.contains("source: /host/.config/git"), "{yaml}");
-        assert!(yaml.contains("target: /root/.config/git"), "{yaml}");
-        assert!(yaml.contains("read_only: true"), "{yaml}");
-        assert!(yaml.contains("working_dir: /workspace/x-1"), "{yaml}");
-    }
-
-    #[test]
-    fn generate_compose_env_passthrough_is_a_bare_name() {
-        let with_value = config::EnvVar {
-            name: "FOO".into(),
-            value: Some("bar".into()),
-        };
-        let passthrough = config::EnvVar {
-            name: "GITHUB_TOKEN".into(),
-            value: None,
-        };
-        let env = [
-            config::ScopedValue {
-                scope: config::Scope::User,
-                value: &with_value,
-            },
-            config::ScopedValue {
-                scope: config::Scope::Profile,
-                value: &passthrough,
-            },
-        ];
-        let yaml = generate_compose(compose_params(&[], &env));
-        assert!(yaml.contains("- FOO=bar"), "{yaml}");
-        assert!(yaml.contains("- GITHUB_TOKEN\n"), "{yaml}");
-        assert!(!yaml.contains("GITHUB_TOKEN="), "{yaml}");
-    }
-
-    #[test]
-    fn generate_compose_sets_the_agent_entrypoint() {
-        let mut params = compose_params(&[], &[]);
-        params.entrypoint = "claude";
-        params.prompt_flag = "--append-system-prompt-file";
-        let yaml = generate_compose(params);
-        // One image carries both agents; the compose entrypoint picks one.
-        assert!(yaml.contains("entrypoint:\n    - claude"), "{yaml}");
-        // Claude needs the -file variant: the plain flag would append the
-        // literal path string instead of the prompt contents.
-        assert!(yaml.contains("--append-system-prompt-file"), "{yaml}");
-        assert!(yaml.contains(PROMPT_TARGET), "{yaml}");
+    fn agent_command_gives_claude_the_prompt_file_flag() {
+        let command = agent_command(config::Agent::Claude, &[], &[]);
+        assert_eq!(command, ["--append-system-prompt-file", PROMPT_TARGET]);
     }
 
     #[test]
