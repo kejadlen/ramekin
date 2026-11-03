@@ -86,7 +86,7 @@ The Apple runtime needs its system services running (`container system start`). 
 
 Agent config comes from the host's own dirs — the agents are also used locally, so their config already exists where they look for it. The config-shaped entries mount read-only at their normal paths inside the container:
 
-- pi: `~/.pi/agent/` — `AGENTS.md`, `settings.json`, `models.json`, `keybindings.json`, `extensions/`, `skills/`
+- pi: `~/.pi/agent/` — `AGENTS.md`, `settings.json`, `models.json`, `keybindings.json`, `extensions/`, `skills/`, `git/` (the clones of the git packages named in `settings.json`, so the container runs whatever the host pi has installed)
 - claude: `~/.claude/` — `CLAUDE.md`, `settings.json`, `skills/`, `agents/`, `commands/`, `hooks/`
 
 Ramekin keeps no parallel copy — edit the host files (or the dotfiles they symlink to) and the next session sees the changes. The rest of each host dir is runtime state (credentials, transcripts) and never enters the container. Project-level agent config (`.claude/`, `CLAUDE.md`, `AGENTS.md` in the repo) rides the workspace mount; the agents layer it themselves.
@@ -101,7 +101,6 @@ The two agents get opposite persistence policies, chosen by failure mode.
 
 - `auth.json` — global, at `$XDG_DATA_HOME/ramekin/agents/pi/auth.json`, so the containerized agent keeps its own credentials (separate from the host's)
 - `models-store.json` — global, alongside `auth.json`; pi's model catalog cache, rebuilt from scratch every session otherwise
-- `git/` — global, alongside `auth.json`; the clones of the git packages named in pi's `settings.json`, so package fetching isn't paid on every start
 - `sessions/` — per-repo, at `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`
 
 On teardown, ramekin logs anything else the agent wrote to its session dir before discarding it, so a path that deserves persistence gets noticed rather than silently vanishing.

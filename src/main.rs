@@ -39,10 +39,6 @@ const CLAUDE_EPHEMERAL: &[&str] = &["statsig", "todos", "shell-snapshots", "debu
 /// writes shows up in the teardown report as a candidate for this list.
 const PI_PERSISTENT_FILES: &[&str] = &["auth.json", "models-store.json"];
 
-/// Where pi clones the git packages named in its `settings.json`. Persisted
-/// because re-cloning every package on every session start is pure latency.
-const PI_PACKAGES_DIR: &str = "git";
-
 #[derive(Parser)]
 #[command(about = "Run a coding agent (pi or Claude Code) in a containerized environment", version = VERSION)]
 struct Cli {
@@ -198,8 +194,7 @@ fn agent_label(report: &outbox::Report) -> &'static str {
 enum AgentState {
     Pi {
         /// `$XDG_DATA_HOME/ramekin/agents/pi/`; holds the global state that
-        /// survives across sessions — `PI_PERSISTENT_FILES` and the package
-        /// checkouts under `PI_PACKAGES_DIR`.
+        /// survives across sessions — `PI_PERSISTENT_FILES`.
         state_dir: PathBuf,
         /// `$XDG_DATA_HOME/ramekin/repos/<slug>/sessions/`.
         repo_sessions_dir: PathBuf,
@@ -240,7 +235,6 @@ impl AgentState {
             } => {
                 fs_err::create_dir_all(state_dir).into_diagnostic()?;
                 fs_err::create_dir_all(repo_sessions_dir).into_diagnostic()?;
-                fs_err::create_dir_all(state_dir.join(PI_PACKAGES_DIR)).into_diagnostic()?;
 
                 // Migrate auth from the pre-redesign location
                 // (~/.config/ramekin/agent/auth.json) before the init below
@@ -311,10 +305,6 @@ impl AgentState {
                         format!("{}/{name}", config::PI_AGENT_DIR),
                     )
                 }));
-                mounts.push(rw(
-                    state_dir.join(PI_PACKAGES_DIR),
-                    format!("{}/{PI_PACKAGES_DIR}", config::PI_AGENT_DIR),
-                ));
                 mounts.push(rw(
                     repo_sessions_dir.clone(),
                     format!("{}/sessions", config::PI_AGENT_DIR),
@@ -1297,9 +1287,6 @@ mod tests {
             assert_eq!(m.source, PathBuf::from(format!("/data/agents/pi/{name}")));
             assert!(m.writable);
         }
-
-        let packages = target("/root/.pi/agent/git").expect("packages mount");
-        assert_eq!(packages.source, PathBuf::from("/data/agents/pi/git"));
 
         let sessions = target("/root/.pi/agent/sessions").expect("sessions mount");
         assert_eq!(sessions.source, PathBuf::from("/data/repos/x-1/sessions"));

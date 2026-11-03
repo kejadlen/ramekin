@@ -79,6 +79,8 @@ impl Agent {
                 "keybindings.json",
                 "extensions",
                 "skills",
+                // Package clones named in settings.json; the host pi keeps them current.
+                "git",
             ],
             Self::Claude => &[
                 "CLAUDE.md",
