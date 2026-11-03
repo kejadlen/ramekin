@@ -9,9 +9,10 @@ Ramekin is a containerized harness for running coding agents — the [pi coding 
 ```
 Cargo.toml              # Single-crate workspace
 src/
-  main.rs               # CLI: agent state, image builds, compose generation, outbox commands
+  main.rs               # CLI: agent state, session assembly, outbox commands
   config.rs             # KDL parsing, config layers, profiles, mount resolution and merging
   outbox.rs             # Pending config problem reports: scan, show, discard
+  runtime.rs            # Container runtimes (Docker, Apple): image builds, session runs, compose generation
 build.rs                # Sets RAMEKIN_VERSION from env or git rev
 assets/
   Dockerfile            # Base image: both agents (+ claude managed settings, IS_SANDBOX)
@@ -44,11 +45,12 @@ just           # All four
 ## Architecture notes
 
 - The config redesign is documented in `docs/config-redesign.md`; all four steps of its sequencing are implemented.
-- Config files are parsed directly with the `kdl` crate (`parse_config` in `config.rs`), not serde: the grammar is `mounts` blocks (one child node per mount: name = host source, `target`/`writable` properties), one `env` block syntax (bare child = host passthrough), and `profile` nodes (with children = definition carrying `agent`/`env`/`mounts`/`args`, bare = selection). Unknown nodes fail loudly.
+- Config files are parsed directly with the `kdl` crate (`parse_config` in `config.rs`), not serde: the grammar is `mounts` blocks (one child node per mount: name = host source, `target`/`writable` properties), one `env` block syntax (bare child = host passthrough), `profile` nodes (with children = definition carrying `agent`/`env`/`mounts`/`args`, bare = selection), and a `runtime` node. Unknown nodes fail loudly.
 - Config merges layers, lowest precedence first: binary (staples `~/.config/git`/`~/.config/jj` plus the active agent's config allowlist, mounted read-only, canonicalized, skip-if-missing), profile (the active profile's env, mounts, and args), user (every `*.kdl` in `~/.config/ramekin/`, merged as one layer, duplicate keys within the layer are errors), and project (`.ramekin/config.kdl`). A `/dev/null` source masks (removes) a mount inherited from a lower layer. `env` merges per variable; profiles merge by name, last writer takes the whole definition.
 - Profiles subsume agent selection: the binary ships trivial `pi`/`claude` profiles, selection precedence is binary < user < project < `-p`. `Agent` (in `config.rs`) carries each agent's host config dir, allowlist, and container config dir; `AgentState` (in `main.rs`) carries its persistent host paths and session mounts.
 - Persistence is per-agent, opposite policies: pi is ephemeral-by-default (fresh session dir at `/root/.pi/agent`; allowlisted `auth.json` from `$XDG_DATA_HOME/ramekin/agents/pi/` and per-repo `sessions/` bound on top; teardown logs discarded writes). Claude is persist-by-default (`~/.claude` + `~/.claude.json` from `$XDG_DATA_HOME/ramekin/agents/`, shared across repos; session-scoped dirs bound over the `CLAUDE_EPHEMERAL` denylist).
 - Each workspace mounts at `/workspace/<slug>` (slug is `<dirname>-<hash>`, never a shared `/workspace`) so cwd-keyed agent state stays distinct per repo; compose's `working_dir` puts the agent there on start.
+- The `Runtime` enum (`src/runtime.rs`) is the seam between session assembly and the container CLI: `main.rs` builds a `runtime::Session` (binds, masks, env, command) and the runtime renders it. A top-level `runtime "docker"|"apple"` KDL node selects it, highest layer wins, Docker by default. Apple runs one foreground `container run -it --rm`, mounts with `-v` (its `--mount` rejects single files), and hides masks with `--masked-path` because the host's `/dev/null` doesn't survive its VM boundary.
 - Docker compose config is generated at runtime via `serde_yaml` over a typed `ComposeConfig` struct, not a static file. Volume mounts use the long-form bind syntax (`{type: bind, source, target, read_only}`), ordered lexicographically by target so parents precede children. Passthrough env vars render as bare names in the environment list.
 - One base image (`ramekin-agent`) carries both agents; it has no ENTRYPOINT, and the generated compose config sets `entrypoint` to `pi` or `claude` per session. A project `.ramekin/Dockerfile` builds `FROM ramekin-agent` with a repo-specific tag. Image builds forward a host GitHub token (env vars or `gh auth token`) as a BuildKit secret for API calls.
 - The outbox (`src/outbox.rs`) is the agent's only channel back to shared config: each session mounts a fresh dir at `/root/.ramekin/outbox` where the agent writes Markdown problem reports (not fixes); an `.agent` sidecar written outside the mount records whose config they concern; `ramekin outbox list|show|discard` reviews them.

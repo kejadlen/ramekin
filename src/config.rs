@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use kdl::{KdlDocument, KdlNode};
 use miette::{Context, IntoDiagnostic, Result, bail, ensure, miette};
 
+use crate::runtime::Runtime;
+
 /// Configuration scope, ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
@@ -265,6 +267,8 @@ pub struct ScopedConfig {
     pub selected_by: Option<Scope>,
     /// The active profile.
     pub profile: Profile,
+    /// The container runtime, from the highest layer that names one.
+    pub runtime: ScopedValue<Runtime>,
 }
 
 impl ScopedConfig {
@@ -367,7 +371,17 @@ impl ScopedConfig {
         // came from.
         let mut profile_files: BTreeMap<String, PathBuf> = BTreeMap::new();
         let mut selection = (DEFAULT_PROFILE.to_string(), Some(Scope::Binary));
+        let mut runtime = ScopedValue {
+            scope: Scope::Binary,
+            value: Runtime::Docker,
+        };
         for builder in &builders {
+            if let Some(value) = builder.runtime {
+                runtime = ScopedValue {
+                    scope: builder.scope,
+                    value,
+                };
+            }
             for profile in &builder.profiles {
                 profiles.insert(
                     profile.name.clone(),
@@ -428,6 +442,7 @@ impl ScopedConfig {
             profiles,
             selected_by,
             profile,
+            runtime,
         };
         config.check_configured_mount_sources(&profile_files)?;
         Ok(config)
@@ -594,6 +609,7 @@ struct LayerBuilder {
     caches: Vec<Cache>,
     cache_names: BTreeSet<CacheName>,
     selection: Option<String>,
+    runtime: Option<Runtime>,
 }
 
 impl LayerBuilder {
@@ -611,6 +627,7 @@ impl LayerBuilder {
             caches: Vec::new(),
             cache_names: BTreeSet::new(),
             selection: None,
+            runtime: None,
         }
     }
 
@@ -683,6 +700,15 @@ impl LayerBuilder {
             );
             self.selection = Some(name);
         }
+        for runtime in raw.runtimes {
+            ensure!(
+                self.runtime.is_none(),
+                "{}: the {} layer selects a runtime twice",
+                file.display(),
+                self.scope,
+            );
+            self.runtime = Some(runtime);
+        }
         Ok(())
     }
 
@@ -709,6 +735,7 @@ struct RawConfig {
     caches: Vec<Cache>,
     profiles: Vec<Profile>,
     selections: Vec<String>,
+    runtimes: Vec<Runtime>,
 }
 
 fn parse_file(path: &Path) -> Result<RawConfig> {
@@ -726,6 +753,14 @@ fn parse_config(content: &str) -> Result<RawConfig> {
             "mounts" => raw.mounts.extend(parse_mounts(node)?),
             "env" => raw.env.extend(parse_env(node)?),
             "cache" => raw.caches.extend(parse_cache(node)?),
+            "runtime" => {
+                ensure!(
+                    node.children().is_none(),
+                    "`runtime` takes a value (runtime \"apple\"), not a block"
+                );
+                raw.runtimes
+                    .push(Runtime::parse(&single_string_arg(node)?)?);
+            }
             // `profile "name" { ... }` defines; `profile "name"` selects.
             "profile" => match parse_profile(node)? {
                 ProfileNode::Definition(profile) => raw.profiles.push(profile),
@@ -1081,6 +1116,10 @@ mod tests {
             layers,
             profiles: BTreeMap::new(),
             selected_by: Some(Scope::Binary),
+            runtime: ScopedValue {
+                scope: Scope::Binary,
+                value: Runtime::Docker,
+            },
             profile: Profile {
                 name: DEFAULT_PROFILE.into(),
                 agent: Agent::Pi,
@@ -1920,6 +1959,55 @@ mod tests {
         let raw = parse_config(r#"profile "pi-glm""#).unwrap();
         assert!(raw.profiles.is_empty());
         assert_eq!(raw.selections, vec!["pi-glm".to_string()]);
+    }
+
+    #[test]
+    fn runtime_defaults_to_docker() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ScopedConfig::load_from(None, dir.path(), WS, None).unwrap();
+        assert_eq!(config.runtime.value, Runtime::Docker);
+        assert_eq!(config.runtime.scope, Scope::Binary);
+    }
+
+    #[test]
+    fn project_runtime_beats_user_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        fs_err::write(home.path().join("config.kdl"), "runtime \"apple\"\n").unwrap();
+        let user_only = tempfile::tempdir().unwrap();
+        let config =
+            ScopedConfig::load_from(Some(home.path()), user_only.path(), WS, None).unwrap();
+        assert_eq!(config.runtime.value, Runtime::Apple);
+        assert_eq!(config.runtime.scope, Scope::User);
+
+        let workspace = tempfile::tempdir().unwrap();
+        fs_err::create_dir_all(workspace.path().join(".ramekin")).unwrap();
+        fs_err::write(
+            workspace.path().join(".ramekin/config.kdl"),
+            "runtime \"docker\"\n",
+        )
+        .unwrap();
+        let config =
+            ScopedConfig::load_from(Some(home.path()), workspace.path(), WS, None).unwrap();
+        assert_eq!(config.runtime.value, Runtime::Docker);
+        assert_eq!(config.runtime.scope, Scope::Project);
+    }
+
+    #[test]
+    fn runtime_named_twice_in_a_layer_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        fs_err::write(home.path().join("a.kdl"), "runtime \"apple\"\n").unwrap();
+        fs_err::write(home.path().join("b.kdl"), "runtime \"docker\"\n").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let err =
+            ScopedConfig::load_from(Some(home.path()), workspace.path(), WS, None).unwrap_err();
+        assert!(err.to_string().contains("runtime twice"), "{err}");
+    }
+
+    #[test]
+    fn malformed_runtime_is_rejected() {
+        assert!(parse_config(r#"runtime "podman""#).is_err());
+        assert!(parse_config("runtime").is_err());
+        assert!(parse_config(r#"runtime "apple" { x }"#).is_err());
     }
 
     #[test]

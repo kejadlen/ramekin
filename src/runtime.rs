@@ -1,5 +1,6 @@
 //! Container runtimes: how an image gets built and a session gets run.
 
+use std::fmt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -13,6 +14,14 @@ use crate::config;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Runtime {
     Docker,
+    /// Apple's `container` CLI, which runs each container in its own VM.
+    Apple,
+}
+
+impl fmt::Display for Runtime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
 }
 
 /// An image to build.
@@ -56,6 +65,23 @@ pub struct Session<'a> {
 }
 
 impl Runtime {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "docker" => Ok(Self::Docker),
+            "apple" => Ok(Self::Apple),
+            other => {
+                bail!("unknown runtime `{other}` (expected `docker` or `apple`)");
+            }
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Apple => "apple",
+        }
+    }
+
     pub fn build(&self, build: &Build) -> Result<()> {
         let mut cmd = Command::new(self.program());
         cmd.args(["build", "-t", build.tag, "-f"])
@@ -86,14 +112,82 @@ impl Runtime {
     pub fn run(&self, session: &Session) -> Result<ExitStatus> {
         match self {
             Self::Docker => docker_run(session),
+            Self::Apple => apple_run(session),
         }
     }
 
     fn program(&self) -> &'static str {
         match self {
             Self::Docker => "docker",
+            Self::Apple => "container",
         }
     }
+}
+
+/// One foreground `container run`: Apple's CLI has no compose, and a single
+/// attached `--rm` container covers compose's up, attach, and down.
+fn apple_run(session: &Session) -> Result<ExitStatus> {
+    Command::new("container")
+        .args(apple_run_args(session)?)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .into_diagnostic()
+        .wrap_err("failed to run `container run`")
+}
+
+fn apple_run_args(session: &Session) -> Result<Vec<String>> {
+    let mut args: Vec<String> = ["run", "-it", "--rm", "--name", session.name]
+        .into_iter()
+        .chain(["--workdir", session.working_dir])
+        .chain(["--entrypoint", session.entrypoint])
+        .map(str::to_string)
+        .collect();
+
+    // `--mount type=bind` rejects single files, which ramekin mounts plenty
+    // of; `-v` takes both, at the cost of the colon-delimited short form.
+    for bind in session.binds {
+        let source = bind.source.display().to_string();
+        if source.contains(':') || bind.target.contains(':') {
+            bail!(
+                "can't mount {source} at {}: the apple runtime's -v syntax can't \
+                 express a path containing a colon",
+                bind.target
+            );
+        }
+        let mode = if bind.writable { "" } else { ":ro" };
+        args.push("-v".into());
+        args.push(format!("{source}:{}{mode}", bind.target));
+    }
+
+    // Binding the host's /dev/null doesn't survive the VM boundary (reads
+    // fail with ENXIO), so masks use the runtime's own: `--masked-path`
+    // gives a file the guest's /dev/null and a directory an empty read-only
+    // tmpfs. A writable directory mask needs a writable tmpfs instead.
+    for mask in session.masks {
+        let flag = if mask.over_dir && mask.writable {
+            "--tmpfs"
+        } else {
+            "--masked-path"
+        };
+        args.push(flag.into());
+        args.push(mask.target.clone());
+    }
+
+    // A bare name inherits the host's value, and stays unset when the host
+    // doesn't have it either.
+    for sv in session.env {
+        args.push("-e".into());
+        args.push(match &sv.value.value {
+            Some(value) => format!("{}={value}", sv.value.name),
+            None => sv.value.name.clone(),
+        });
+    }
+
+    args.push(session.image.to_string());
+    args.extend(session.command.iter().cloned());
+    Ok(args)
 }
 
 fn docker_run(session: &Session) -> Result<ExitStatus> {
@@ -345,5 +439,126 @@ mod tests {
         let parent = yaml.find("target: /workspace/slug\n").expect("{yaml}");
         let child = yaml.find("target: /workspace/slug/.envrc").expect("{yaml}");
         assert!(parent < child, "{yaml}");
+    }
+
+    #[test]
+    fn runtime_names_round_trip() {
+        for runtime in [Runtime::Docker, Runtime::Apple] {
+            assert_eq!(Runtime::parse(runtime.name()).unwrap(), runtime);
+        }
+        let err = Runtime::parse("podman").unwrap_err();
+        assert!(err.to_string().contains("podman"), "{err}");
+    }
+
+    #[test]
+    fn apple_run_renders_a_foreground_session() {
+        let binds = [
+            config::ResolvedMount {
+                source: PathBuf::from("/host/repo"),
+                target: "/workspace/slug".into(),
+                writable: true,
+            },
+            config::ResolvedMount {
+                source: PathBuf::from("/host/state.json"),
+                target: "/root/.claude.json".into(),
+                writable: false,
+            },
+        ];
+        let foo = config::EnvVar {
+            name: "FOO".into(),
+            value: Some("bar".into()),
+        };
+        let token = config::EnvVar {
+            name: "GITHUB_TOKEN".into(),
+            value: None,
+        };
+        let env = [
+            config::ScopedValue {
+                scope: config::Scope::User,
+                value: &foo,
+            },
+            config::ScopedValue {
+                scope: config::Scope::User,
+                value: &token,
+            },
+        ];
+        let command = ["--append-system-prompt".to_string(), "/p.md".to_string()];
+        let mut session = session(&binds, &[], &env);
+        session.command = &command;
+
+        let args = apple_run_args(&session).unwrap();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "-it",
+                "--rm",
+                "--name",
+                "ramekin-test",
+                "--workdir",
+                "/workspace/x-1",
+                "--entrypoint",
+                "pi",
+                "-v",
+                "/host/repo:/workspace/slug",
+                "-v",
+                "/host/state.json:/root/.claude.json:ro",
+                "-e",
+                "FOO=bar",
+                "-e",
+                "GITHUB_TOKEN",
+                "ramekin-agent",
+                "--append-system-prompt",
+                "/p.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn apple_masks_use_the_runtimes_own_flags() {
+        let masks = [
+            Mask {
+                target: "/workspace/slug/.envrc".into(),
+                over_dir: false,
+                writable: false,
+            },
+            Mask {
+                target: "/workspace/slug/secrets".into(),
+                over_dir: true,
+                writable: false,
+            },
+            Mask {
+                target: "/workspace/slug/node_modules".into(),
+                over_dir: true,
+                writable: true,
+            },
+        ];
+        let args = apple_run_args(&session(&[], &masks, &[]))
+            .unwrap()
+            .join(" ");
+        assert!(
+            args.contains("--masked-path /workspace/slug/.envrc"),
+            "{args}"
+        );
+        assert!(
+            args.contains("--masked-path /workspace/slug/secrets"),
+            "{args}"
+        );
+        assert!(
+            args.contains("--tmpfs /workspace/slug/node_modules"),
+            "{args}"
+        );
+        assert!(!args.contains("/dev/null"), "{args}");
+    }
+
+    #[test]
+    fn apple_run_rejects_a_colon_in_a_mount_path() {
+        let binds = [config::ResolvedMount {
+            source: PathBuf::from("/host/a:b"),
+            target: "/a".into(),
+            writable: false,
+        }];
+        let err = apple_run_args(&session(&binds, &[], &[])).unwrap_err();
+        assert!(err.to_string().contains("/host/a:b"), "{err}");
     }
 }

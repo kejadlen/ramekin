@@ -581,6 +581,13 @@ impl Ramekin {
         }
 
         println!();
+        println!("Runtime");
+        println!(
+            "  {} (selected by {})",
+            self.config.runtime.value, self.config.runtime.scope
+        );
+
+        println!();
         println!("Ramekin directories");
         for (label, path) in self.agent_state.state_labels() {
             println!("  {label} {}", path.display());
@@ -718,7 +725,7 @@ impl Ramekin {
             info!("authenticated GitHub API for image build");
         }
 
-        let runtime = runtime::Runtime::Docker;
+        let runtime = self.config.runtime.value;
         if rebuild {
             info!("rebuilding base image (no cache)");
         } else {

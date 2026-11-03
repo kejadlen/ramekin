@@ -12,15 +12,15 @@ ramekin run --rebuild  # force a full image rebuild
 ramekin -- --model X   # forward extra args to the agent
 ```
 
-Ramekin builds a Docker image with the agent and its dependencies, starts it via Docker Compose, and attaches your terminal. Auth tokens and session history persist across runs.
+Ramekin builds a container image with the agent and its dependencies, starts it with Docker (or [Apple containers](#runtime)), and attaches your terminal. Auth tokens and session history persist across runs.
 
 ## How it works
 
-A Rust CLI orchestrates a Docker Compose stack. On each run it:
+A Rust CLI drives the container runtime. On each run it:
 
 1. Resolves the active profile (which picks the agent) and merges config layers
 2. Builds the base image (`ramekin-agent`, carrying both agents), and a project-specific layer if one exists
-3. Generates a compose config, renders the system prompt, and creates fresh agent dirs, all in a session-scoped cache directory
+3. Renders the system prompt and creates fresh agent dirs (plus, under Docker, a compose config), all in a session-scoped cache directory
 4. Starts the agent container with the workspace mounted at `/workspace/<slug>` (where `<slug>` is `<dirname>-<hash>`, so cwd-keyed agent state never collides across repos)
 5. Attaches interactively, then tears down on exit — logging any state the agent wrote to its session-scoped dirs before discarding it, and keeping any config problem reports the agent left in its outbox
 
@@ -30,7 +30,7 @@ Concurrent sessions don't interfere: everything a run touches is either read-onl
 
 `run` (default) starts a containerized agent session. Pass `--rebuild` to ignore Docker layer cache and pull fresh base images, `-p <profile>` to pick a profile for this run.
 
-`config` prints the active profile, resolved paths, volume mounts, and Dockerfile status without starting (or mutating) anything — useful for debugging mount issues.
+`config` prints the active profile, runtime, resolved paths, volume mounts, and Dockerfile status without starting (or mutating) anything — useful for debugging mount issues.
 
 `outbox` reviews config problems reported by agents — see [Outbox](#outbox).
 
@@ -70,6 +70,17 @@ A bare `profile "name"` node (no block) *selects* a profile. Selection precedenc
 Profiles merge by name across layers and the last writer takes the whole definition. Fine-grained tweaks (one env var) go through the ordinary layered `env`, which overlays the active profile's env per variable.
 
 Provider credentials never appear in config: passthrough env forwards host values at run time, mounts carry their own files, and OAuth lives in the container's persistent agent state.
+
+### Runtime
+
+Ramekin runs sessions under Docker by default. To use Apple's [`container`](https://github.com/apple/container) CLI instead, set the runtime in any config layer; the highest layer that names one wins:
+
+```kdl
+// ~/.config/ramekin/config.kdl
+runtime "apple"
+```
+
+The Apple runtime needs its system services running (`container system start`). Each session is a single foreground `container run`, with no compose. Mounts, env, masks, and custom Dockerfiles behave the same under both runtimes. Under Apple, a host path containing a colon can't be mounted, and ramekin reports an error instead of starting.
 
 ### Agent config
 
