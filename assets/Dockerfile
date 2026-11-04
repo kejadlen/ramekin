@@ -44,6 +44,29 @@ RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
     curl -fsSL "https://github.com/jj-vcs/jj/releases/download/${JJ_VERSION}/jj-${JJ_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
       | tar xz --strip-components=0 -C /usr/local/bin ./jj
 
+# Trixie's apt git (2.47) lags upstream. Build the latest stable tag from
+# source into /usr/local, which shadows /usr/bin/git via PATH. The apt git
+# stays installed so its runtime libraries (libcurl, libexpat, zlib) are
+# present; git/git has no /releases/latest, so resolve via ls-remote.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=cache,target=/tmp/downloads \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    libcurl4-openssl-dev \
+    libexpat1-dev \
+    zlib1g-dev \
+    && GIT_VERSION=$(git ls-remote --tags https://github.com/git/git.git 'v*' \
+      | grep -v '\^{}' | grep -vE -- '-rc|-windows' | cut -d/ -f3 | sort -V | tail -1) \
+    && curl -fsSL -o /tmp/downloads/git.tar.gz \
+      "https://github.com/git/git/archive/refs/tags/${GIT_VERSION}.tar.gz" \
+    && tar xzf /tmp/downloads/git.tar.gz -C /tmp \
+    && cd /tmp/git-${GIT_VERSION#v} \
+    && make prefix=/usr/local NO_GETTEXT=1 NO_TCLTK=1 -j"$(nproc)" all \
+    && make prefix=/usr/local NO_GETTEXT=1 NO_TCLTK=1 install \
+    && rm -rf /tmp/git-${GIT_VERSION#v} \
+    && git --version
+
 # pi publishes under @earendil-works. The older @mariozechner scope still
 # resolves and still carries the `latest` tag, so it looks current, but it's
 # abandoned at 0.73.1 — far enough behind that host extensions fail to load
