@@ -48,6 +48,8 @@ RUN --mount=type=secret,id=github-token,target=/run/secrets/github-token \
 # source into /usr/local, which shadows /usr/bin/git via PATH. The apt git
 # stays installed so its runtime libraries (libcurl, libexpat, zlib) are
 # present; git/git has no /releases/latest, so resolve via ls-remote.
+# NO_RUST skips the optional Rust components, which need cargo; Git 3.0 will
+# make Rust mandatory, so this step will need a toolchain then.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/tmp/downloads \
@@ -62,8 +64,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       "https://github.com/git/git/archive/refs/tags/${GIT_VERSION}.tar.gz" \
     && tar xzf /tmp/downloads/git.tar.gz -C /tmp \
     && cd /tmp/git-${GIT_VERSION#v} \
-    && make prefix=/usr/local NO_GETTEXT=1 NO_TCLTK=1 -j"$(nproc)" all \
-    && make prefix=/usr/local NO_GETTEXT=1 NO_TCLTK=1 install \
+    && make prefix=/usr/local NO_GETTEXT=1 NO_TCLTK=1 NO_RUST=1 -j"$(nproc)" all \
+    && make prefix=/usr/local NO_GETTEXT=1 NO_TCLTK=1 NO_RUST=1 install \
     && rm -rf /tmp/git-${GIT_VERSION#v} \
     && git --version
 
