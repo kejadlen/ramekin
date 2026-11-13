@@ -21,7 +21,7 @@ clippy.toml             # Disallows std::fs in favor of fs-err
 justfile                # Local dev tasks (check, fmt, clippy, test, install)
 .github/workflows/
   ci.yml                # CI: fmt + clippy + test
-  release.yml           # CalVer release: build macOS binary + DotSlash
+  release.yml           # CalVer release: build macOS + Linux binaries + DotSlash
 ```
 
 ## Build and test

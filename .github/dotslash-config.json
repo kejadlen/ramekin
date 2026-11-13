@@ -5,6 +5,14 @@
         "macos-aarch64": {
           "regex": "^ramekin-aarch64-apple-darwin\\.tar\\.gz$",
           "path": "ramekin"
+        },
+        "linux-x86_64": {
+          "regex": "^ramekin-x86_64-unknown-linux-musl\\.tar\\.gz$",
+          "path": "ramekin"
+        },
+        "linux-aarch64": {
+          "regex": "^ramekin-aarch64-unknown-linux-musl\\.tar\\.gz$",
+          "path": "ramekin"
         }
       }
     }
