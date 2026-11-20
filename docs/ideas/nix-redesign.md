@@ -25,7 +25,7 @@ then a per-repo `FROM ramekin-agent` layer) and **sandboxing** (everything
 else). Nix is good at the first and has nothing to say about the second, so
 this redesign touches only provisioning.
 
-It follows the three tiers from `config-redesign.md`:
+It follows the three tiers from `../config-redesign.md`:
 
 - **The binary** keeps the session model and the bootstrap image.
 - **The host's existing files** hold content — now including the harness
