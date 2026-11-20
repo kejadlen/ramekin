@@ -1,4 +1,4 @@
-FROM node:24-trixie-slim
+FROM node:26-trixie-slim
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
