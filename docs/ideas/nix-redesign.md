@@ -1,0 +1,363 @@
+# Nix redesign
+
+Status: proposed (2026-11) — nothing implemented yet. Assumes every repo
+ramekin runs against carries a `flake.nix`, and that jj repos are colocated
+(so nix sees a `.git`).
+
+## Goals
+
+1. **The repo declares its own environment** — the container's project
+   toolchain is exactly the repo's `devShells.default`, with no second copy
+   in a `.ramekin/Dockerfile`.
+2. **Harness tools stay fresh without hand-maintained pins** — pi and
+   claude-code move fast; today every `--rebuild` pulls latest, and the
+   redesign shouldn't make that worse.
+3. **One mechanism** — tools arrive one way, cache one way, and update one
+   way, instead of apt + curl-the-latest-tag + npm + per-repo Dockerfiles.
+4. **Keep the sandbox** — profiles, mounts, persistence policies, caches,
+   the outbox, and the runtime seam are unaffected.
+
+## Principles
+
+Ramekin today does two jobs: **provisioning** (the base Dockerfile resolving
+latest releases with curl and jq, aarch64 hardcoded, git built from source;
+then a per-repo `FROM ramekin-agent` layer) and **sandboxing** (everything
+else). Nix is good at the first and has nothing to say about the second, so
+this redesign touches only provisioning.
+
+It follows the three tiers from `../config-redesign.md`:
+
+- **The binary** keeps the session model and the bootstrap image.
+- **The host's existing files** hold content — now including the harness
+  tool set, as a flake in dotfiles, next to the agent config it already
+  mounts.
+- **KDL** keeps the remainder, unchanged.
+
+## Design
+
+### Three layers
+
+1. **Image: a bootstrap.** A static `nix` binary installed outside `/nix`,
+   CA certs, the Claude managed settings, `IS_SANDBOX=1`, `RAMEKIN=1`.
+   No git, no agents, no tools. It changes almost never, so per-project
+   image builds and the GitHub-token BuildKit secret go away.
+2. **Harness flake: the agent's tools, on the host.** A flake at
+   `~/.config/ramekin/flake.nix` (symlinked from dotfiles), mounted
+   read-only into the container like the rest of the host config. It
+   layers the harness tools over the project's devShell.
+3. **Project flake: the project's toolchain.** The repo's own `flake.nix`,
+   riding the workspace mount.
+
+### The harness flake
+
+The harness takes the project as an input it never resolves for real —
+ramekin overrides it per session — and builds one shell:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    agents.url = "...";  # a daily-bumped packaging of pi + claude-code
+    # Placeholder; ramekin overrides it with the workspace every session.
+    project.url = "github:kejadlen/ramekin?dir=nix/empty-project";
+  };
+
+  outputs = { nixpkgs, agents, project, ... }:
+    let
+      forLinux = nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ];
+    in {
+      devShells = forLinux (system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          default = pkgs.mkShell {
+            inputsFrom = pkgs.lib.optional
+              (project ? devShells.${system}.default)
+              project.devShells.${system}.default;
+            packages = [
+              agents.packages.${system}.pi
+              agents.packages.${system}.claude-code
+            ] ++ (with pkgs; [
+              git jujutsu ripgrep fd just jq difftastic zizmor bc
+            ]);
+          };
+        });
+    };
+}
+```
+
+- **Git lives here, not in the image.** Nix fetches git repos with its
+  built-in libgit2 (2.20+; confirm against the chosen static build), so the
+  bootstrap doesn't need a `git` binary, and git's version moves with
+  everything else in `flake.lock`.
+- **PATH order is the harness author's call**, made inside one `mkShell`.
+  The sketch puts project tools first, so a repo that pins its own node or
+  git wins.
+- **Repos without a flake** just aren't overridden: the placeholder is an
+  empty flake ramekin publishes at `nix/empty-project/` (`outputs = _: {}`),
+  and the `optional` guard yields the harness tools alone. The same guard
+  covers a flake that defines no linux devShell — `ramekin config` should
+  say so rather than leave it silent.
+- **ranger** isn't in nixpkgs; it needs a flake output of its own (it's
+  ours) or a `fetchurl` of its release in the harness.
+- Ramekin can ship the sketch above as a template:
+  `nix flake init -t github:kejadlen/ramekin`.
+
+### Session
+
+Config resolution is unchanged. A session then runs in two phases against
+a persistent `ramekin-nix` volume holding the store, shared across sessions
+and repos, with the harness dir mounted read-only (target TBD, e.g.
+`/root/.config/ramekin`):
+
+1. **Build.** A short-lived container with `/nix` mounted **writable**, the
+   workspace and harness mounted read-only, and nothing else: no agent, no
+   passthrough env, no agent state, no outbox. It realizes the environment
+   into a per-repo profile and exits:
+
+   ```sh
+   nix develop /root/.config/ramekin \
+     --override-input project /workspace/<slug> \
+     --no-write-lock-file \
+     --profile /nix/var/ramekin/<slug> \
+     -c true
+   ```
+
+2. **Run.** The agent container as today, with `/nix` mounted
+   **read-only**, entering the already-built profile:
+
+   ```sh
+   nix develop /nix/var/ramekin/<slug> -c pi …
+   ```
+
+   Entering a built profile needs no store writes and no evaluation. (Exact
+   invocation to verify; sourcing the profile's `env-bin` rc script
+   directly is the fallback.)
+
+   - The override is the **bare path**, not `path:`. Nix sees a git repo
+     and copies only tracked files; `path:` would copy everything,
+     including `target/` (which a cache shadows inside the workspace) and
+     untracked junk.
+   - `--no-write-lock-file` because the harness is read-only. The harness
+     `flake.lock` is the host's; overriding `project` doesn't need to
+     record anything.
+   - `--profile` keeps the built environment as a per-repo GC root and
+     warm cache. The build phase can skip itself when neither lock nor
+     `flake.nix` changed since the profile was made, so a relaunch costs
+     one container start.
+
+Concurrent builds of the same repo serialize on nix's own store locks; the
+profile swap is an atomic symlink, so a running session keeps the
+environment it started with.
+
+Caches (`cache { target }`) still matter — the host is darwin and the
+container linux — but now only invalidate when the pinned toolchain
+changes.
+
+### Store integrity
+
+Agents run as root in bypass-permissions mode and can be prompt-injected
+(a web page, an issue, a dependency's README). A store they can write is a
+store they can poison: overwrite `git` or `claude` once, and every later
+session in every repo runs that binary, with that repo's workspace and
+passthrough secrets in reach. That breaks the property that a session can
+mostly only hurt its own repo. (Claude's shared, writable `~/.claude` is
+already a smaller hole of the same kind.) More likely than malice is
+accident: an agent running `nix-collect-garbage` to free space sees only
+its own container's processes as roots, so it can delete paths another
+running session is using.
+
+The blast radius is ramekin sessions, not the host — the volume holds linux
+binaries the Mac never executes — and recovery is deleting the volume.
+
+The two-phase session above is the mitigation: the agent never holds a
+writable store, the build container never holds an agent or secrets, and it
+works identically under Docker and Apple with no sidecar. It does not stop
+the project's *flake* from writing the store during the build phase — see
+N1 under the threat model, which adds build users to close that. The cost is ad-hoc
+`nix shell nixpkgs#foo`: a missing tool means editing `flake.nix` and
+relaunching. Alternatives, if that cost bites:
+
+- **Verify at start** — `nix store verify -r --sigs-needed 1` over the
+  profile's closure checks substituted paths against cache.nixos.org
+  signatures, which a root attacker can't forge. Locally built paths (the
+  devShell itself, possibly pi) aren't signed, so this is detection, not
+  prevention. Cheap enough to layer on top of any option.
+- **nix-daemon sidecar** owning the volume, agents mounting the store
+  read-only plus the daemon socket. Keeps `nix shell` working, and fits
+  compose and the planned firewall sidecar — but not Apple's single
+  `container run`.
+- **Per-repo store volumes**, writable. Caps the blast radius at one repo,
+  at the cost of duplicating every toolchain on disk.
+- **Shared writable store**, no hardening. Simplest; accepts both risks.
+
+### Freshness
+
+Bumping is `nix flake update` on the host, in the harness dir. The change is
+a `flake.lock` diff in dotfiles: reviewable, and the same on every machine.
+The agents input should be a packaging that someone (a bot, ideally not us)
+bumps daily, so pi and claude-code stay within a day of latest with no
+hash maintenance. Everything else tracks nixpkgs-unstable.
+
+The project's own `flake.lock` is the project's business; ramekin never
+updates it.
+
+### What changes elsewhere
+
+- **Removed:** most of `assets/Dockerfile`, `.ramekin/Dockerfile` support,
+  `Runtime::build`'s per-project builds and the `Build` struct, GitHub
+  token forwarding, the hardcoded aarch64 downloads.
+- **`--rebuild`** means "drop the cached dev profile for this repo."
+- **`ramekin config`** reports the harness flake, whether the project has a
+  linux devShell, and the dev profile's state, in place of Dockerfile
+  status.
+- **`ramekin gc`** (new) collects garbage in the store volume from a
+  build-phase container, keeping the per-repo profiles. It should refuse
+  while sessions are running, since their in-use paths are invisible to it.
+  Agents can't GC at all.
+- **`ramekin-prompt.md`:** missing *project* tools go in the repo's
+  `flake.nix` (a workspace edit — a normal, reviewable diff, picked up on
+  the next launch); `/nix` is read-only, so there's no `nix shell` for
+  one-offs; problems with *harness* tools go to the outbox, like any other
+  read-only shared config.
+- **Networking:** sessions now reach cache.nixos.org (and the agents
+  input's cache, if it has one) — an allowlist entry once the firewall
+  sidecar exists.
+
+## Threat model
+
+How the design changes `../threat-model.md`. That document describes the
+code as it is, so it gets updated when this lands, not before; this section
+is the delta to apply. A6 (the agent is not trusted) still drives
+everything, and one new fact matters throughout: **a project's flake is
+code, and the build phase runs it.** Both the repo author and a hijacked
+agent (which is encouraged to edit `flake.nix`) can write it.
+
+### New risks
+
+**N1: A project flake poisons the shared store.** *(Addressable)* The
+build phase evaluates the project flake and realizes its devShell with
+`/nix` writable. Any derivation that builds rather than substitutes runs
+its builder there. Nix's build sandbox needs user namespaces, which
+Docker's default seccomp profile blocks, so builders run unsandboxed; in
+single-user mode they run as root and can rewrite any store path —
+including the `git` and `claude` every other repo's session runs. That
+reopens the cross-repo persistence the two-phase session was meant to
+close, one launch after an agent edits `flake.nix` (an R2-shaped loop).
+
+Mitigation: run a nix-daemon *inside the build container* with a
+`nixbld` build-users group. Builders then run as unprivileged users who
+can write only their own outputs, while store paths stay root-owned and
+read-only. This is per-container, so it stays runtime-neutral, and it
+needs no added capabilities. Also pin `accept-flake-config = false` in the
+image's `nix.conf`, so a flake's `nixConfig` can't add a substituter and
+trusted key that serves a poisoned path under a legitimate store hash. The
+R1 trust gate, if built, should hash `flake.nix` and `flake.lock` alongside
+`.ramekin/config.kdl`.
+
+**N2: Tracked files leak into a shared, readable store.** *(Addressable)*
+Evaluating the project flake copies every git-tracked file into
+`/nix/store/<hash>-source`. Masks don't apply to that copy, so a masked
+tracked file (`.envrc`, a `secrets/` dir) is readable at its store path.
+And the store is shared, so repo B's session can read repo A's source.
+Untracked files (`.env`, `target/`) are never copied.
+
+Mitigation: after the build phase, delete the project's source path when
+it isn't in the profile's closure, which is the common case (devShells
+rarely reference `./`). Per-repo store volumes close it fully, at the disk
+cost noted under store integrity. Either way, the threat model should say
+that masks don't cover tracked files once a flake is evaluated.
+
+### Changes to existing risks
+
+- **R2** gains `flake.nix` and `flake.lock` as loop files. Unlike
+  `.ramekin/`, they can't be bound read-only, because editing them is how
+  the agent adds tools. N1's build users are what contain the loop.
+- **R3** gains `shellHook`: a host-side `nix develop` or direnv `use flake`
+  runs whatever an agent put there, and host builds run on the darwin
+  daemon with its relaxed sandbox. This is already true of any repo with
+  a flake and direnv, but the design makes agent edits to `flake.nix`
+  routine. Still Open; review before entering the shell on the host.
+- **R4** gains allowlist entries for the firewall: cache.nixos.org, the
+  agents input's cache, and GitHub for flake inputs. The build container
+  has network access and the read-only workspace, but no credentials.
+- **R5** gains the store as a cross-repo vector. The agent phase can't
+  write it (read-only mount); N1 and N2 cover the build phase.
+- **R7** is unchanged for the workspace. The store volume isn't host
+  filesystem, and nix strips setuid bits from store paths anyway.
+- **R8**'s build-context half disappears with `.ramekin/Dockerfile`. Its
+  flake equivalent is N2.
+- **R9** narrows. Every input is pinned by hash in a `flake.lock`, and
+  substituted paths carry cache.nixos.org signatures, so a compromised
+  release has to land in nixpkgs or the agents input and then survive a
+  reviewed lock bump. Trust shifts to nixpkgs maintainers, the
+  cache.nixos.org key, and whoever bumps the agents input. Still Open,
+  since tracking upstream remains deliberate.
+- **R10** is unchanged, and both phases get the same isolation. Don't
+  grant extra capabilities to make nix's build sandbox work; N1's build
+  users are the substitute.
+- **R11** goes away: no image builds forward a GitHub token. If flake
+  input fetches hit GitHub rate limits, an `access-tokens` entry belongs
+  in the build phase only, never the agent phase.
+- **R12** extends to the harness flake and its lock (read-only mount) and
+  to the built profiles (read-only store in the agent phase).
+
+## Alternatives considered
+
+- **Ramekin's own flake ships the harness tools** (a pinned `agent-tools`
+  set plus a `mkSessionShell` helper). Freshness then depends on bumping
+  ramekin's lock, and the tool set isn't the user's to edit without a
+  release. The harness-on-host version moves the same flake into dotfiles.
+- **Agents outside nix**, npm-installed into a versioned prefix with an
+  atomic `current` symlink, everything else via nix. Keeps today's "latest
+  on rebuild" exactly, but leaves two mechanisms.
+- **Staples from an unlocked nixpkgs** (`nix profile install
+  github:NixOS/nixpkgs/nixpkgs-unstable#…` on rebuild). Fresh with no
+  hashes, but unreproducible across machines.
+- **DotSlash files on the host** for every tool, with git + dotslash in the
+  image. Elegant and lazy, but each file pins a URL and hash, so most tools
+  need a `ramekin tools update` generator, and pi (an npm package) doesn't
+  fit at all.
+- **Build a per-project image on the host** with
+  `dockerTools.streamLayeredImage`. Needs a linux builder on the Mac and a
+  reload on every lock change; in-container builds against the store
+  volume need neither and behave the same under both runtimes.
+
+## Sequencing
+
+1. Write the harness flake (and `nix/empty-project/`), and check it covers
+   everything `assets/Dockerfile` installs. No ramekin changes.
+2. Bootstrap image + store volume + the two-phase session (build container,
+   then a read-only-store agent container), behind a KDL switch
+   (`toolchain "nix"`), alongside the Dockerfile path.
+3. Dev profile caching, `--rebuild` semantics, `ramekin config` reporting,
+   `ramekin gc`, prompt update.
+4. Flip the default; warn when a `.ramekin/Dockerfile` is present.
+5. Delete the Dockerfile path. Ramekin's own `.ramekin/Dockerfile` (rustup)
+   is replaced by a `devShells.default` in this repo's flake.
+
+## Open questions
+
+- **Is losing `nix shell` tolerable?** The read-only store trades it away
+  (see store integrity). If agents keep needing one-offs, the daemon
+  sidecar is the upgrade under Docker.
+- **Build users in the build container.** Does a per-container
+  nix-daemon with `nixbld` users (N1) work in both runtimes without extra
+  capabilities, and how much does it add to a cold build phase?
+- **Apple containers and shared volumes.** Does nix's sqlite locking hold
+  when concurrent Apple-runtime build containers share the store volume?
+  Only build phases write, which narrows the window. Unverified.
+- **Bootstrapping an empty volume.** Docker seeds a named volume from the
+  image on first mount; Apple may not. Installing nix outside `/nix` is
+  meant to make an empty store fine either way — verify.
+- **Packaging pi.** Is there a maintained, daily-bumped packaging (numtide's
+  `llm-agents.nix` may cover both agents — unchecked), or do we
+  `buildNpmPackage` it ourselves?
+- **New files in colocated jj repos.** Nix only sees git-tracked files; a
+  file that's new in jj's working-copy commit may not be in git's index, so
+  a `flake.nix` importing a just-added `.nix` file could fail to evaluate.
+  Test how current jj handles the index.
+- **Eval cost on large repos.** Copying tracked files into the store on
+  every re-evaluation; the dev profile hides relaunches but not lock
+  changes.
+- **Harness mount target and config.** Fixed path, or a KDL node to point
+  at a different harness dir per machine?
