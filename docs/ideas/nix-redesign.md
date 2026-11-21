@@ -104,21 +104,34 @@ ramekin overrides it per session — and builds one shell:
 
 ### Session
 
-Config resolution is unchanged. Materialization adds:
+Config resolution is unchanged. A session then runs in two phases against
+a persistent `ramekin-nix` volume holding the store, shared across sessions
+and repos, with the harness dir mounted read-only (target TBD, e.g.
+`/root/.config/ramekin`):
 
-1. A persistent `ramekin-nix` volume mounted writable at `/nix` — the store,
-   shared across sessions and repos.
-2. The harness dir mounted read-only (target TBD, e.g.
-   `/root/.config/ramekin`).
-3. The agent command becomes:
+1. **Build.** A short-lived container with `/nix` mounted **writable**, the
+   workspace and harness mounted read-only, and nothing else: no agent, no
+   passthrough env, no agent state, no outbox. It realizes the environment
+   into a per-repo profile and exits:
 
    ```sh
    nix develop /root/.config/ramekin \
      --override-input project /workspace/<slug> \
      --no-write-lock-file \
      --profile /nix/var/ramekin/<slug> \
-     -c pi …
+     -c true
    ```
+
+2. **Run.** The agent container as today, with `/nix` mounted
+   **read-only**, entering the already-built profile:
+
+   ```sh
+   nix develop /nix/var/ramekin/<slug> -c pi …
+   ```
+
+   Entering a built profile needs no store writes and no evaluation. (Exact
+   invocation to verify; sourcing the profile's `env-bin` rc script
+   directly is the fallback.)
 
    - The override is the **bare path**, not `path:`. Nix sees a git repo
      and copies only tracked files; `path:` would copy everything,
@@ -128,11 +141,52 @@ Config resolution is unchanged. Materialization adds:
      `flake.lock` is the host's; overriding `project` doesn't need to
      record anything.
    - `--profile` keeps the built environment as a per-repo GC root and
-     warm cache, so a relaunch skips evaluation until a lock changes.
+     warm cache. The build phase can skip itself when neither lock nor
+     `flake.nix` changed since the profile was made, so a relaunch costs
+     one container start.
+
+Concurrent builds of the same repo serialize on nix's own store locks; the
+profile swap is an atomic symlink, so a running session keeps the
+environment it started with.
 
 Caches (`cache { target }`) still matter — the host is darwin and the
 container linux — but now only invalidate when the pinned toolchain
 changes.
+
+### Store integrity
+
+Agents run as root in bypass-permissions mode and can be prompt-injected
+(a web page, an issue, a dependency's README). A store they can write is a
+store they can poison: overwrite `git` or `claude` once, and every later
+session in every repo runs that binary, with that repo's workspace and
+passthrough secrets in reach. That breaks the property that a session can
+mostly only hurt its own repo. (Claude's shared, writable `~/.claude` is
+already a smaller hole of the same kind.) More likely than malice is
+accident: an agent running `nix-collect-garbage` to free space sees only
+its own container's processes as roots, so it can delete paths another
+running session is using.
+
+The blast radius is ramekin sessions, not the host — the volume holds linux
+binaries the Mac never executes — and recovery is deleting the volume.
+
+The two-phase session above is the mitigation: the agent never holds a
+writable store, the build container never holds an agent or secrets, and it
+works identically under Docker and Apple with no daemon. The cost is ad-hoc
+`nix shell nixpkgs#foo`: a missing tool means editing `flake.nix` and
+relaunching. Alternatives, if that cost bites:
+
+- **Verify at start** — `nix store verify -r --sigs-needed 1` over the
+  profile's closure checks substituted paths against cache.nixos.org
+  signatures, which a root attacker can't forge. Locally built paths (the
+  devShell itself, possibly pi) aren't signed, so this is detection, not
+  prevention. Cheap enough to layer on top of any option.
+- **nix-daemon sidecar** owning the volume, agents mounting the store
+  read-only plus the daemon socket. Keeps `nix shell` working, and fits
+  compose and the planned firewall sidecar — but not Apple's single
+  `container run`.
+- **Per-repo store volumes**, writable. Caps the blast radius at one repo,
+  at the cost of duplicating every toolchain on disk.
+- **Shared writable store**, no hardening. Simplest; accepts both risks.
 
 ### Freshness
 
@@ -154,12 +208,15 @@ updates it.
 - **`ramekin config`** reports the harness flake, whether the project has a
   linux devShell, and the dev profile's state, in place of Dockerfile
   status.
-- **`ramekin gc`** (new) collects garbage in the store volume, keeping the
-  per-repo profiles.
+- **`ramekin gc`** (new) collects garbage in the store volume from a
+  build-phase container, keeping the per-repo profiles. It should refuse
+  while sessions are running, since their in-use paths are invisible to it.
+  Agents can't GC at all.
 - **`ramekin-prompt.md`:** missing *project* tools go in the repo's
-  `flake.nix` (a workspace edit — a normal, reviewable diff); one-offs via
-  `nix shell nixpkgs#foo`; problems with *harness* tools go to the outbox,
-  like any other read-only shared config.
+  `flake.nix` (a workspace edit — a normal, reviewable diff, picked up on
+  the next launch); `/nix` is read-only, so there's no `nix shell` for
+  one-offs; problems with *harness* tools go to the outbox, like any other
+  read-only shared config.
 - **Networking:** sessions now reach cache.nixos.org (and the agents
   input's cache, if it has one) — an allowlist entry once the firewall
   sidecar exists.
@@ -189,8 +246,9 @@ updates it.
 
 1. Write the harness flake (and `nix/empty-project/`), and check it covers
    everything `assets/Dockerfile` installs. No ramekin changes.
-2. Bootstrap image + store volume + the `nix develop` command, behind a KDL
-   switch (`toolchain "nix"`), alongside the Dockerfile path.
+2. Bootstrap image + store volume + the two-phase session (build container,
+   then a read-only-store agent container), behind a KDL switch
+   (`toolchain "nix"`), alongside the Dockerfile path.
 3. Dev profile caching, `--rebuild` semantics, `ramekin config` reporting,
    `ramekin gc`, prompt update.
 4. Flip the default; warn when a `.ramekin/Dockerfile` is present.
@@ -199,14 +257,12 @@ updates it.
 
 ## Open questions
 
-- **Shared writable store.** Agents run as root in bypass-permissions
-  mode, so one session can tamper with store paths another uses. The
-  hardening is a nix-daemon sidecar that owns the volume, with agent
-  containers mounting the store read-only plus the daemon socket. That
-  fits compose (and the planned firewall sidecar) but not Apple's single
-  `container run`. Is the unhardened version acceptable to start?
+- **Is losing `nix shell` tolerable?** The read-only store trades it away
+  (see store integrity). If agents keep needing one-offs, the daemon
+  sidecar is the upgrade under Docker.
 - **Apple containers and shared volumes.** Does nix's sqlite locking hold
-  when concurrent Apple-runtime sessions share the store volume? Unverified.
+  when concurrent Apple-runtime build containers share the store volume?
+  Only build phases write, which narrows the window. Unverified.
 - **Bootstrapping an empty volume.** Docker seeds a named volume from the
   image on first mount; Apple may not. Installing nix outside `/nix` is
   meant to make an empty store fine either way — verify.
