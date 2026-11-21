@@ -171,7 +171,9 @@ binaries the Mac never executes — and recovery is deleting the volume.
 
 The two-phase session above is the mitigation: the agent never holds a
 writable store, the build container never holds an agent or secrets, and it
-works identically under Docker and Apple with no daemon. The cost is ad-hoc
+works identically under Docker and Apple with no sidecar. It does not stop
+the project's *flake* from writing the store during the build phase — see
+N1 under the threat model, which adds build users to close that. The cost is ad-hoc
 `nix shell nixpkgs#foo`: a missing tool means editing `flake.nix` and
 relaunching. Alternatives, if that cost bites:
 
@@ -221,6 +223,84 @@ updates it.
   input's cache, if it has one) — an allowlist entry once the firewall
   sidecar exists.
 
+## Threat model
+
+How the design changes `../threat-model.md`. That document describes the
+code as it is, so it gets updated when this lands, not before; this section
+is the delta to apply. A6 (the agent is not trusted) still drives
+everything, and one new fact matters throughout: **a project's flake is
+code, and the build phase runs it.** Both the repo author and a hijacked
+agent (which is encouraged to edit `flake.nix`) can write it.
+
+### New risks
+
+**N1: A project flake poisons the shared store.** *(Addressable)* The
+build phase evaluates the project flake and realizes its devShell with
+`/nix` writable. Any derivation that builds rather than substitutes runs
+its builder there. Nix's build sandbox needs user namespaces, which
+Docker's default seccomp profile blocks, so builders run unsandboxed; in
+single-user mode they run as root and can rewrite any store path —
+including the `git` and `claude` every other repo's session runs. That
+reopens the cross-repo persistence the two-phase session was meant to
+close, one launch after an agent edits `flake.nix` (an R2-shaped loop).
+
+Mitigation: run a nix-daemon *inside the build container* with a
+`nixbld` build-users group. Builders then run as unprivileged users who
+can write only their own outputs, while store paths stay root-owned and
+read-only. This is per-container, so it stays runtime-neutral, and it
+needs no added capabilities. Also pin `accept-flake-config = false` in the
+image's `nix.conf`, so a flake's `nixConfig` can't add a substituter and
+trusted key that serves a poisoned path under a legitimate store hash. The
+R1 trust gate, if built, should hash `flake.nix` and `flake.lock` alongside
+`.ramekin/config.kdl`.
+
+**N2: Tracked files leak into a shared, readable store.** *(Addressable)*
+Evaluating the project flake copies every git-tracked file into
+`/nix/store/<hash>-source`. Masks don't apply to that copy, so a masked
+tracked file (`.envrc`, a `secrets/` dir) is readable at its store path.
+And the store is shared, so repo B's session can read repo A's source.
+Untracked files (`.env`, `target/`) are never copied.
+
+Mitigation: after the build phase, delete the project's source path when
+it isn't in the profile's closure, which is the common case (devShells
+rarely reference `./`). Per-repo store volumes close it fully, at the disk
+cost noted under store integrity. Either way, the threat model should say
+that masks don't cover tracked files once a flake is evaluated.
+
+### Changes to existing risks
+
+- **R2** gains `flake.nix` and `flake.lock` as loop files. Unlike
+  `.ramekin/`, they can't be bound read-only, because editing them is how
+  the agent adds tools. N1's build users are what contain the loop.
+- **R3** gains `shellHook`: a host-side `nix develop` or direnv `use flake`
+  runs whatever an agent put there, and host builds run on the darwin
+  daemon with its relaxed sandbox. This is already true of any repo with
+  a flake and direnv, but the design makes agent edits to `flake.nix`
+  routine. Still Open; review before entering the shell on the host.
+- **R4** gains allowlist entries for the firewall: cache.nixos.org, the
+  agents input's cache, and GitHub for flake inputs. The build container
+  has network access and the read-only workspace, but no credentials.
+- **R5** gains the store as a cross-repo vector. The agent phase can't
+  write it (read-only mount); N1 and N2 cover the build phase.
+- **R7** is unchanged for the workspace. The store volume isn't host
+  filesystem, and nix strips setuid bits from store paths anyway.
+- **R8**'s build-context half disappears with `.ramekin/Dockerfile`. Its
+  flake equivalent is N2.
+- **R9** narrows. Every input is pinned by hash in a `flake.lock`, and
+  substituted paths carry cache.nixos.org signatures, so a compromised
+  release has to land in nixpkgs or the agents input and then survive a
+  reviewed lock bump. Trust shifts to nixpkgs maintainers, the
+  cache.nixos.org key, and whoever bumps the agents input. Still Open,
+  since tracking upstream remains deliberate.
+- **R10** is unchanged, and both phases get the same isolation. Don't
+  grant extra capabilities to make nix's build sandbox work; N1's build
+  users are the substitute.
+- **R11** goes away: no image builds forward a GitHub token. If flake
+  input fetches hit GitHub rate limits, an `access-tokens` entry belongs
+  in the build phase only, never the agent phase.
+- **R12** extends to the harness flake and its lock (read-only mount) and
+  to the built profiles (read-only store in the agent phase).
+
 ## Alternatives considered
 
 - **Ramekin's own flake ships the harness tools** (a pinned `agent-tools`
@@ -260,6 +340,9 @@ updates it.
 - **Is losing `nix shell` tolerable?** The read-only store trades it away
   (see store integrity). If agents keep needing one-offs, the daemon
   sidecar is the upgrade under Docker.
+- **Build users in the build container.** Does a per-container
+  nix-daemon with `nixbld` users (N1) work in both runtimes without extra
+  capabilities, and how much does it add to a cold build phase?
 - **Apple containers and shared volumes.** Does nix's sqlite locking hold
   when concurrent Apple-runtime build containers share the store volume?
   Only build phases write, which narrows the window. Unverified.
